@@ -328,6 +328,21 @@ PROVIDERS: dict[str, WebAuthProvider] = {
         route="direct",
         credential_required=True,
     ),
+    "qwen-coder": WebAuthProvider(
+        id="qwen-coder",
+        name="Qwen Coder / 通义千问编程版",
+        login_url="https://coder.qwen.ai/",
+        status="available",
+        description="Qwen Coder 专用编程助手，支持代码生成、调试、artifacts 代码工件和 MCP 工具调用。使用 qwen-coder/ 前缀模型。",
+        models=(
+            "qwen-coder/qwen-coder-plus",
+            "qwen-coder/qwen-coder-flash",
+        ),
+        capabilities={"text": True, "image": False, "video": False, "artifacts": True, "mcp": True},
+        adapters=("qwen_coder", "qwen-coder"),
+        route="direct",
+        credential_required=True,
+    ),
     "qwen-cn": WebAuthProvider(
         id="qwen-cn",
         name="通义千问（国内版）",
@@ -495,6 +510,10 @@ def is_credential_authorized(provider_id: str, credential: dict[str, Any] | None
     if not credential:
         return False
     if provider_id == "qwen":
+        metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+        return bool(credential.get("bearer") or metadata.get("sessionToken"))
+    if provider_id == "qwen-coder":
+        # Qwen Coder 使用与 Qwen 相同的认证方式
         metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
         return bool(credential.get("bearer") or metadata.get("sessionToken"))
     return bool(credential.get("cookie") or credential.get("bearer"))

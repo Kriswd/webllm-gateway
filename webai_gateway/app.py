@@ -33,6 +33,7 @@ from webai_gateway.openai_api import (
 )
 from webai_gateway.anthropic_api import anthropic_body_to_openai, anthropic_count_tokens, anthropic_response_to_sse, openai_response_to_anthropic
 from webai_gateway.qwen_web import QwenWebClient, is_qwen_web_model
+from webai_gateway.qwen_coder import QwenCoderClient, is_qwen_coder_model
 from webai_gateway.web_auth import (
     DEFAULT_CDP_URL,
     BrowserLauncher,
@@ -61,6 +62,7 @@ def create_app(
     browser_launcher: BrowserLauncher | None = None,
     deepseek_client_factory: Any | None = None,
     qwen_client_factory: Any | None = None,
+    qwen_coder_client_factory: Any | None = None,
     native_ui_dir: str | Path | None = None,
     run_auth_jobs_inline: bool = False,
 ) -> FastAPI:
@@ -74,6 +76,7 @@ def create_app(
     app.state.browser_launcher = browser_launcher or BrowserLauncher(config_file.parent / ".webai-gateway" / "chrome-auth-profile")
     app.state.deepseek_client_factory = deepseek_client_factory or DeepSeekWebClient
     app.state.qwen_client_factory = qwen_client_factory or QwenWebClient
+    app.state.qwen_coder_client_factory = qwen_coder_client_factory or QwenCoderClient
     app.state.web_auth_jobs = {}
 
     static_dir = Path(__file__).with_name("static")
@@ -301,6 +304,8 @@ def create_app(
             return await run_in_threadpool(_deepseek_web_chat, app, client, body, cfg)
         if is_qwen_web_model(body.get("model")):
             return await run_in_threadpool(_qwen_web_chat, app, client, body, cfg)
+        if is_qwen_coder_model(body.get("model")):
+            return await run_in_threadpool(_qwen_coder_chat, app, client, body, cfg)
         payload, bridge, allowed_tools, bridge_context = build_upstream_payload(body, cfg)
         response = await run_in_threadpool(post_upstream, client, cfg, payload)
         response.raise_for_status()
@@ -705,6 +710,103 @@ def _qwen_web_chat_payload(app: FastAPI, client: httpx.Client, body: dict[str, A
     if isinstance(response, JSONResponse):
         return json_loads_response(response)
     raise HTTPException(status_code=400, detail="Anthropic 兼容接口暂不支持 direct provider 流式响应")
+
+
+def _qwen_coder_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> Response:
+    credential = app.state.credential_store.get("qwen-coder")
+    if not is_credential_authorized("qwen-coder", credential):
+        raise HTTPException(status_code=401, detail="请先在控制台完成 Qwen Coder 网页登录授权")
+    payload, bridge, allowed_tools, bridge_context = _build_direct_payload(
+        body,
+        config,
+        default_model="qwen-coder/qwen-coder-plus",
+        provider_native_web_search=True,
+    )
+    model = str(payload.get("model") or "qwen-coder/qwen-coder-plus")
+    try:
+        web_client = None
+        web_client = _build_qwen_coder_client(app.state.qwen_coder_client_factory, credential, client, config)
+        data = web_client.chat_completions(payload)
+    except HTTPException:
+        raise
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        diagnostic = _format_qwen_coder_timeout_diagnostic(getattr(web_client, "last_diagnostic", None), getattr(exc, "diagnostic", None))
+        raise HTTPException(
+            status_code=504,
+            detail=f"Qwen Coder Web 响应超时：{exc}{diagnostic}",
+            headers={"x-should-retry": "false"},
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Qwen Coder Web 调用失败：{exc}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Qwen Coder Web 响应必须是 JSON 对象")
+    parsed, bridge_result = _parse_bridge_chat_data(
+        data,
+        payload=payload,
+        bridge=bridge,
+        allowed_tools=allowed_tools,
+        bridge_context=bridge_context,
+        model=model,
+        retry_chat=web_client.chat_completions,
+        native_web_search=bool(payload.get("_webai_native_web_search")),
+    )
+    if bool(body.get("stream")):
+        content = ""
+        choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
+        if choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
+            if isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls"):
+                return Response(
+                    build_openai_tool_calls_sse(msg["tool_calls"], model=model),
+                    media_type="text/event-stream",
+                )
+            content = str(msg.get("content") or "")
+        return Response(build_tool_call_sse(content, allowed_tools=allowed_tools, model=model, bridge_context=bridge_context), media_type="text/event-stream")
+    return JSONResponse(parsed, headers=bridge_error_headers(bridge_result))
+
+
+def _build_qwen_coder_client(factory: Any, credential: dict[str, Any], client: httpx.Client, config: GatewayConfig) -> Any:
+    timeout = max(config.provider_runtime.request_timeout_seconds, 300)  # Coder 需要更长超时
+    prompt_max_chars = config.provider_runtime.prompt_max_chars
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        accepted_params: set[str] | None = None
+        accepts_kwargs = True
+    else:
+        accepted_params = set(signature.parameters)
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+        )
+    kwargs: dict[str, Any] = {"http_client": client}
+    if accepts_kwargs or (accepted_params and "request_timeout_seconds" in accepted_params):
+        kwargs["request_timeout_seconds"] = timeout
+    if accepts_kwargs or (accepted_params and "prompt_max_chars" in accepted_params):
+        kwargs["prompt_max_chars"] = prompt_max_chars
+    return factory(credential, **kwargs)
+
+
+def _format_qwen_coder_timeout_diagnostic(client_diagnostic: Any, exception_diagnostic: Any) -> str:
+    merged: dict[str, Any] = {}
+    if isinstance(client_diagnostic, dict):
+        merged.update(client_diagnostic)
+    if isinstance(exception_diagnostic, dict):
+        merged.update(exception_diagnostic)
+    if not merged:
+        return ""
+    allowed_keys = (
+        "prompt_chars",
+        "prompt_max_chars",
+        "prompt_compacted",
+        "message_count",
+        "stream_events",
+        "json_events",
+        "output_chars",
+        "think_chars",
+        "artifact_chars",
+    )
+    parts = [f"{key}={merged[key]}" for key in allowed_keys if key in merged]
+    return f"；diagnostic: {', '.join(parts)}" if parts else ""
 
 
 def _openai_response_content(data: dict[str, Any]) -> str:

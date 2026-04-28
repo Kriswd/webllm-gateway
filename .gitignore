@@ -1,12 +1,27 @@
+```
+# Compiled and build artifacts
+*.pyc
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.codex-logs/
-.learnings/
+
+# Dependencies
 .venv/
 venv/
+node_modules/
+
+# Logs and temp files
 *.log
-config.json
-credentials/
-.webai-gateway/
-webui/node_modules/
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Original rules preserved
+*.log
+```
