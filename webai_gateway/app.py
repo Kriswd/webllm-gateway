@@ -20,6 +20,7 @@ from webai_gateway.openai_api import (
     build_incomplete_response_retry_payload,
     build_native_web_search_retry_payload,
     build_repair_payload,
+    build_tool_refusal_recovery_payload,
     build_unknown_tool_recovery_payload,
     build_openai_tool_calls_sse,
     build_tool_call_sse,
@@ -371,6 +372,8 @@ def create_app(
             parsed = await run_in_threadpool(_deepseek_web_chat_payload, app, client, openai_body, cfg)
         elif is_qwen_web_model(openai_body.get("model")):
             parsed = await run_in_threadpool(_qwen_web_chat_payload, app, client, openai_body, cfg)
+        elif is_qwen_coder_model(openai_body.get("model")):
+            parsed = await run_in_threadpool(_qwen_coder_chat_payload, app, client, openai_body, cfg)
         else:
             payload, bridge, allowed_tools, bridge_context = build_upstream_payload(openai_body, cfg)
             response = await run_in_threadpool(post_upstream, client, cfg, payload)
@@ -559,11 +562,24 @@ def _parse_bridge_chat_data(
                 allowed_tools=allowed_tools,
                 model=model,
                 bridge_context=bridge_context,
-                    return_bridge_result=True,
-                )
+                return_bridge_result=True,
+            )
         if bridge_result.error and bridge_result.error.kind == "unknown_tool":
             recovery_data = retry_chat(
                 build_unknown_tool_recovery_payload(payload, bridge_result, allowed_tools=allowed_tools)
+            )
+            if isinstance(recovery_data, dict):
+                parsed, bridge_result = parse_chat_response(
+                    recovery_data,
+                    bridge=bridge,
+                    allowed_tools=allowed_tools,
+                    model=model,
+                    bridge_context=bridge_context,
+                    return_bridge_result=True,
+                )
+        elif _should_retry_tool_refusal_recovery(bridge_result):
+            recovery_data = retry_chat(
+                build_tool_refusal_recovery_payload(payload, bridge_result, allowed_tools=allowed_tools)
             )
             if isinstance(recovery_data, dict):
                 parsed, bridge_result = parse_chat_response(
@@ -598,7 +614,25 @@ def _parse_bridge_chat_data(
                         bridge_context=bridge_context,
                         return_bridge_result=True,
                     )
+                if _should_retry_tool_refusal_recovery(bridge_result):
+                    recovery_data = retry_chat(
+                        build_tool_refusal_recovery_payload(payload, bridge_result, allowed_tools=allowed_tools)
+                    )
+                    if isinstance(recovery_data, dict):
+                        parsed, bridge_result = parse_chat_response(
+                            recovery_data,
+                            bridge=bridge,
+                            allowed_tools=allowed_tools,
+                            model=model,
+                            bridge_context=bridge_context,
+                            return_bridge_result=True,
+                        )
     return parsed, bridge_result
+
+
+def _should_retry_tool_refusal_recovery(bridge_result: Any) -> bool:
+    error = getattr(bridge_result, "error", None)
+    return bool(error and getattr(error, "kind", "") in {"tool_denial_without_call", "deferred_tool_action_without_call"})
 
 
 def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> Response:
@@ -707,6 +741,13 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
 
 def _qwen_web_chat_payload(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> dict[str, Any]:
     response = _qwen_web_chat(app, client, body, config)
+    if isinstance(response, JSONResponse):
+        return json_loads_response(response)
+    raise HTTPException(status_code=400, detail="Anthropic 兼容接口暂不支持 direct provider 流式响应")
+
+
+def _qwen_coder_chat_payload(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> dict[str, Any]:
+    response = _qwen_coder_chat(app, client, body, config)
     if isinstance(response, JSONResponse):
         return json_loads_response(response)
     raise HTTPException(status_code=400, detail="Anthropic 兼容接口暂不支持 direct provider 流式响应")

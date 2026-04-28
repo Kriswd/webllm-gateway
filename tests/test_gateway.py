@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +27,9 @@ from webai_gateway.qwen_web import (
     parse_qwen_stream_text,
     qwen_messages_to_prompt_and_files,
 )
-from webai_gateway.tool_bridge import compress_observation
-from webai_gateway.web_auth import CredentialStore, _read_qwen_credential, credential_summary
+from webai_gateway.qwen_coder import QwenCoderClient, normalize_qwen_coder_model
+from webai_gateway.tool_bridge import build_context, parse_tool_response, compress_observation
+from webai_gateway.web_auth import CredentialStore, DeepSeekWebAuthService, PROVIDERS, _read_qwen_credential, credential_summary
 
 
 def _config() -> GatewayConfig:
@@ -66,8 +69,37 @@ def _credential_store(tmp_path: Path) -> CredentialStore:
     return store
 
 
+def _qwen_coder_credential_store(tmp_path: Path) -> CredentialStore:
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "qwen-coder",
+        {
+            "cookie": "qwen_session=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    return store
+
+
 def _not_found_client() -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(404, request=request)))
+
+
+def test_gitignore_protects_local_credentials_and_runtime_state() -> None:
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
+
+    assert "```" not in gitignore
+    for pattern in (
+        "config.json",
+        "credentials/",
+        ".webai-gateway/",
+        ".codex-logs/",
+        ".learnings/",
+        ".pytest_cache/",
+        "webui/node_modules/",
+    ):
+        assert pattern in gitignore
 
 
 def _sse_events(body: str) -> list[dict[str, Any]]:
@@ -415,6 +447,61 @@ def test_strict_tool_bridge_repairs_allowed_tool_denial_text() -> None:
     assert body["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
 
 
+def test_strict_tool_bridge_repairs_chinese_permission_denial_text() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json=_openai_response(
+                    "很抱歉，我无法直接帮您更新项目。作为AI助手，我没有权限直接操作您的文件系统或执行Git命令。"
+                    "系统明确限制了我不能使用任何文件系统操作工具（如Bash、Git等），这是出于安全考虑。"
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '```tool_json\n{"calls":[{"id":"toolu_bash","name":"Bash","input":{"command":"git status --short"}}]}\n```'
+            ),
+            request=request,
+        )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(exposure_policy="all"),
+    )
+    client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+
+    response = client.post(
+        "/v1/messages?beta=true",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "web-model",
+            "messages": [{"role": "user", "content": "更新项目并提交"}],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(requests) == 2
+    repair_text = "\n".join(str(m.get("content", "")) for m in requests[1]["messages"])
+    assert "The listed tools are available through the downstream client" in repair_text
+    body = response.json()
+    assert body["stop_reason"] == "tool_use"
+    assert body["content"] == [
+        {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "git status --short"}}
+    ]
+
+
 def test_strict_tool_bridge_reports_repair_failure_without_tool_call() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_openai_response('```tool_json\n{"calls":[{"name":"missing_tool","input":{}}]}\n```'), request=request)
@@ -619,6 +706,114 @@ def test_compress_observation_uses_configured_excluded_path_globs() -> None:
     assert "generated" not in compressed
     assert "src\\main.py" in compressed
     assert "tests\\test_gateway.py" in compressed
+
+
+def test_tool_bridge_rewrites_repository_wide_glob_to_shallow_pattern() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Glob",
+                    "description": "Find files by pattern.",
+                    "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"Glob","input":{"pattern":"**/*.md"}}]}\n```',
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        ("call_1", "Glob", {"pattern": "*.md"})
+    ]
+
+
+def test_tool_bridge_rewrites_repository_wide_all_files_glob_to_directory_list() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Glob",
+                    "description": "Find files by pattern.",
+                    "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "LS",
+                    "description": "List a directory.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            },
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"Glob","input":{"pattern":"**/*"}}]}\n```',
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        ("call_1", "LS", {"path": "."})
+    ]
+
+
+def test_direct_provider_sanitizes_expensive_glob_without_retry(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class BroadGlobClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"call_1","name":"Glob","input":{"pattern":"**/*.md"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=BroadGlobClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [{"role": "user", "content": "/init"}],
+            "tools": [
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    assert response.json()["content"] == [
+        {"type": "tool_use", "id": "toolu_call_1", "name": "Glob", "input": {"pattern": "*.md"}}
+    ]
 
 
 def test_anthropic_messages_returns_tool_use_block() -> None:
@@ -892,6 +1087,91 @@ def test_tool_bridge_full_exposure_allows_runtime_and_mcp_tools() -> None:
     body = response.json()
     assert body["stop_reason"] == "tool_use"
     assert [block["name"] for block in body["content"]] == ["Bash", "mcp__repo__search"]
+
+
+def test_tool_bridge_rewrites_cli_tool_name_to_bash_when_bash_allowed() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"gh","input":{"command":"repo view Kriswd/web-gateway"}}]}\n```',
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        ("call_1", "Bash", {"command": "gh repo view Kriswd/web-gateway"})
+    ]
+
+
+def test_tool_bridge_rewrites_terminal_tool_name_to_bash_without_prefixing_wrapper() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"terminal","input":{"command":"git status --short"}}]}\n```',
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        ("call_1", "Bash", {"command": "git status --short"})
+    ]
+
+
+def test_tool_bridge_does_not_rewrite_cli_name_without_bash() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read files",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"gh","input":{"command":"repo view Kriswd/web-gateway"}}]}\n```',
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is not None
+    assert result.error.kind == "unknown_tool"
 
 
 def test_tool_bridge_all_exposure_does_not_truncate_or_invent_toolsearch() -> None:
@@ -1837,6 +2117,86 @@ def test_read_qwen_credential_accepts_bearer_login_state() -> None:
     assert credential["metadata"]["sessionToken"] == "bearer-token"
 
 
+def test_read_qwen_coder_credential_uses_coder_origin() -> None:
+    context = _FakeQwenContext([{"name": "qwen_session", "value": "coder-session"}])
+
+    credential = asyncio.run(
+        _read_qwen_credential(
+            context,
+            _FakeQwenPage(),
+            origins=("https://coder.qwen.ai", "https://qwen.ai"),
+        )
+    )
+
+    assert credential is not None
+    assert credential["metadata"]["sessionToken"] == "coder-session"
+
+
+def test_qwen_coder_auth_service_captures_browser_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    progress: list[str] = []
+    seen: dict[str, Any] = {}
+
+    class FakePage:
+        def on(self, event: str, handler: Any) -> None:
+            seen["event"] = event
+
+        async def goto(self, url: str) -> None:
+            seen["goto"] = url
+
+        async def evaluate(self, script: str) -> str:
+            return "Chrome Test"
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [FakePage()]
+
+        async def cookies(self, urls: Any) -> list[dict[str, str]]:
+            seen["cookie_urls"] = urls
+            return [{"name": "qwen_session", "value": "coder-session"}]
+
+    class FakeBrowser:
+        def __init__(self) -> None:
+            self.contexts = [FakeContext()]
+
+        async def new_context(self) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            seen["closed"] = True
+
+    class FakeChromium:
+        async def connect_over_cdp(self, cdp_url: str) -> FakeBrowser:
+            seen["cdp_url"] = cdp_url
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        async def __aenter__(self) -> Any:
+            return types.SimpleNamespace(chromium=FakeChromium())
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+    fake_async_api = types.SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    monkeypatch.setitem(sys.modules, "playwright", types.SimpleNamespace(async_api=fake_async_api))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    credential = asyncio.run(
+        DeepSeekWebAuthService().capture(
+            "qwen-coder",
+            "http://127.0.0.1:9222",
+            progress=progress.append,
+            timeout_seconds=3,
+        )
+    )
+
+    assert seen["goto"] == "https://coder.qwen.ai/"
+    assert "https://coder.qwen.ai" in seen["cookie_urls"]
+    assert credential["metadata"]["sessionToken"] == "coder-session"
+    assert credential["userAgent"] == "Chrome Test"
+    assert seen["closed"] is True
+    assert any("Qwen Coder" in item for item in progress)
+
+
 class _FakeAuthService:
     async def capture(self, provider_id: str, cdp_url: str, progress):
         progress("已连接授权浏览器，正在等待登录状态")
@@ -1964,6 +2324,29 @@ class _FakeQwenClient:
         }
 
 
+class _FakeQwenCoderClient:
+    captured_payload: dict[str, Any] = {}
+
+    def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+        self.credential = credential
+
+    def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+        _FakeQwenCoderClient.captured_payload = payload
+        assert self.credential["cookie"] == "qwen_session=session-secret"
+        return {
+            "id": "qwen-coder-test",
+            "object": "chat.completion",
+            "model": payload["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "来自 Qwen Coder 网页模型"},
+                }
+            ],
+        }
+
+
 class _FakeQwenToolClient:
     def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
         self.credential = credential
@@ -1984,10 +2367,10 @@ class _FakeQwenBatchToolClient:
         assert "tools" not in payload
         assert "tool_choice" not in payload
         calls = [
-            {"id": "call_1", "name": "Glob", "input": {"pattern": "**/*.md"}},
-            {"id": "call_2", "name": "Glob", "input": {"pattern": "**/pyproject.toml"}},
-            {"id": "call_3", "name": "Glob", "input": {"pattern": "**/requirements*.txt"}},
-            {"id": "call_4", "name": "Glob", "input": {"pattern": "**/.cursorrules"}},
+            {"id": "call_1", "name": "Glob", "input": {"pattern": "*.md"}},
+            {"id": "call_2", "name": "Glob", "input": {"pattern": "pyproject.toml"}},
+            {"id": "call_3", "name": "Glob", "input": {"pattern": "requirements*.txt"}},
+            {"id": "call_4", "name": "Glob", "input": {"pattern": ".cursorrules"}},
             {"id": "call_5", "name": "Glob", "input": {"pattern": ".cursor/rules/**"}},
             {"id": "call_6", "name": "Glob", "input": {"pattern": ".github/copilot-instructions.md"}},
         ]
@@ -2192,6 +2575,112 @@ def test_qwen_web_chat_uses_saved_credentials(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "来自 Qwen 网页模型"
+
+
+def test_anthropic_messages_routes_qwen_coder_direct_provider(tmp_path: Path) -> None:
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=_qwen_coder_credential_store(tmp_path),
+            qwen_coder_client_factory=_FakeQwenCoderClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-coder/qwen-coder-plus",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["content"][0]["type"] == "text"
+    assert body["content"][0]["text"] == "来自 Qwen Coder 网页模型"
+    assert _FakeQwenCoderClient.captured_payload["model"] == "qwen-coder/qwen-coder-plus"
+
+
+def test_qwen_coder_provider_does_not_claim_gateway_mcp_support() -> None:
+    provider = PROVIDERS["qwen-coder"]
+
+    assert provider.supports_native_tools is False
+    assert provider.capabilities.get("mcp") is not True
+
+
+def test_qwen_coder_legacy_plus_alias_maps_to_web_model() -> None:
+    assert normalize_qwen_coder_model("qwen-coder/qwen-coder-plus") == "qwen3-coder-plus"
+    assert normalize_qwen_coder_model("qwen-coder/qwen3-coder-plus") == "qwen3-coder-plus"
+
+
+def test_qwen_coder_client_sends_web_model_alias_for_legacy_plus() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/v2/chats/new"):
+            return httpx.Response(200, json={"data": {"id": "chat-test"}}, request=request)
+        if request.url.path.endswith("/api/v2/chat/completions"):
+            seen["body"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"ok","phase":"answer"}}]}\n\ndata: [DONE]\n\n',
+                request=request,
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(404, request=request)
+
+    qwen = QwenCoderClient(
+        {"cookie": "qwen_session=session-secret", "bearer": "bearer-secret", "userAgent": "Chrome Test"},
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = qwen.chat_completions(
+        {
+            "model": "qwen-coder/qwen-coder-plus",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert seen["body"]["model"] == "qwen3-coder-plus"
+    assert seen["body"]["messages"][0]["models"] == ["qwen3-coder-plus"]
+
+
+def test_qwen_coder_client_does_not_enable_mcp_by_default() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/v2/chats/new"):
+            return httpx.Response(200, json={"data": {"id": "chat-test"}}, request=request)
+        if request.url.path.endswith("/api/v2/chat/completions"):
+            seen["body"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"ok","phase":"answer"}}]}\n\ndata: [DONE]\n\n',
+                request=request,
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(404, request=request)
+
+    qwen = QwenCoderClient(
+        {"cookie": "qwen_session=session-secret", "bearer": "bearer-secret", "userAgent": "Chrome Test"},
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = qwen.chat_completions(
+        {
+            "model": "qwen-coder/qwen-coder-plus",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+
+    assert response["choices"][0]["message"]["content"] == "ok"
+    feature_config = seen["body"]["messages"][0]["feature_config"]
+    assert feature_config.get("mcp_enabled") is not True
 
 
 def test_qwen_web_chat_passes_configured_provider_timeout(tmp_path: Path) -> None:
@@ -2899,6 +3388,63 @@ def test_qwen_web_tool_bridge_repairs_deferred_research_without_tool_call(tmp_pa
     assert "没有发起工具调用" in retry_prompt
     assert response.json()["content"] == [
         {"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "webai_gateway/web_auth.py"}}
+    ]
+
+
+def test_qwen_web_tool_bridge_recovers_when_permission_denial_repair_repeats(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    denial = (
+        "由于我无法直接访问您的文件系统或执行命令，我将为您提供手动更新GitHub项目的详细步骤。"
+        "这是最安全可靠的方式，避免意外数据丢失。"
+    )
+
+    class RepeatedPermissionDenialThenToolQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) <= 2:
+                return _openai_response(denial)
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"toolu_bash","name":"Bash","input":{"command":"git status --short"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=RepeatedPermissionDenialThenToolQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [{"role": "user", "content": "更新项目并推送到 GitHub"}],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 3
+    final_retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[2]["messages"])
+    assert "manual steps" in final_retry_prompt
+    assert "Bash" in final_retry_prompt
+    assert response.json()["content"] == [
+        {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "git status --short"}}
     ]
 
 

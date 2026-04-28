@@ -15,6 +15,11 @@ from urllib.parse import urlparse
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 QWEN_LOGIN_COOKIE_HINTS = ("session", "token", "auth", "login", "sso")
+QWEN_DIRECT_PROVIDER_IDS = {"qwen", "qwen-coder"}
+QWEN_CREDENTIAL_ORIGINS: dict[str, tuple[str, ...]] = {
+    "qwen": ("https://chat.qwen.ai", "https://qwen.ai"),
+    "qwen-coder": ("https://coder.qwen.ai", "https://qwen.ai"),
+}
 
 
 @dataclass(frozen=True)
@@ -333,12 +338,12 @@ PROVIDERS: dict[str, WebAuthProvider] = {
         name="Qwen Coder / 通义千问编程版",
         login_url="https://coder.qwen.ai/",
         status="available",
-        description="Qwen Coder 专用编程助手，支持代码生成、调试、artifacts 代码工件和 MCP 工具调用。使用 qwen-coder/ 前缀模型。",
+        description="Qwen Coder 专用编程助手，支持代码生成、调试和 artifacts 代码工件。使用 qwen-coder/ 前缀模型。",
         models=(
+            "qwen-coder/qwen3-coder-plus",
             "qwen-coder/qwen-coder-plus",
-            "qwen-coder/qwen-coder-flash",
         ),
-        capabilities={"text": True, "image": False, "video": False, "artifacts": True, "mcp": True},
+        capabilities={"text": True, "image": False, "video": False, "artifacts": True},
         adapters=("qwen_coder", "qwen-coder"),
         route="direct",
         credential_required=True,
@@ -614,7 +619,7 @@ class DeepSeekWebAuthService:
         timeout_seconds: int = 180,
     ) -> dict[str, Any]:
         provider = get_provider(provider_id)
-        if provider.id not in {"deepseek-web", "qwen"}:
+        if provider.id not in {"deepseek-web", *QWEN_DIRECT_PROVIDER_IDS}:
             raise ValueError(f"{provider.name} 暂未实现本地自动捕获；请在 WebAI2API 管理台完成该站点登录。")
         try:
             from playwright.async_api import async_playwright
@@ -642,24 +647,29 @@ class DeepSeekWebAuthService:
                 url = str(request.url)
                 if provider.id == "deepseek-web" and "/api/v0/" in url and auth.lower().startswith("bearer "):
                     bearer_seen = auth.split(" ", 1)[1].strip()
-                if provider.id == "qwen" and "qwen.ai" in url and auth.lower().startswith("bearer "):
+                if provider.id in QWEN_DIRECT_PROVIDER_IDS and "qwen.ai" in url and auth.lower().startswith("bearer "):
                     bearer_seen = auth.split(" ", 1)[1].strip()
 
             page.on("request", on_request)
             await page.goto(provider.login_url)
-            if provider.id == "qwen":
-                notify("等待 Qwen 登录态：请在 chat.qwen.ai 完成登录，检测到登录态后才会完成")
+            if provider.id in QWEN_DIRECT_PROVIDER_IDS:
+                notify(f"等待 {provider.name} 登录态：请在 {provider.login_url} 完成登录，检测到登录态后才会完成")
             else:
                 notify(f"请在弹出的浏览器里完成 {provider.name} 登录")
 
             while time.monotonic() - started_at < timeout_seconds:
-                if provider.id == "qwen":
-                    credential = await _read_qwen_credential(context, page, bearer_seen)
+                if provider.id in QWEN_DIRECT_PROVIDER_IDS:
+                    credential = await _read_qwen_credential(
+                        context,
+                        page,
+                        bearer_seen,
+                        origins=QWEN_CREDENTIAL_ORIGINS[provider.id],
+                    )
                 else:
                     credential = await _read_deepseek_credential(context, page, bearer_seen)
                 if credential:
-                    if provider.id == "qwen":
-                        notify("已检测到 Qwen 登录态")
+                    if provider.id in QWEN_DIRECT_PROVIDER_IDS:
+                        notify(f"已检测到 {provider.name} 登录态")
                     else:
                         notify(f"已捕获 {provider.name} 登录态")
                     await browser.close()
@@ -667,8 +677,8 @@ class DeepSeekWebAuthService:
                 await asyncio.sleep(2)
 
             await browser.close()
-        if provider.id == "qwen":
-            raise TimeoutError("等待 Qwen 登录态超时，请确认已经在 chat.qwen.ai 登录成功后重试")
+        if provider.id in QWEN_DIRECT_PROVIDER_IDS:
+            raise TimeoutError(f"等待 {provider.name} 登录态超时，请确认已经在 {provider.login_url} 登录成功后重试")
         raise TimeoutError(f"等待 {provider.name} 登录超时，请确认网页已经登录成功后重试")
 
 
@@ -693,8 +703,14 @@ async def _read_deepseek_credential(context: Any, page: Any, bearer_seen: str = 
     return {"cookie": cookie_text, "bearer": bearer, "userAgent": user_agent}
 
 
-async def _read_qwen_credential(context: Any, page: Any, bearer_seen: str = "") -> dict[str, Any] | None:
-    cookies = await context.cookies(["https://chat.qwen.ai", "https://qwen.ai"])
+async def _read_qwen_credential(
+    context: Any,
+    page: Any,
+    bearer_seen: str = "",
+    *,
+    origins: tuple[str, ...] = QWEN_CREDENTIAL_ORIGINS["qwen"],
+) -> dict[str, Any] | None:
+    cookies = await context.cookies(list(origins))
     cookie_text = "; ".join(f"{item.get('name')}={item.get('value')}" for item in cookies if item.get("name") and item.get("value"))
     user_agent = await page.evaluate("() => navigator.userAgent")
     session_token = bearer_seen or _qwen_session_token_from_cookies(cookies)

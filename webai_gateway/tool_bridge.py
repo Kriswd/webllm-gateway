@@ -4,6 +4,7 @@ import json
 import fnmatch
 import html
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,7 +32,9 @@ _TOOL_ENV_DENIAL_RE = re.compile(
     r"((?:cannot|can't|unable\s+to)\s+(?:directly\s+)?(?:access|use|execute|run)\s+"
     r"(?:the\s+)?(?:filesystem|file\s+system|tools?|commands?|shell|bash|terminal)|"
     r"no\s+access\s+to\s+(?:the\s+)?(?:filesystem|file\s+system|tools?|commands?)|"
-    r"(?:无法|不能|不可)\s*(?:直接)?\s*(?:访问|使用|执行|运行)\s*(?:文件系统|工具|命令|终端|shell|bash))",
+    r"(?:无法|不能|不可|没有权限|无权限)\s*(?:直接)?\s*(?:访问|使用|执行|运行|操作)?\s*"
+    r"(?:您的|本地|任何)?\s*(?:文件系统|文件|工具|操作工具|命令|git命令|终端|shell|bash)|"
+    r"(?:系统|环境).{0,24}(?:限制|禁止).{0,24}(?:文件系统|工具|操作工具|命令|git|bash))",
     re.IGNORECASE,
 )
 _DEFERRED_TOOL_ACTION_RE = re.compile(
@@ -333,8 +336,8 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
     ]
     tool_manifest = _tool_manifest_json(functions, max_chars=max(2000, int(cfg.tool_prompt_max_chars or 12000)))
     return (
-        "You are using WebAI Gateway's strict tool bridge. You cannot execute tools yourself; "
-        "you can only request that the downstream client executes one of the allowed tools.\n\n"
+        "You are using WebAI Gateway's strict tool bridge. You are allowed to request the downstream client to execute listed tools; "
+        "do not confuse this with executing tools inside the web model runtime yourself.\n\n"
         "Available tools (allowed names only):\n"
         f"{tool_manifest}\n\n"
         "Decision rules:\n"
@@ -342,9 +345,10 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
         "- If a tool is needed, output exactly one fenced tool_json block and no natural language outside it.\n"
         "- Never use provider-native markup such as <search>, <tool>, <tool_call>, <function_call>, or browsing tags. Use only fenced tool_json.\n"
         "- Never output summaries like 'Assistant requested tool calls'. Those are history text, not the required protocol.\n"
-        "- Never say an available tool does not exist or that you cannot access files/commands. The downstream client executes allowed tools for you after you request them with tool_json.\n"
+        "- Never say an available tool does not exist or that you lack permission to access files, run commands, use Bash/Git, or update the project. The downstream client owns permissions and executes allowed tools after you request them with tool_json.\n"
         "- After a Tool result message, use the observation to answer or request another allowed tool. Do not wait, do not claim that you executed a tool yourself, and do not repeat a failed identical call.\n"
         "- If a Tool result says is_error: true, do not treat it as successful data. Choose a different allowed tool/input if recovery is possible; otherwise explain the failure briefly.\n"
+        "- For Glob/file-discovery tools, avoid repository-wide recursive patterns such as **/*, **/*.ext, or **/package.json unless the input also scopes the search to a narrow path. Prefer Read for known files, LS/list tools for directory overviews, or scoped patterns like src/**/*.py.\n"
         "- For public GitHub repository or source-code URLs, prefer machine-readable endpoints such as https://api.github.com/repos/<owner>/<repo>, the GitHub contents API, or raw.githubusercontent.com files instead of interactive HTML pages.\n\n"
         "Required tool-call format:\n"
         "```tool_json\n"
@@ -982,9 +986,22 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
                 return [], BridgeError("invalid_tool_call", "工具调用必须是对象")
             canonical_name = normalized.name if normalized.name in allowed else canonical_by_lower.get(normalized.name.lower())
             if not canonical_name:
-                return [], BridgeError("unknown_tool", f"未知工具：{normalized.name}", repairable=True)
+                replacement = _safe_replacement_for_cli_tool(normalized, context.tools)
+                if replacement:
+                    normalized = replacement
+                    canonical_name = replacement.name
+                else:
+                    return [], BridgeError("unknown_tool", f"未知工具：{normalized.name}", repairable=True)
             if not isinstance(normalized.input, dict):
                 return [], BridgeError("invalid_input", f"工具 {normalized.name} 的 input 必须是对象")
+            replacement = _safe_replacement_for_expensive_glob(normalized, canonical_name, context.tools)
+            if replacement:
+                normalized = replacement
+                canonical_name = replacement.name
+            else:
+                expensive_glob = _expensive_glob_message(canonical_name, normalized.input)
+                if expensive_glob:
+                    return [], BridgeError("expensive_tool_input", expensive_glob, repairable=True)
             call_id = normalized.id or f"call_web_{len(out) + 1}"
             if call_id in seen_ids:
                 return [], BridgeError("duplicate_tool_call_id", f"重复的工具调用 id：{call_id}")
@@ -998,6 +1015,237 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
     if len(out) > max_calls:
         return [], BridgeError("too_many_tool_calls", f"本轮工具调用过多：{len(out)} > {max_calls}")
     return out, None
+
+
+def _safe_replacement_for_cli_tool(call: ToolCallDraft, tools: list[ToolSpec]) -> ToolCallDraft | None:
+    if not isinstance(call.input, dict) or not _is_cli_tool_name(call.name):
+        return None
+    bash_tool = _select_bash_tool(tools)
+    if not bash_tool:
+        return None
+    command = _cli_tool_command(call.name, call.input)
+    if not command:
+        return None
+    return ToolCallDraft(
+        id=call.id,
+        name=bash_tool.name,
+        input={_shell_command_key(bash_tool): command},
+    )
+
+
+def _is_cli_tool_name(name: str) -> bool:
+    lowered = (name or "").strip().lower()
+    return lowered in {
+        "bun",
+        "cargo",
+        "deno",
+        "docker",
+        "docker-compose",
+        "gh",
+        "git",
+        "go",
+        "kubectl",
+        "mypy",
+        "node",
+        "npm",
+        "npx",
+        "pip",
+        "pip3",
+        "pnpm",
+        "pytest",
+        "python",
+        "python3",
+        "ruff",
+        "rustc",
+        "shell",
+        "terminal",
+        "uv",
+        "yarn",
+    }
+
+
+def _select_bash_tool(tools: list[ToolSpec]) -> ToolSpec | None:
+    for tool in tools:
+        lowered = tool.name.strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", lowered)
+        if lowered == "bash" or compact == "bash":
+            return tool
+    return None
+
+
+def _cli_tool_command(name: str, input_value: dict[str, Any]) -> str:
+    command_name = name.strip()
+    for key in ("command", "cmd"):
+        value = input_value.get(key)
+        if isinstance(value, str):
+            command = value.strip()
+            if not command:
+                return command_name
+            if _is_shell_wrapper_tool_name(command_name):
+                return command
+            return command if _command_starts_with_cli_name(command, command_name) else f"{command_name} {command}"
+    args = input_value.get("args")
+    if args is None:
+        args = input_value.get("arguments")
+    if args is None:
+        args = input_value.get("argv")
+    if isinstance(args, str):
+        return f"{command_name} {args.strip()}".strip()
+    if isinstance(args, list):
+        parts = [command_name]
+        for arg in args:
+            if arg is None:
+                continue
+            parts.append(shlex.quote(str(arg)))
+        return " ".join(parts).strip()
+    if not input_value:
+        return command_name
+    return ""
+
+
+def _is_shell_wrapper_tool_name(name: str) -> bool:
+    return (name or "").strip().lower() in {"shell", "terminal"}
+
+
+def _command_starts_with_cli_name(command: str, name: str) -> bool:
+    command = command.strip()
+    lowered = command.lower()
+    name_lower = name.strip().lower()
+    return lowered == name_lower or lowered.startswith(f"{name_lower} ")
+
+
+def _shell_command_key(tool: ToolSpec) -> str:
+    properties = tool.input_schema.get("properties") if isinstance(tool.input_schema, dict) else None
+    if isinstance(properties, dict):
+        for key in ("command", "cmd"):
+            if key in properties:
+                return key
+    return "command"
+
+
+def _safe_replacement_for_expensive_glob(
+    call: ToolCallDraft,
+    canonical_name: str,
+    tools: list[ToolSpec],
+) -> ToolCallDraft | None:
+    if not _is_glob_tool_name(canonical_name):
+        return None
+    pattern = _glob_pattern(call.input)
+    if not pattern or not _is_repository_wide_glob(pattern):
+        return None
+    scope = _glob_scope(call.input)
+    if scope and scope not in {".", "./", "\\", "/"}:
+        return None
+
+    if _is_all_files_glob(pattern):
+        list_tool = _select_directory_list_tool(tools)
+        if list_tool:
+            return ToolCallDraft(
+                id=call.id,
+                name=list_tool.name,
+                input={_directory_path_key(list_tool): scope or "."},
+            )
+
+    shallow_pattern = _shallow_glob_pattern(pattern)
+    if not shallow_pattern or shallow_pattern == pattern:
+        return None
+    sanitized = dict(call.input)
+    for key in ("pattern", "glob", "file_pattern"):
+        if key in sanitized:
+            sanitized[key] = shallow_pattern
+            break
+    else:
+        sanitized["pattern"] = shallow_pattern
+    return ToolCallDraft(id=call.id, name=canonical_name, input=sanitized)
+
+
+def _expensive_glob_message(name: str, input_value: dict[str, Any]) -> str | None:
+    if not _is_glob_tool_name(name):
+        return None
+    pattern = _glob_pattern(input_value)
+    if not pattern:
+        return None
+    if not _is_repository_wide_glob(pattern):
+        return None
+    scope = _glob_scope(input_value)
+    if scope and scope not in {".", "./", "\\", "/"}:
+        return None
+    return (
+        f"Glob pattern {pattern!r} is repository-wide and likely to time out on large workspaces. "
+        "Use Read for known files, LS/list tools for directory overviews, or a scoped Glob pattern with a narrow path."
+    )
+
+
+def _is_glob_tool_name(name: str) -> bool:
+    lowered = (name or "").strip().lower()
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    return lowered == "glob" or compact.endswith("glob")
+
+
+def _glob_pattern(input_value: dict[str, Any]) -> str:
+    for key in ("pattern", "glob", "file_pattern"):
+        value = input_value.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _glob_scope(input_value: dict[str, Any]) -> str:
+    for key in ("path", "cwd", "root", "directory", "base_path"):
+        value = input_value.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _is_repository_wide_glob(pattern: str) -> bool:
+    normalized = pattern.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized in {"**", "**/*", "**/*.*"} or normalized.startswith("**/")
+
+
+def _is_all_files_glob(pattern: str) -> bool:
+    normalized = pattern.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized in {"**", "**/*", "**/*.*"}
+
+
+def _shallow_glob_pattern(pattern: str) -> str:
+    normalized = pattern.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if _is_all_files_glob(normalized):
+        return "*"
+    if normalized.startswith("**/"):
+        return normalized[3:] or "*"
+    return normalized
+
+
+def _select_directory_list_tool(tools: list[ToolSpec]) -> ToolSpec | None:
+    preferred_names = ("ls", "list", "list_dir", "listdir", "list_files", "listfiles")
+    for name in preferred_names:
+        for tool in tools:
+            lowered = tool.name.strip().lower()
+            compact = re.sub(r"[^a-z0-9]+", "", lowered)
+            if lowered == name or compact == name:
+                return tool
+    for tool in tools:
+        lowered = tool.name.strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", lowered)
+        if compact.startswith("list") and _is_read_only_name(tool.name):
+            return tool
+    return None
+
+
+def _directory_path_key(tool: ToolSpec) -> str:
+    properties = tool.input_schema.get("properties") if isinstance(tool.input_schema, dict) else None
+    if isinstance(properties, dict):
+        for key in ("path", "directory", "dir_path", "folder"):
+            if key in properties:
+                return key
+    return "path"
 
 
 def _candidate_items(candidate: Any) -> list[Any]:

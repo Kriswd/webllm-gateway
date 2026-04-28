@@ -180,6 +180,7 @@ def build_unknown_tool_recovery_payload(
     retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
     allowed = ", ".join(sorted(allowed_tools)) or "(none)"
     reason = bridge_result.error.message if bridge_result.error else "unknown tool"
+    examples = _unknown_tool_examples(allowed_tools)
     retry_messages.append({"role": "assistant", "content": (bridge_result.raw_content or "")[:4000]})
     retry_messages.append(
         {
@@ -187,7 +188,7 @@ def build_unknown_tool_recovery_payload(
             "content": (
                 f"上一轮工具调用被 Gateway 拒绝：{reason}。\n"
                 f"当前真实允许的工具名只有：{allowed}。\n"
-                "不要再请求未列出的工具，例如 Task、Agent、Subagent、Skill、Bash 或 shell。"
+                f"不要再请求未列出的工具，例如 {examples}。"
                 "如果确实需要工具，只能使用上面列出的真实工具名并输出一个 fenced tool_json block。"
                 "如果这些工具不足以完成任务，请不要输出 JSON，直接基于已有上下文给出诚实、完整的最终回答，并说明限制。"
             ),
@@ -196,6 +197,51 @@ def build_unknown_tool_recovery_payload(
     recovered["messages"] = retry_messages
     recovered["stream"] = False
     return recovered
+
+
+def build_tool_refusal_recovery_payload(
+    payload: dict[str, Any],
+    bridge_result: BridgeResult,
+    *,
+    allowed_tools: set[str],
+) -> dict[str, Any]:
+    recovered = dict(payload)
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
+    allowed = ", ".join(sorted(allowed_tools)) or "(none)"
+    reason = bridge_result.error.message if bridge_result.error else "tool refusal without call"
+    retry_messages.append({"role": "assistant", "content": (bridge_result.raw_content or "")[:4000]})
+    retry_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Your previous reply still refused to use tools, claimed you cannot access the filesystem/run commands, "
+                "or offered manual steps instead of a tool request. That is incorrect for this Gateway tool bridge.\n"
+                f"Gateway rejection reason: {reason}\n"
+                f"The downstream client has exposed these real allowed tools: {allowed}.\n"
+                "The Gateway itself will not execute local tools. The downstream client owns permissions and executes allowed tools after you request them.\n"
+                "Do not say you cannot access files, run commands, use Bash/Git/gh, update the project, or provide manual steps.\n"
+                "If the task requires local project work, output exactly one fenced tool_json block using one allowed tool.\n"
+                "If Bash is allowed and you need git/gh/shell behavior, request Bash with a command string.\n"
+                "If no listed tool can help, answer honestly without JSON. Never invent tool names.\n"
+                "Required format when using a tool:\n"
+                "```tool_json\n"
+                "{\"calls\":[{\"id\":\"call_1\",\"name\":\"Bash\",\"input\":{\"command\":\"git status --short\"}}]}\n"
+                "```\n"
+                "No natural language outside the fenced tool_json block when a tool is needed. No manual steps."
+            ),
+        }
+    )
+    recovered["messages"] = retry_messages
+    recovered["stream"] = False
+    return recovered
+
+
+def _unknown_tool_examples(allowed_tools: set[str]) -> str:
+    allowed_lower = {tool.lower() for tool in allowed_tools}
+    examples = ["Task", "Agent", "Subagent", "Skill", "Bash", "shell"]
+    visible = [example for example in examples if example.lower() not in allowed_lower]
+    return "、".join(visible) or "未列出的工具"
 
 
 def parse_chat_response(

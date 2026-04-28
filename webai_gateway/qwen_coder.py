@@ -13,6 +13,9 @@ import httpx
 QWEN_CODER_MODEL_PREFIX = "qwen-coder/"
 QWEN_CODER_BASE_URL = "https://coder.qwen.ai"
 DEFAULT_QWEN_CODER_REQUEST_TIMEOUT_SECONDS = 300  # 编程任务需要更长超时
+QWEN_CODER_MODEL_ALIASES = {
+    "qwen-coder-plus": "qwen3-coder-plus",
+}
 _DATA_URL_RE = re.compile(r"^data:(?P<media>[^;,]+);base64,(?P<data>.*)$", re.DOTALL)
 _TOOL_JSON_BLOCK_RE = re.compile(r"```tool_json\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
@@ -22,7 +25,8 @@ def is_qwen_coder_model(model: Any) -> bool:
 
 
 def normalize_qwen_coder_model(model: str) -> str:
-    return model.removeprefix(QWEN_CODER_MODEL_PREFIX) or "qwen-coder-plus"
+    normalized = model.removeprefix(QWEN_CODER_MODEL_PREFIX) or "qwen3-coder-plus"
+    return QWEN_CODER_MODEL_ALIASES.get(normalized, normalized)
 
 
 class QwenCoderClient:
@@ -35,7 +39,7 @@ class QwenCoderClient:
         request_timeout_seconds: float = DEFAULT_QWEN_CODER_REQUEST_TIMEOUT_SECONDS,
         prompt_max_chars: int = 12000,
         enable_artifacts: bool = True,
-        enable_mcp: bool = True,
+        enable_mcp: bool = False,
         enable_thinking: bool = True,
     ) -> None:
         self.credential = credential
@@ -124,8 +128,9 @@ class QwenCoderClient:
             "thinking_enabled": self.enable_thinking,
             "output_schema": "phase",
             "artifacts_enabled": self.enable_artifacts,
-            "mcp_enabled": self.enable_mcp,
         }
+        if self.enable_mcp:
+            feature_config["mcp_enabled"] = True
         if enable_web_search:
             feature_config["auto_search"] = True
             
