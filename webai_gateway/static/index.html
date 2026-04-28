@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebAI Gateway 控制台</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">WG</div>
+          <div>
+            <div class="brand-title">WebAI Gateway</div>
+            <div class="brand-subtitle">OpenAI 兼容桥接器</div>
+          </div>
+        </div>
+        <nav class="nav" aria-label="控制台分区">
+          <a href="#status" class="nav-link active">状态</a>
+          <a href="#web-auth" class="nav-link">网页授权</a>
+          <a href="#token" class="nav-link">令牌</a>
+          <a href="#upstream" class="nav-link">上游</a>
+          <a href="#test" class="nav-link">接口测试</a>
+          <a href="#clients" class="nav-link">客户端</a>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1>WebAI Gateway 控制台</h1>
+            <p>管理本地 API、网页模型授权和工具调用桥接。</p>
+          </div>
+          <button id="refreshButton" class="icon-button" type="button" title="刷新状态" aria-label="刷新状态">
+            <span aria-hidden="true">刷新</span>
+          </button>
+        </header>
+
+        <section id="status" class="panel status-grid">
+          <div class="metric">
+            <span class="metric-label">网关</span>
+            <strong id="gatewayStatus">检测中</strong>
+            <small id="gatewayUrl">http://127.0.0.1:8610</small>
+          </div>
+          <div class="metric">
+            <span class="metric-label">上游</span>
+            <strong id="upstreamStatus">未知</strong>
+            <small id="upstreamUrl">未加载</small>
+          </div>
+          <div class="metric">
+            <span class="metric-label">模型</span>
+            <strong id="modelName">未加载</strong>
+            <small id="toolMode">工具模式：prompt</small>
+          </div>
+        </section>
+
+        <section id="web-auth" class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>网页登录授权</h2>
+              <p>DeepSeek 支持本地一键授权；其它站点直接复用 WebAI2API 原生管理台。</p>
+            </div>
+            <span id="authBadge" class="badge">检测中</span>
+          </div>
+          <div class="native-console">
+            <div>
+              <span class="metric-label">WebAI2API 原生管理台</span>
+              <strong id="webai2apiUiUrl">未加载</strong>
+              <small>网页登录、适配器、工作池、虚拟显示器都在 WebAI2API 原生界面里完成。</small>
+            </div>
+            <div class="button-row compact-row">
+              <button id="openWebai2apiButton" type="button" class="primary">打开原生管理台</button>
+              <button id="openWebai2apiLoginButton" type="button" class="secondary">进入登录/重启页</button>
+              <button id="embedWebai2apiButton" type="button" class="secondary">在此嵌入</button>
+            </div>
+          </div>
+          <div id="webai2apiFrameWrap" class="native-frame is-hidden">
+            <iframe id="webai2apiFrame" title="WebAI2API 原生管理台" referrerpolicy="no-referrer"></iframe>
+          </div>
+          <div class="auth-grid">
+            <div class="auth-status">
+              <span id="authProviderLabel" class="metric-label">DeepSeek Web</span>
+              <strong id="authStatus">未加载</strong>
+              <small id="authUpdatedAt">尚未授权</small>
+            </div>
+            <label class="field">
+              <span>网页模型</span>
+              <select id="authProvider">
+                <option value="deepseek-web">DeepSeek Web</option>
+              </select>
+            </label>
+            <div class="snippet">
+              <span class="snippet-label">可用模型名</span>
+              <code id="authModelName">deepseek-web/deepseek-chat</code>
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="startAuthButton" type="button" class="primary">一键启动 DeepSeek 授权浏览器</button>
+            <button id="captureAuthButton" type="button" class="secondary">重新捕获登录态</button>
+            <button id="refreshAuthButton" type="button" class="secondary">刷新授权状态</button>
+            <button id="clearAuthButton" type="button" class="danger">清除授权</button>
+          </div>
+          <pre id="authLog" class="output compact" aria-live="polite">等待操作。</pre>
+        </section>
+
+        <form id="configForm" class="layout-grid">
+          <section id="token" class="panel">
+            <div class="section-heading">
+              <div>
+                <h2>令牌</h2>
+                <p>KrisAI、OpenClaw、Hermes、Claude Code 等客户端使用这里的 Bearer 令牌。</p>
+              </div>
+              <span class="badge">仅本机管理</span>
+            </div>
+            <label class="field">
+              <span>API 令牌</span>
+              <input id="serverApiKey" name="serverApiKey" type="password" autocomplete="off" />
+            </label>
+            <div class="button-row">
+              <button id="toggleTokenButton" type="button" class="secondary">显示</button>
+              <button id="copyTokenButton" type="button" class="secondary">复制</button>
+              <button id="rotateTokenButton" type="button" class="danger">轮换</button>
+            </div>
+          </section>
+
+          <section id="upstream" class="panel">
+            <div class="section-heading">
+              <div>
+                <h2>上游</h2>
+                <p>需要继续复用 WebAI2API 时，在这里配置它的 OpenAI 兼容地址。</p>
+              </div>
+            </div>
+            <div class="two-col">
+              <label class="field">
+                <span>基础地址</span>
+                <input id="upstreamBaseUrl" name="upstreamBaseUrl" type="url" placeholder="http://127.0.0.1:8500/v1" />
+              </label>
+              <label class="field">
+                <span>模型</span>
+                <input id="upstreamModel" name="upstreamModel" type="text" placeholder="webai2api-model" />
+              </label>
+              <label class="field">
+                <span>上游 API 密钥</span>
+                <input id="upstreamApiKey" name="upstreamApiKey" type="password" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>工具模式</span>
+                <select id="toolModeSelect" name="toolModeSelect">
+                  <option value="prompt">提示词桥接</option>
+                  <option value="native">原生工具调用</option>
+                  <option value="off">关闭</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>工具桥激活策略</span>
+                <select id="toolActivationPolicySelect" name="toolActivationPolicySelect">
+                  <option value="auto">自动（普通问答直连，Agent 任务桥接）</option>
+                  <option value="always">始终桥接</option>
+                  <option value="off">关闭桥接</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>网页登录请求超时（秒）</span>
+                <input id="providerRuntimeTimeoutSeconds" name="providerRuntimeTimeoutSeconds" type="number" min="30" max="900" />
+              </label>
+              <label class="field">
+                <span>网页登录 Prompt 上限（字符）</span>
+                <input id="providerRuntimePromptMaxChars" name="providerRuntimePromptMaxChars" type="number" min="4000" max="200000" />
+              </label>
+              <label class="field">
+                <span>Provider 原生联网</span>
+                <select id="nativeWebSearchPolicySelect" name="nativeWebSearchPolicySelect">
+                  <option value="auto">自动（检测到联网/最新/官网等问题时启用）</option>
+                  <option value="force">强制启用</option>
+                  <option value="off">关闭</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>工具暴露策略</span>
+                <select id="toolExposurePolicySelect" name="toolExposurePolicySelect">
+                  <option value="safe">安全默认（隐藏 Bash/Edit/Write 等底层工具）</option>
+                  <option value="all">全工具优先（交给下游权限系统确认）</option>
+                  <option value="allowlist">仅允许 allowlist</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>路径列表压缩</span>
+                <select id="observationPolicyPathSummary" name="observationPolicyPathSummary">
+                  <option value="true">启用（推荐，过滤依赖/构建/cache 路径）</option>
+                  <option value="false">关闭</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>排除路径片段</span>
+                <textarea id="observationPolicyPathParts" name="observationPolicyPathParts" rows="5" placeholder="node_modules&#10;.pnpm&#10;dist&#10;build"></textarea>
+              </label>
+              <label class="field">
+                <span>排除路径 glob</span>
+                <textarea id="observationPolicyPathGlobs" name="observationPolicyPathGlobs" rows="5" placeholder="**/generated/**&#10;**/.cache/**"></textarea>
+              </label>
+              <label class="field">
+                <span>保留相关路径数量</span>
+                <input id="observationPolicyMaxItems" name="observationPolicyMaxItems" type="number" min="1" max="500" />
+              </label>
+            </div>
+            <div class="button-row align-end">
+              <button id="saveConfigButton" type="submit" class="primary">保存并应用</button>
+            </div>
+          </section>
+        </form>
+
+        <section id="test" class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>接口测试</h2>
+              <p>检查模型列表、聊天接口和工具调用解析。</p>
+            </div>
+          </div>
+          <div class="test-grid">
+            <label class="field">
+              <span>提示词</span>
+              <textarea id="testPrompt" rows="4">用一句简短的话打个招呼。</textarea>
+            </label>
+            <label class="field">
+              <span>模式</span>
+              <select id="testMode">
+                <option value="chat">普通聊天</option>
+                <option value="tool">工具调用探测</option>
+              </select>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="modelsTestButton" type="button" class="secondary">测试 /v1/models</button>
+            <button id="chatTestButton" type="button" class="primary">测试聊天</button>
+          </div>
+          <pre id="testOutput" class="output" aria-live="polite">就绪。</pre>
+        </section>
+
+        <section id="clients" class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>客户端配置</h2>
+              <p>在任何支持 OpenAI 兼容端点的客户端里使用这些值。</p>
+            </div>
+          </div>
+          <div class="snippet-grid">
+            <div>
+              <span class="snippet-label">基础地址</span>
+              <code id="clientBaseUrl">http://127.0.0.1:8610/v1</code>
+            </div>
+            <div>
+              <span class="snippet-label">API 密钥</span>
+              <code id="clientApiKey">local-dev-key</code>
+            </div>
+            <div>
+              <span class="snippet-label">模型</span>
+              <code id="clientModel">webai2api-model</code>
+            </div>
+          </div>
+        </section>
+
+        <div id="toast" class="toast" role="status" aria-live="polite"></div>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

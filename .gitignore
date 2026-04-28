@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.codex-logs/
+.learnings/
+.venv/
+venv/
+*.log
+config.json
+credentials/
+.webai-gateway/
+webui/node_modules/

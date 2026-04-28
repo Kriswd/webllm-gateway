@@ -1,0 +1,29 @@
+{
+  "model": "webai2api-model",
+  "messages": [
+    {
+      "role": "user",
+      "content": "please read README"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a local file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ]
+}

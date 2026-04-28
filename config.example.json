@@ -1,0 +1,57 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8610,
+    "apiKey": "local-dev-key"
+  },
+  "upstream": {
+    "baseUrl": "http://127.0.0.1:8500/v1",
+    "apiKey": "",
+    "model": "webai2api-model",
+    "toolMode": "prompt"
+  },
+  "providerRuntime": {
+    "requestTimeoutSeconds": 180,
+    "promptMaxChars": 12000,
+    "nativeWebSearchPolicy": "auto"
+  },
+  "tool_bridge": {
+    "mode": "strict",
+    "activationPolicy": "auto",
+    "maxToolsInPrompt": 32,
+    "maxCallsPerTurn": 1,
+    "maxReadonlyCallsPerTurn": 4,
+    "toolPromptMaxChars": 8000,
+    "observationMaxChars": 4000,
+    "exposurePolicy": "safe",
+    "allowedToolNames": [],
+    "observationPolicy": {
+      "summarizePathLists": true,
+      "excludedPathParts": [
+        ".cache",
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".next",
+        ".nuxt",
+        ".pnpm",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".svn",
+        ".turbo",
+        ".venv",
+        "__pycache__",
+        "bower_components",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "site-packages",
+        "target",
+        "vendor"
+      ],
+      "excludedPathGlobs": [],
+      "pathListMaxItems": 80
+    }
+  }
+}
