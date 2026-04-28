@@ -48,6 +48,7 @@ _DEFERRED_TOOL_ACTION_RE = re.compile(
 )
 _QUOTED_WINDOWS_PATH_RE = re.compile(r"(?P<quote>[\"'])(?P<path>[A-Za-z]:\\[^\"'\r\n]+)(?P=quote)")
 _UNQUOTED_WINDOWS_PATH_RE = re.compile(r"(?<![\w/])(?P<path>[A-Za-z]:\\[^\s&|;<>]*)")
+_SHELL_COMMAND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _READ_ONLY_PREFIXES = ("read", "list", "search", "fetch", "get", "show", "find", "query")
 _READ_ONLY_NAMES = frozenset(
     {
@@ -1019,6 +1020,9 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
                 if expensive_glob:
                     return [], BridgeError("expensive_tool_input", expensive_glob, repairable=True)
             normalized = _normalize_shell_tool_command(normalized, canonical_name, context.tools)
+            shell_error = _shell_tool_command_error(normalized, canonical_name, context.tools)
+            if shell_error:
+                return [], shell_error
             call_id = normalized.id or f"call_web_{len(out) + 1}"
             if call_id in seen_ids:
                 return [], BridgeError("duplicate_tool_call_id", f"重复的工具调用 id：{call_id}")
@@ -1064,6 +1068,17 @@ def _normalize_shell_tool_command(call: ToolCallDraft, canonical_name: str, tool
     updated = dict(call.input)
     updated[command_key] = normalized
     return ToolCallDraft(id=call.id, name=call.name, input=updated)
+
+
+def _shell_tool_command_error(call: ToolCallDraft, canonical_name: str, tools: list[ToolSpec]) -> BridgeError | None:
+    if not _is_bash_tool_name(canonical_name):
+        return None
+    bash_tool = next((tool for tool in tools if tool.name == canonical_name), None)
+    command_key = _shell_command_key(bash_tool) if bash_tool else "command"
+    command = call.input.get(command_key)
+    if not isinstance(command, str) or not command.strip():
+        return BridgeError("incomplete_shell_command", "Bash command is empty; provide a complete command string.", repairable=True)
+    return _incomplete_shell_command_error(command)
 
 
 def _is_cli_tool_name(name: str) -> bool:
@@ -1173,6 +1188,79 @@ def _normalize_windows_paths_for_bash(command: str) -> str:
 
 def _windows_path_to_bash_path(path: str) -> str:
     return path.replace("\\", "/")
+
+
+def _incomplete_shell_command_error(command: str) -> BridgeError | None:
+    for segment in _SHELL_COMMAND_SPLIT_RE.split(command):
+        stripped = segment.strip()
+        if not stripped:
+            return BridgeError(
+                "incomplete_shell_command",
+                "Bash command contains an empty shell segment; provide a complete command.",
+                repairable=True,
+            )
+        words = _shell_words(stripped)
+        if not words:
+            continue
+        if len(words) == 1 and words[0] in {"cd", "git"}:
+            return BridgeError(
+                "incomplete_shell_command",
+                f"Bash command segment {stripped!r} is incomplete; include the required arguments.",
+                repairable=True,
+            )
+        if len(words) >= 2 and words[0] == "git" and words[1] == "clone":
+            meaningful_args = _meaningful_git_clone_args(words[2:])
+            if not meaningful_args:
+                return BridgeError(
+                    "incomplete_shell_command",
+                    "git clone is missing the repository URL. Include the repo URL and destination path when needed.",
+                    repairable=True,
+                )
+    return None
+
+
+def _shell_words(segment: str) -> list[str]:
+    try:
+        return shlex.split(segment, posix=True)
+    except ValueError:
+        return [part for part in re.split(r"\s+", segment.strip()) if part]
+
+
+def _meaningful_git_clone_args(args: list[str]) -> list[str]:
+    meaningful: list[str] = []
+    options_with_values = {
+        "-b",
+        "--branch",
+        "-c",
+        "--config",
+        "--depth",
+        "-j",
+        "--jobs",
+        "-o",
+        "--origin",
+        "--reference",
+        "--reference-if-able",
+        "--recurse-submodules",
+        "--server-option",
+        "--shallow-exclude",
+        "--shallow-since",
+        "--template",
+        "--upload-pack",
+    }
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if not arg:
+            continue
+        if arg in options_with_values:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        meaningful.append(arg)
+    return meaningful
 
 
 def _safe_replacement_for_expensive_glob(

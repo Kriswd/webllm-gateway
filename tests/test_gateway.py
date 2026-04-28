@@ -1179,6 +1179,36 @@ def test_tool_bridge_normalizes_windows_paths_in_bash_command() -> None:
     ]
 
 
+def test_tool_bridge_rejects_incomplete_git_clone_command() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"Bash","input":{"command":"git clone"}}]}\n```',
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is not None
+    assert result.error.kind == "incomplete_shell_command"
+    assert result.error.repairable is True
+
+
 def test_tool_bridge_does_not_rewrite_cli_name_without_bash() -> None:
     context = build_context(
         [
@@ -2696,6 +2726,67 @@ def test_qwen_coder_keeps_tool_bridge_for_windows_path_update_task(tmp_path: Pat
             "id": "toolu_call_1",
             "name": "Bash",
             "input": {"command": "cd E:/ProjectX/mindcraft/MediaCrawler && git status --short"},
+        }
+    ]
+
+
+def test_qwen_coder_repairs_incomplete_git_clone_before_tool_use(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class RepairingQwenCoderClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response(
+                    '```tool_json\n{"calls":[{"id":"call_1","name":"Bash","input":{"command":"git clone"}}]}\n```'
+                )
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"call_2","name":"Bash","input":{"command":"git clone https://github.com/NanmiCoder/MediaCrawler.git E:\\\\ProjectX\\\\mindcraft\\\\MediaCrawler"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        provider_runtime=ProviderRuntimeConfig(native_web_search_policy="auto"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_qwen_coder_credential_store(tmp_path),
+            qwen_coder_client_factory=RepairingQwenCoderClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-coder/qwen-coder-plus",
+            "messages": [
+                {"role": "user", "content": r"E:\ProjectX\mindcraft\MediaCrawler 这个项目更新到 https://github.com/NanmiCoder/MediaCrawler"}
+            ],
+            "tools": [{"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}}],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "git clone is missing the repository URL" in retry_prompt
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_2",
+            "name": "Bash",
+            "input": {
+                "command": "git clone https://github.com/NanmiCoder/MediaCrawler.git E:/ProjectX/mindcraft/MediaCrawler"
+            },
         }
     ]
 
