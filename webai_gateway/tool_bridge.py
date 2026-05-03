@@ -87,6 +87,13 @@ _SKILL_DOC_HEADING_RE = re.compile(r"(?im)^\s*#\s+[^\n#]{1,120}\bSkill\b")
 _SKILL_DOC_COLON_HEADING_RE = re.compile(
     r"(?im)^\s*#\s+(?P<skill>[A-Za-z][A-Za-z0-9_.:@/-]{1,80})\s*:\s*[^\n#]{1,160}$"
 )
+_SKILL_FRONTMATTER_RE = re.compile(
+    r"^\s*---\s*\n"
+    r"(?=[\s\S]{0,1000}^\s*name:\s*[A-Za-z0-9_.:@/-]+\s*$)"
+    r"(?=[\s\S]{0,1000}^\s*description:\s*Use\s+when\b)"
+    r"[\s\S]{0,1600}?^\s*---\s*(?:\n|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 _SKILL_DOC_MARKER_RE = re.compile(
     r"(?im)(^\s*##\s+(When|Instructions|Procedure|Workflow|Examples)\b|"
     r"^\s*##\s+Phase\b|Base directory for this skill:|Skill instructions|ARGUMENTS:)"
@@ -3913,6 +3920,7 @@ def _looks_like_skill_injection_text(text: str) -> bool:
         stripped.startswith("Base directory for this skill:")
         or ("<EXTREMELY-IMPORTANT>" in value and "# Using Skills" in value)
         or ("Skill instructions" in value and "ARGUMENTS:" in value)
+        or bool(_SKILL_FRONTMATTER_RE.search(value))
         or bool(_SKILL_DOC_HEADING_RE.search(value) and _SKILL_DOC_MARKER_RE.search(value))
         or bool(_SKILL_DOC_COLON_HEADING_RE.search(value) and _SKILL_DOC_MARKER_RE.search(value))
     )

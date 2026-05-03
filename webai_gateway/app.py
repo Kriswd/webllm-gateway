@@ -1291,6 +1291,7 @@ def _provider_diagnostic_fields(diagnostic: Any) -> dict[str, Any]:
         "prompt_compaction_strategy": "providerPromptCompactionStrategy",
         "prompt_history_entry_count": "providerPromptHistoryEntryCount",
         "prompt_latest_entry_count": "providerPromptLatestEntryCount",
+        "current_task_anchor_chars": "providerCurrentTaskAnchorChars",
         "message_count": "providerMessageCount",
         "artifacts_enabled": "providerArtifactsEnabled",
         "mcp_enabled": "providerMcpEnabled",

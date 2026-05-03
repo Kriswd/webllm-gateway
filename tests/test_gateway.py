@@ -2697,6 +2697,94 @@ def test_tool_bridge_uses_command_args_instead_of_superpowers_skill_body_for_tas
     assert "EXTREMELY-IMPORTANT" not in refined.task_text
 
 
+def test_tool_bridge_uses_inline_skill_arguments_without_trailing_skill_body() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+    command_args = "审查当前项目代码，看看有什么需要改进的"
+    skill_body = (
+        "Base directory for this skill: C:\\Users\\woody\\.codex\\plugins\\cache\\superpowers\\using-superpowers\n"
+        f"ARGUMENTS: {command_args}\n\n"
+        "<EXTREMELY-IMPORTANT>\n"
+        "This long skill body is instruction text, not the user's current task.\n"
+        "</EXTREMELY-IMPORTANT>\n\n"
+        "# Using Skills\n"
+        + ("large skill instruction block\n" * 300)
+    )
+
+    refined = prefer_local_tools_for_local_agent_task(
+        context,
+        [{"role": "user", "content": [{"type": "text", "text": skill_body}]}],
+    )
+
+    assert refined.task_text == command_args
+    assert len(refined.task_text) < 100
+    assert "EXTREMELY-IMPORTANT" not in refined.task_text
+    assert "large skill instruction block" not in refined.task_text
+
+
+def test_tool_bridge_skips_yaml_frontmatter_skill_body_for_task_anchor() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+    skill_body = (
+        "---\n"
+        "name: requesting-code-review\n"
+        "description: Use when completing tasks, implementing major features, or before merging to verify work meets requirements\n"
+        "---\n\n"
+        "# Requesting Code Review\n\n"
+        "Dispatch superpowers:code-reviewer subagent to catch issues before they cascade.\n"
+        + ("review workflow instruction\n" * 300)
+    )
+
+    refined = prefer_local_tools_for_local_agent_task(
+        context,
+        [
+            {
+                "role": "user",
+                "content": (
+                    "<command-message>using-superpowers</command-message>\n"
+                    "<command-name>/using-superpowers</command-name>\n"
+                    "<command-args>审查当前项目代码，看看有什么需要改进的</command-args>"
+                ),
+            },
+            {"role": "user", "content": skill_body},
+        ],
+    )
+
+    assert refined.task_text == "审查当前项目代码，看看有什么需要改进的"
+    assert "requesting-code-review" not in refined.task_text
+    assert "review workflow instruction" not in refined.task_text
+
+
 def test_tool_bridge_normalizes_glob_path_with_embedded_pattern() -> None:
     context = build_context(
         [
@@ -16231,6 +16319,7 @@ def test_request_diagnostics_records_qwen_coder_provider_diagnostic(tmp_path: Pa
                 "prompt_compaction_strategy": "ds2api_layered_history",
                 "prompt_history_entry_count": 120,
                 "prompt_latest_entry_count": 5,
+                "current_task_anchor_chars": 253,
                 "message_count": 3,
                 "artifacts_enabled": False,
                 "mcp_enabled": False,
@@ -16275,6 +16364,7 @@ def test_request_diagnostics_records_qwen_coder_provider_diagnostic(tmp_path: Pa
     assert event["providerPromptCompactionStrategy"] == "ds2api_layered_history"
     assert event["providerPromptHistoryEntryCount"] == 120
     assert event["providerPromptLatestEntryCount"] == 5
+    assert event["providerCurrentTaskAnchorChars"] == 253
     assert event["providerMessageCount"] == 3
     assert event["providerArtifactsEnabled"] is False
     assert event["providerThinkingEnabled"] is False
