@@ -96,6 +96,25 @@ _UNKNOWN_PROJECT_STRUCTURE_FINAL_RE = re.compile(
     r"项目根目录|根目录路径|目录结构|文件列表|关键代码|编程语言|框架)",
     re.IGNORECASE | re.DOTALL,
 )
+_DOC_NEXT_STEP_SUMMARY_FINAL_RE = re.compile(
+    r"(?:according\s+to|based\s+on|根据).{0,80}(?:\b[A-Za-z0-9_.-]+\.md\b|document|docs?|文档)"
+    r".{0,160}(?:next\s+steps?|下一步).{0,120}(?:recommend|suggest|建议|操作)|"
+    r"(?:\b[A-Za-z0-9_.-]+\.md\b|document|docs?|文档).{0,120}(?:listed|列出).{0,80}"
+    r"(?:next\s+steps?|下一步).{0,120}(?:recommend|suggest|建议|操作)",
+    re.IGNORECASE | re.DOTALL,
+)
+_OPTIONAL_NEXT_STEP_SELECTION_FINAL_RE = re.compile(
+    r"(?:请问|请选择|你希望|您希望|是否需要|需要我|要我).{0,120}"
+    r"(?:执行|选择|继续|处理|优先|开始).{0,80}(?:哪一项|哪项|哪一个|哪个|操作|任务|事项|功能)|"
+    r"(?:或者|或).{0,40}(?:其他|其它).{0,80}(?:具体任务|任务|需求).{0,40}(?:处理|执行|继续)?|"
+    r"(?:which|what|would\s+you\s+like|do\s+you\s+want).{0,160}"
+    r"(?:operation|option|task|action|next\s+step)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TASK_REQUESTS_NEXT_STEP_SELECTION_RE = re.compile(
+    r"\b(?:next\s+steps?|options?|choose|select)\b|(?:下一步|选项|选择|让我选|让用户选|问我)",
+    re.IGNORECASE,
+)
 _OFF_TASK_ENV_CONFIG_FINAL_RE = re.compile(
     r"\bcaveman\s+mode\s+active\b.{0,200}\b(?:statusline|status\s+line|settings\.json|badge|plugins?|hooks?)\b|"
     r"\b(?:statusline|status\s+line|badge)\b.{0,160}\b(?:settings\.json|configured|configure|command)\b|"
@@ -182,6 +201,21 @@ def classify_bridge_result(
             "RETRY",
             retry_kind="unknown_project_structure_final_without_task_answer",
             reason="unknown_project_structure_final_without_task_answer",
+            bridge_result=result,
+            retry_state=RetryState(
+                repair_attempts=state.repair_attempts + 1,
+                recovery_attempts=state.recovery_attempts,
+                ask_user_attempts=state.ask_user_attempts,
+            ),
+        )
+
+    if _is_review_next_step_menu_final_without_task_answer(context, result.content):
+        if state.repair_attempts >= max_repair_attempts:
+            return ControllerDecision("FINAL", reason="retry_budget_exhausted", bridge_result=result, retry_state=state)
+        return ControllerDecision(
+            "RETRY",
+            retry_kind="review_next_step_menu_final_without_task_answer",
+            reason="review_next_step_menu_final_without_task_answer",
             bridge_result=result,
             retry_state=RetryState(
                 repair_attempts=state.repair_attempts + 1,
@@ -462,6 +496,39 @@ def _is_unknown_project_structure_final_without_task_answer(context: ToolBridgeC
         return False
     ledger = build_evidence_ledger(context)
     return ledger.has_discovery or "glob" in raw.lower() or "目录" in raw or "directory" in raw.lower()
+
+
+def _is_review_next_step_menu_final_without_task_answer(context: ToolBridgeContext, text: str) -> bool:
+    if not context.has_tool_loop or not context.allowed_names:
+        return False
+    task = context.task_text or ""
+    if _TASK_REQUESTS_NEXT_STEP_SELECTION_RE.search(task):
+        return False
+    if not _REVIEW_TASK_RE.search(task):
+        return False
+    ledger = build_evidence_ledger(context)
+    if not (ledger.has_discovery or ledger.has_file_read or ledger.has_search):
+        return False
+    raw = " ".join((text or "").split())
+    if not raw or len(raw) > 2200:
+        return False
+    if _DOC_NEXT_STEP_SUMMARY_FINAL_RE.search(raw[:2200]) and _OPTIONAL_NEXT_STEP_SELECTION_FINAL_RE.search(raw[:2200]):
+        return True
+    return bool(_OPTIONAL_NEXT_STEP_SELECTION_FINAL_RE.search(raw[-800:]) and not _looks_like_substantive_review_final(raw))
+
+
+def _looks_like_substantive_review_final(text: str) -> bool:
+    raw = text or ""
+    has_finding_language = bool(
+        re.search(
+            r"\b(?:finding|findings|issue|issues|risk|risks|bug|bugs|defect|defects)\b|"
+            r"(?:发现|问题|风险|缺陷|漏洞|隐患)",
+            raw,
+            re.IGNORECASE,
+        )
+    )
+    has_code_reference = bool(re.search(r"`[^`]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs|md)`|[\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs)", raw))
+    return has_finding_language and has_code_reference
 
 
 def _is_off_task_environment_configuration_final(context: ToolBridgeContext, text: str) -> bool:

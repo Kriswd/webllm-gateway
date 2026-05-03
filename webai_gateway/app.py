@@ -2232,6 +2232,13 @@ def _controller_retry_error_message(error_kind: str) -> str:
             "context and request a narrower allowed tool such as Glob, Grep, Read, LS, or Bash when available. "
             "Do not ask the user to provide repository details that the downstream tools can inspect."
         )
+    if error_kind == "review_next_step_menu_final_without_task_answer":
+        return (
+            "The model returned a document next-step menu or asked the user to choose an operation instead of answering "
+            "the current code review/audit task. Do not summarize README/CONFIGURATION next-step suggestions as the final "
+            "answer. Continue inspecting relevant files with allowed tools, or provide concrete review findings, risks, "
+            "and improvement recommendations grounded in the files already read."
+        )
     return (
         "The controller rejected this response as incomplete for local-agent work. "
         "Request an allowed tool if more evidence is needed, otherwise provide a substantive final answer."

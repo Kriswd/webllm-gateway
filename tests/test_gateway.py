@@ -565,6 +565,47 @@ def test_tool_controller_retries_unknown_project_structure_final_in_all_profile(
     assert decision.reason == "unknown_project_structure_final_without_task_answer"
 
 
+def test_tool_controller_retries_review_doc_next_step_menu_final_in_all_profile() -> None:
+    text = (
+        "根据 `CONFIGURATION.md` 的配置总结，当前系统已配置好 Tu-Zi API 和飞书多维表格。"
+        "文档中列出的“下一步”操作建议如下："
+        "1. 测试 AI 改写功能 2. 测试飞书同步功能 3. 查看日志。"
+        "请问您希望执行哪一项操作？或者有其他具体任务需要处理？"
+    )
+    result = BridgeResult(content=text, tool_calls=[], raw_content=text)
+    context = _controller_context_with_tools(
+        ["Glob", "Grep", "Read", "Bash", "Skill"],
+        task_text="审查当前项目的代码，看看有什么需要改进的",
+        recent_tool_call_names=("Skill", "Glob", "Glob", "Bash", "Read", "Read"),
+    )
+    context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
+
+    decision = classify_bridge_result(result, context, RetryState())
+
+    assert decision.state == "RETRY"
+    assert decision.reason == "review_next_step_menu_final_without_task_answer"
+
+
+def test_tool_controller_all_profile_keeps_substantive_review_final_with_next_steps() -> None:
+    text = (
+        "审查结论：发现 2 个问题。"
+        "1. `sync_to_feishu.py` 同时处理配置读取和 API 调用，建议拆分客户端层。"
+        "2. `rewrite.py` 缺少失败重试，网络异常时会直接中断批处理。"
+        "下一步建议：先补充错误路径测试，再拆分飞书客户端。"
+    )
+    result = BridgeResult(content=text, tool_calls=[], raw_content=text)
+    context = _controller_context_with_tools(
+        ["Glob", "Grep", "Read", "Bash", "Skill"],
+        task_text="审查当前项目的代码，看看有什么需要改进的",
+        recent_tool_call_names=("Skill", "Glob", "Grep", "Read", "Read"),
+    )
+    context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
+
+    decision = classify_bridge_result(result, context, RetryState())
+
+    assert decision.state == "FINAL"
+
+
 def test_tool_controller_retries_off_task_environment_config_final_after_tool_loop() -> None:
     text = (
         'CAVEMAN MODE ACTIVE. Statusline badge not configured. Add to `~/.claude/settings.json`: '
