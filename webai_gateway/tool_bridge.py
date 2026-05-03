@@ -114,6 +114,9 @@ _SUCCESSFUL_TOOL_RESULT_RE = re.compile(
 _TOOL_SUMMARY_HEADER_RE = re.compile(r"assistant\s+requested\s+tool\s+calls\s*:", re.IGNORECASE)
 _TOOL_SUMMARY_CALL_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?P<name>[A-Za-z_][\w.:-]*)\s*\((?P<input>\{.*\})\)\s*$")
 _TOOL_SUMMARY_CALL_START_RE = re.compile(r"(?m)^\s*(?:[-*•]\s*)?(?P<name>[A-Za-z_][\w.:-]*)\s*\(")
+_CONVERTED_TOOL_RESULT_RE = re.compile(
+    r"(?is)^\s*Tool result for (?P<name>.+?) \(call id: (?P<id>.*?), is_error: (?P<is_error>true|false)\):\n(?P<body>.*)$"
+)
 _TOOL_HISTORY_ECHO_RE = re.compile(
     r"assistant\s+requested\s+tool\s+calls\s*:.*?"
     r"(?:"
@@ -686,7 +689,7 @@ def should_bridge_tools(
     latest = _effective_human_task_text(messages)
     if _looks_like_meta_capability_question(latest):
         return False
-    if _messages_have_tool_loop(messages):
+    if _messages_have_tool_loop(_messages_for_current_human_task(messages)):
         return True
     if _looks_like_local_agent_task(latest):
         return True
@@ -830,8 +833,9 @@ def prefer_local_tools_for_local_agent_task(
     tool_choice: Any = None,
 ) -> ToolBridgeContext:
     latest = _effective_human_task_text(messages)
-    recent_call_drafts = _recent_tool_call_drafts(messages) if isinstance(messages, list) else []
-    has_tool_loop = _messages_have_tool_loop(messages) or any(
+    task_messages = _messages_for_current_human_task(messages)
+    recent_call_drafts = _recent_tool_call_drafts(task_messages) if isinstance(task_messages, list) else []
+    has_tool_loop = _messages_have_tool_loop(task_messages) or any(
         _compact_tool_name(call.name) == "skill" for call in recent_call_drafts
     )
     recent_calls = [
@@ -846,10 +850,10 @@ def prefer_local_tools_for_local_agent_task(
         if skill_name
     )
     last_tool_result_text, last_tool_result_is_error = (
-        _last_tool_result_record(messages) if isinstance(messages, list) else ("", False)
+        _last_tool_result_record(task_messages) if isinstance(task_messages, list) else ("", False)
     )
     recent_successful_tool_results = (
-        _recent_successful_tool_result_records(messages) if isinstance(messages, list) else []
+        _recent_successful_tool_result_records(task_messages) if isinstance(task_messages, list) else []
     )
     recent_successful_tool_result_names = tuple(
         name for name, _, _ in recent_successful_tool_results[-8:]
@@ -857,7 +861,7 @@ def prefer_local_tools_for_local_agent_task(
     recent_successful_tool_result_summaries = tuple(
         summary for _, summary, _ in recent_successful_tool_results[-8:]
     )
-    failed_discovery_calls = _unresolved_failed_discovery_calls(messages) if isinstance(messages, list) else []
+    failed_discovery_calls = _unresolved_failed_discovery_calls(task_messages) if isinstance(task_messages, list) else []
     failed_discovery_call = failed_discovery_calls[-1] if failed_discovery_calls else None
     last_failed_discovery_path = _tool_path_from_input(failed_discovery_call.input) if failed_discovery_call else ""
     last_failed_discovery_summary = _tool_loop_summary(failed_discovery_call) if failed_discovery_call else ""
@@ -875,7 +879,7 @@ def prefer_local_tools_for_local_agent_task(
         path for path in (_tool_path_from_input(call.input) for call in failed_discovery_calls) if path
     )
     recent_failed_discovery_summaries = tuple(_tool_loop_summary(call) for call in failed_discovery_calls)
-    unchanged_read_calls = _recent_unchanged_read_calls(messages) if isinstance(messages, list) else []
+    unchanged_read_calls = _recent_unchanged_read_calls(task_messages) if isinstance(task_messages, list) else []
     unchanged_read_call = unchanged_read_calls[-1] if unchanged_read_calls else None
     last_unchanged_read_path = _tool_path_from_input(unchanged_read_call.input) if unchanged_read_call else ""
     last_unchanged_read_summary = _tool_loop_summary(unchanged_read_call) if unchanged_read_call else ""
@@ -883,7 +887,7 @@ def prefer_local_tools_for_local_agent_task(
         path for path in (_tool_path_from_input(call.input) for call in unchanged_read_calls) if path
     )
     recent_unchanged_read_summaries = tuple(_tool_loop_summary(call) for call in unchanged_read_calls)
-    has_repo_discovery_for_write = _has_repo_discovery_for_write(messages) if isinstance(messages, list) else False
+    has_repo_discovery_for_write = _has_repo_discovery_for_write(task_messages) if isinstance(task_messages, list) else False
     force_tools = _tool_choice_requires_tool(tool_choice)
     force_activation = (context.options.activation_policy or "auto").strip().lower() == "always"
     shell_explicit = _local_agent_task_explicitly_requests_shell(latest)
@@ -1381,19 +1385,24 @@ def prepare_openai_messages(messages: list[dict[str, Any]], context: ToolBridgeC
     call_names = _assistant_tool_call_names(messages)
     converted = [_convert_message(message, call_names=call_names, options=context.options) for message in messages if isinstance(message, dict)]
     if not _allows_ds2api_style_progress_passthrough(context):
-        loop_guard = _tool_loop_guard_message(messages)
+        task_messages = _messages_for_current_human_task(messages)
+        loop_guard = _tool_loop_guard_message(task_messages)
         if loop_guard:
             converted.append({"role": "user", "content": loop_guard})
-        repeat_skill_guard = _repeat_skill_guard_message(messages)
+        repeat_skill_guard = _repeat_skill_guard_message(task_messages)
         if repeat_skill_guard:
             converted.append({"role": "user", "content": repeat_skill_guard})
-    failed_path_guard = _failed_path_tool_result_guard_message(messages, context)
+    task_messages = _messages_for_current_human_task(messages)
+    failed_path_guard = _failed_path_tool_result_guard_message(task_messages, context)
     if failed_path_guard:
         converted.append({"role": "user", "content": failed_path_guard})
     if not _allows_ds2api_style_progress_passthrough(context):
-        unchanged_read_guard = _unchanged_read_tool_result_guard_message(messages, context)
+        unchanged_read_guard = _unchanged_read_tool_result_guard_message(task_messages, context)
         if unchanged_read_guard:
             converted.append({"role": "user", "content": unchanged_read_guard})
+    boundary_guard = _new_task_boundary_guard_message(messages, context)
+    if boundary_guard:
+        converted.append({"role": "user", "content": boundary_guard})
     if converted and converted[0].get("role") == "system":
         converted[0] = {**converted[0], "content": f"{_as_text(converted[0].get('content')).strip()}\n\n{prompt}".strip()}
         return converted
@@ -1567,6 +1576,20 @@ def _tool_manifest_json(functions: list[dict[str, Any]], *, max_chars: int) -> s
     return prefix + json.dumps(names_only, ensure_ascii=False, separators=(",", ":"))
 
 
+def _new_task_boundary_guard_message(messages: list[dict[str, Any]], context: ToolBridgeContext) -> str:
+    if not _current_task_starts_after_prior_tool_history(messages):
+        return ""
+    task = (context.task_text or _effective_human_task_text(messages)).strip()
+    if not task:
+        return ""
+    return (
+        "New user task boundary: the latest user request starts a new task after earlier tool history. "
+        "Treat previous tool calls, previous tool results, background task ids, and install/run commands as historical context only. "
+        "Do not poll TaskOutput, continue prior background jobs, or resume prior setup/install commands unless the latest user request explicitly asks to continue them.\n"
+        f"Current user task: {task[:1000]}"
+    )
+
+
 def _tool_loop_guard_message(messages: list[dict[str, Any]]) -> str:
     if not _last_message_is_tool_result(messages):
         return ""
@@ -1689,6 +1712,8 @@ def _last_message_is_tool_result(messages: list[dict[str, Any]]) -> bool:
             continue
         if role == "tool":
             return True
+        if role == "user" and _message_is_tool_result(message):
+            return True
         content = message.get("content")
         if role == "user" and isinstance(content, list):
             return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
@@ -1697,7 +1722,8 @@ def _last_message_is_tool_result(messages: list[dict[str, Any]]) -> bool:
 
 
 def _last_message_is_skill_injection_text(messages: list[dict[str, Any]]) -> bool:
-    for message in reversed(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "")
@@ -1705,7 +1731,10 @@ def _last_message_is_skill_injection_text(messages: list[dict[str, Any]]) -> boo
             continue
         if role != "user":
             return False
-        return _looks_like_skill_injection_text(_content_to_text(message.get("content")))
+        if _message_is_gateway_control_instruction(message):
+            continue
+        text = _content_to_text(message.get("content"))
+        return _looks_like_skill_injection_text(text) or _message_is_skill_payload_after_tool_result(messages, index)
     return False
 
 
@@ -1853,6 +1882,9 @@ def _has_repo_discovery_for_write(messages: list[dict[str, Any]]) -> bool:
 def _message_tool_results(message: dict[str, Any]) -> list[tuple[str, str, bool]]:
     role = str(message.get("role") or "")
     content = message.get("content")
+    converted = _converted_tool_result_record(message)
+    if converted:
+        return [converted]
     if role == "tool":
         text = _content_to_text(content)
         is_error = bool(message.get("is_error")) or bool(_MISSING_FILE_TOOL_RESULT_RE.search(text))
@@ -1867,6 +1899,26 @@ def _message_tool_results(message: dict[str, Any]) -> list[tuple[str, str, bool]
             results.append((str(block.get("tool_use_id") or ""), text, is_error))
         return results
     return []
+
+
+def _converted_tool_result_record(message: dict[str, Any]) -> tuple[str, str, bool] | None:
+    if str(message.get("role") or "") != "user":
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    match = _CONVERTED_TOOL_RESULT_RE.match(content)
+    if not match:
+        return None
+    body = match.group("body") or ""
+    body = re.split(
+        r"\n\n(?:Use this tool result to continue the task\.|The tool call failed\.)",
+        body,
+        maxsplit=1,
+    )[0].strip()
+    is_error = (match.group("is_error") or "").strip().lower() == "true"
+    is_error = is_error or bool(_MISSING_FILE_TOOL_RESULT_RE.search(body))
+    return (match.group("id").strip(), body, is_error)
 
 
 def _created_file_path_from_tool_result(text: str) -> str:
@@ -2014,7 +2066,33 @@ def _message_tool_call_drafts(message: dict[str, Any]) -> list[ToolCallDraft]:
                 draft = _normalize_item(block)
                 if draft:
                     drafts.append(draft)
+    elif isinstance(content, str):
+        drafts.extend(_converted_tool_call_drafts(content))
     return drafts
+
+
+def _converted_tool_call_drafts(text: str) -> list[ToolCallDraft]:
+    raw = text or ""
+    if not (_TOOL_SUMMARY_HEADER_RE.search(raw) and _has_dsml_tool_call_syntax(raw)):
+        return []
+    names = {
+        html.unescape(match.group("name")).strip()
+        for match in re.finditer(r"<\|?DSML\|?invoke\b[^>]*\bname=(?P<quote>[\"'])(?P<name>.*?)(?P=quote)", raw, re.IGNORECASE | re.DOTALL)
+        if match.group("name").strip()
+    }
+    if not names:
+        return []
+    context = ToolBridgeContext(
+        enabled=True,
+        mode="strict",
+        tools=[
+            ToolSpec(name=name, description="", input_schema={"type": "object"}, read_only=_is_read_only_name(name))
+            for name in sorted(names)
+        ],
+        options=ToolBridgeConfig(tool_profile="all"),
+    )
+    result = parse_tool_response(raw, context)
+    return list(result.tool_calls)
 
 
 def _tool_loop_category(call: ToolCallDraft) -> str:
@@ -3820,16 +3898,114 @@ def _messages_have_tool_loop(messages: Any) -> bool:
     for message in messages:
         if not isinstance(message, dict):
             continue
-        if message.get("role") == "tool":
+        if _message_has_tool_interaction(message):
             return True
-        if isinstance(message.get("tool_calls"), list) and message.get("tool_calls"):
-            return True
-        content = message.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and str(block.get("type") or "") in {"tool_use", "tool_result"}:
-                    return True
     return False
+
+
+def _messages_for_current_human_task(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return messages
+    start = _current_human_task_start_index(messages)
+    if start <= 0:
+        return messages
+    return messages[start:]
+
+
+def _current_human_task_start_index(messages: list[Any]) -> int:
+    fallback = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+            continue
+        if _message_is_tool_result(message):
+            continue
+        if _message_is_gateway_control_instruction(message):
+            continue
+        if _message_is_skill_payload_after_tool_result(messages, index):
+            continue
+        text = _human_task_text_from_message(message)
+        if not text.strip():
+            continue
+        if fallback < 0:
+            fallback = index
+        if not _looks_like_continuation_task(text):
+            return index
+    return fallback
+
+
+def _message_is_skill_payload_after_tool_result(messages: list[Any], index: int) -> bool:
+    message = messages[index]
+    text = _content_to_text(message.get("content"))
+    if not text.strip():
+        return False
+    launched_skill = ""
+    for prior in range(index - 1, -1, -1):
+        previous = messages[prior]
+        if not isinstance(previous, dict):
+            continue
+        if str(previous.get("role") or "") == "system":
+            continue
+        if not _message_is_tool_result(previous):
+            return False
+        match = _SKILL_LAUNCH_TOOL_RESULT_RE.search(_content_to_text(previous.get("content")))
+        if match:
+            launched_skill = match.group("skill") or ""
+        break
+    if not launched_skill:
+        return False
+    heading = _first_markdown_heading(text)
+    if not heading:
+        return False
+    return _compact_tool_name(launched_skill) in _compact_tool_name(heading)
+
+
+def _first_markdown_heading(text: str) -> str:
+    match = re.search(r"(?m)^\s{0,3}#{1,3}\s+(?P<head>[^\n#]{1,180})\s*$", text or "")
+    return match.group("head").strip() if match else ""
+
+
+def _current_task_starts_after_prior_tool_history(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    start = _current_human_task_start_index(messages)
+    if start <= 0:
+        return False
+    return any(isinstance(message, dict) and _message_has_tool_interaction(message) for message in messages[:start])
+
+
+def _message_has_tool_interaction(message: dict[str, Any]) -> bool:
+    if message.get("role") == "tool":
+        return True
+    if isinstance(message.get("tool_calls"), list) and message.get("tool_calls"):
+        return True
+    if _converted_tool_result_record(message):
+        return True
+    content = message.get("content")
+    if isinstance(content, list):
+        return any(isinstance(block, dict) and str(block.get("type") or "") in {"tool_use", "tool_result"} for block in content)
+    if isinstance(content, dict):
+        return str(content.get("type") or "") in {"tool_use", "tool_result"}
+    if isinstance(content, str) and str(message.get("role") or "") == "assistant":
+        return bool(_TOOL_SUMMARY_HEADER_RE.search(content) and _has_dsml_tool_call_syntax(content))
+    return False
+
+
+def _message_is_gateway_control_instruction(message: dict[str, Any]) -> bool:
+    if str(message.get("role") or "") != "user":
+        return False
+    if _message_is_tool_result(message):
+        return False
+    text = _content_to_text(message.get("content")).lstrip()
+    return text.startswith(
+        (
+            "Previous tool JSON",
+            "Tool loop guard:",
+            "Skill progress guard:",
+            "Tool result guard:",
+            "New user task boundary:",
+        )
+    )
 
 
 def _latest_user_text(messages: Any) -> str:
@@ -3849,6 +4025,8 @@ def _latest_human_user_text(messages: Any) -> str:
         if not isinstance(message, dict) or str(message.get("role") or "") != "user":
             continue
         if _message_is_tool_result(message):
+            continue
+        if _message_is_gateway_control_instruction(message):
             continue
         text = _human_task_text_from_message(message)
         if text.strip():
@@ -3877,6 +4055,8 @@ def _human_user_texts_newest_first(messages: Any) -> list[str]:
         if not isinstance(message, dict) or str(message.get("role") or "") != "user":
             continue
         if _message_is_tool_result(message):
+            continue
+        if _message_is_gateway_control_instruction(message):
             continue
         text = _human_task_text_from_message(message)
         if text.strip():
@@ -3929,6 +4109,10 @@ def _looks_like_skill_injection_text(text: str) -> bool:
 
 
 def _message_is_tool_result(message: dict[str, Any]) -> bool:
+    if str(message.get("role") or "") == "tool":
+        return True
+    if _converted_tool_result_record(message):
+        return True
     content = message.get("content")
     if isinstance(content, dict):
         return content.get("type") == "tool_result"

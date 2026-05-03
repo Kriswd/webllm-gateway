@@ -15240,6 +15240,83 @@ def test_qwen_web_auto_activation_does_not_bridge_meta_question_after_tool_loop(
     assert started["requestToolCount"] == 3
 
 
+def test_qwen_web_new_project_info_task_resets_prior_tool_loop_state(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return _openai_response("这个项目包含内容抓取、AI 改写和飞书同步功能。")
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "好的，那你全面修复下发现的问题"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_task_output",
+                            "name": "TaskOutput",
+                            "input": {"task_id": "brzi7w0x9", "block": False, "timeout": 30},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_task_output",
+                            "content": "<task_id>brzi7w0x9</task_id>\n<status>running</status>\npip install -r requirements.txt",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "当前这个项目都有哪些功能？我应该如何使用？"},
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "TaskOutput", "description": "Read task output", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = seen["payload"]
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "New user task boundary" in prompt
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+    started = next(event for event in diagnostics if event["kind"] == "completion_request_started")
+    assert started["bridge"] is True
+    assert started["toolBridgeHasToolLoop"] is False
+    assert "toolBridgeRecentToolCalls" not in started
+
+
 def test_qwen_web_native_search_retries_placeholder_response_for_final_answer(tmp_path: Path) -> None:
     seen_payloads: list[dict[str, Any]] = []
 
