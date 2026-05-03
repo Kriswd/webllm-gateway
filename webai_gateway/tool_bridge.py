@@ -690,12 +690,12 @@ def should_bridge_tools(
     latest = _effective_human_task_text(messages)
     if _looks_like_meta_capability_question(latest):
         return False
+    if provider_native_web_search:
+        return False
     if _messages_have_tool_loop(_messages_for_current_human_task(messages)):
         return True
     if _looks_like_local_agent_task(latest):
         return True
-    if provider_native_web_search:
-        return False
     return True
 
 
@@ -708,6 +708,8 @@ def should_enable_native_web_search(messages: Any, policy: str) -> bool:
     if normalized != "auto":
         return False
     latest = _latest_human_user_text(messages)
+    if _looks_like_external_web_lookup_task(latest):
+        return True
     if _looks_like_local_agent_task(latest):
         return False
     if _looks_like_web_search_task(latest):
@@ -4409,6 +4411,73 @@ def _looks_like_web_search_task(text: str) -> bool:
         "released",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _looks_like_external_web_lookup_task(text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    mutation_markers = (
+        "提交",
+        "推送",
+        "合并",
+        "修改",
+        "修复",
+        "写入",
+        "创建",
+        "删除",
+        "commit",
+        "push",
+        "merge",
+        "modify",
+        "edit",
+        "fix",
+        "write",
+        "delete",
+        "deploy",
+    )
+    if any(marker in lowered for marker in mutation_markers):
+        return False
+    external_markers = (
+        "github",
+        "gitlab",
+        "npm",
+        "pypi",
+        "crates.io",
+        "docker hub",
+        "官网",
+        "官方",
+        "网页",
+        "网站",
+        "网上",
+        "线上",
+        "release",
+        "releases",
+    )
+    lookup_markers = (
+        "版本",
+        "版本号",
+        "最新版",
+        "最新",
+        "发布",
+        "发行",
+        "标签",
+        "查",
+        "看下",
+        "看一下",
+        "搜索",
+        "version",
+        "versions",
+        "latest",
+        "current",
+        "release",
+        "releases",
+        "tag",
+        "tags",
+        "changelog",
+    )
+    return any(marker in lowered for marker in external_markers) and any(marker in lowered for marker in lookup_markers)
 
 
 def _is_allowed_tool_denial(text: str, context: ToolBridgeContext) -> bool:

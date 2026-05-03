@@ -15353,6 +15353,109 @@ def test_qwen_web_auto_activation_routes_plain_web_search_to_native_provider(tmp
     assert body["content"] == [{"type": "text", "text": "Qwen native web search returned a final answer."}]
 
 
+def test_qwen_web_auto_activation_routes_github_version_lookup_to_native_provider(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return _openai_response("GitHub release lookup returned versions.")
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        provider_runtime=ProviderRuntimeConfig(native_web_search_policy="auto"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [{"role": "user", "content": "你看下 github 上这两个项目的版本号不就知道了？"}],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = seen["payload"]
+    assert payload["_webai_native_web_search"] is True
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "WebAI Gateway's strict tool bridge" not in prompt
+    assert "Provider" in prompt
+    assert response.json()["content"] == [{"type": "text", "text": "GitHub release lookup returned versions."}]
+
+
+def test_qwen_web_auto_activation_keeps_local_github_push_on_tool_bridge(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"call_1","name":"Bash","input":{"command":"git status --short"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        provider_runtime=ProviderRuntimeConfig(native_web_search_policy="auto"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [{"role": "user", "content": "把当前项目提交并推送到 GitHub"}],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = seen["payload"]
+    assert payload.get("_webai_native_web_search") is False
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert response.json()["content"] == [
+        {"type": "tool_use", "id": "toolu_call_1", "name": "Bash", "input": {"command": "git status --short"}}
+    ]
+
+
 def test_qwen_web_auto_activation_does_not_bridge_meta_question_after_tool_loop(tmp_path: Path) -> None:
     seen: dict[str, Any] = {}
 
