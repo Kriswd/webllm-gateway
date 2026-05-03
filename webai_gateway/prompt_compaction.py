@@ -239,9 +239,39 @@ def _latest_user_request(entries: list[tuple[str, str]]) -> str:
         if _history_role_label(role) != "USER":
             continue
         content = (text or "").strip()
-        if content:
-            return content
+        if not content or _looks_like_current_request_control_text(content):
+            continue
+        task_text = _current_request_task_text(content)
+        if task_text and not _looks_like_current_request_control_text(task_text):
+            return task_text
     return ""
+
+
+def _current_request_task_text(text: str) -> str:
+    content = (text or "").strip()
+    command = _SLASH_COMMAND_WITH_ARGS_RE.match(content)
+    if command:
+        return _one_line(command.group("body") or "", 4000)
+    return content
+
+
+def _looks_like_current_request_control_text(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", str(text or "").strip()).lower()
+    if not compact:
+        return True
+    control_markers = (
+        "do not request the same skill again",
+        "use the loaded skill instructions already in the conversation",
+        "continue the original user task",
+        "loaded skill instructions",
+        "launching skill:",
+        "skill loaded",
+        "loaded using-superpowers",
+        "不要再次请求同一",
+        "继续原始用户任务",
+        "已加载技能",
+    )
+    return any(marker in compact for marker in control_markers)
 
 
 def _history_continuation_prompt(latest_user: str, *, max_user_chars: int) -> str:
@@ -396,6 +426,10 @@ _RESULT_SIGNAL_RE = re.compile(
     r"\b(?:file does not exist|no such file|not found|is_error:\s*true|"
     r"unchanged content|reported unchanged|already available in history|missing content)\b",
     re.IGNORECASE,
+)
+_SLASH_COMMAND_WITH_ARGS_RE = re.compile(
+    r"^\s*/[A-Za-z0-9][A-Za-z0-9:_\.-]*(?:\s+(?P<body>.+))?\s*$",
+    re.DOTALL,
 )
 _TASK_LIST_PARAM_NAMES = {"todos", "tasks", "items", "tasklist", "todolist"}
 

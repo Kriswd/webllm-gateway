@@ -9921,6 +9921,53 @@ def test_qwen_messages_compaction_does_not_promote_tool_history_without_task_upd
     assert prompt.rfind("LATEST_NEW_TASK_SENTINEL") > prompt.rfind("Continue from the latest state")
 
 
+def test_qwen_messages_current_request_skips_skill_control_text() -> None:
+    huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
+    tool_protocol = (
+        "You are using WebAI Gateway's strict tool bridge.\n"
+        "Available tools: Skill, Glob, Read.\n"
+        "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+
+    prompt, files = qwen_messages_to_prompt_and_files(
+        [
+            {"role": "system", "content": huge_system_prefix + "\n\n" + tool_protocol},
+            {"role": "user", "content": "/using-superpowers 审查当前项目的代码，看看有什么需要改进的"},
+            {
+                "role": "assistant",
+                "content": (
+                    'Assistant requested tool calls:\n<|DSML|tool_calls><|DSML|invoke name="Skill">'
+                    '<|DSML|parameter name="skill"><![CDATA[using-superpowers]]></|DSML|parameter>'
+                    "</|DSML|invoke></|DSML|tool_calls>"
+                ),
+            },
+            {
+                "role": "tool",
+                "content": (
+                    "Loaded using-superpowers. Do not request the same Skill again. "
+                    "Use the loaded skill instructions already in the conversation, then continue the original user task."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Do not request the same Skill again. Use the loaded skill instructions already in the conversation, "
+                    "then continue the original user task."
+                ),
+            },
+        ],
+        max_prompt_chars=2200,
+    )
+
+    assert files == []
+    marker = "=== CURRENT USER REQUEST (highest priority) ==="
+    assert marker in prompt
+    current_block = prompt[prompt.rfind(marker) :]
+    assert "审查当前项目的代码，看看有什么需要改进的" in current_block
+    assert "/using-superpowers" not in current_block
+    assert "Do not request the same Skill again" not in current_block
+
+
 def test_qwen_messages_compaction_preserves_task_state_snapshot() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 600)
     tool_protocol = (
