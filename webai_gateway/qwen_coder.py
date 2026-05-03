@@ -91,12 +91,17 @@ class QwenCoderClient:
         self.http_client = http_client or httpx.Client(timeout=self.request_timeout_seconds, trust_env=False)
 
     def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
-        prompt, files = qwen_coder_messages_to_prompt_and_files(payload.get("messages"), max_prompt_chars=self.prompt_max_chars)
+        prompt, files = qwen_coder_messages_to_prompt_and_files(
+            payload.get("messages"),
+            max_prompt_chars=self.prompt_max_chars,
+            current_task_text=str(payload.get("_webai_current_task_text") or ""),
+        )
         self.last_diagnostic = {
             "prompt_chars": len(prompt),
             "prompt_max_chars": self.prompt_max_chars,
             "prompt_compacted": "Prompt content was compacted" in prompt,
             "message_count": len(payload.get("messages")) if isinstance(payload.get("messages"), list) else 0,
+            "current_task_anchor_chars": len(str(payload.get("_webai_current_task_text") or "")),
             **prompt_preserved_task_state_diagnostics(prompt),
             "artifacts_enabled": self.enable_artifacts,
             "mcp_enabled": self.enable_mcp,
@@ -255,7 +260,12 @@ class QwenCoderClient:
         return headers
 
 
-def qwen_coder_messages_to_prompt_and_files(messages: Any, *, max_prompt_chars: int | None = None) -> tuple[str, list[dict[str, Any]]]:
+def qwen_coder_messages_to_prompt_and_files(
+    messages: Any,
+    *,
+    max_prompt_chars: int | None = None,
+    current_task_text: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return "", []
     parts: list[str] = [f"System: {STATELESS_WEB_API_GUARD}"]
@@ -281,7 +291,11 @@ def qwen_coder_messages_to_prompt_and_files(messages: Any, *, max_prompt_chars: 
             parts.append(f"User: {text}")
     prompt = "\n\n".join(parts)
     if max_prompt_chars and len(prompt) > int(max_prompt_chars):
-        prompt = compact_role_messages_as_ds2api_history(role_entries, max_chars=max_prompt_chars)
+        prompt = compact_role_messages_as_ds2api_history(
+            role_entries,
+            max_chars=max_prompt_chars,
+            current_user_override=current_task_text,
+        )
     return prompt, files
 
 

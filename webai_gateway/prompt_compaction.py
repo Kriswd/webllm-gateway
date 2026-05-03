@@ -104,6 +104,7 @@ def compact_role_messages_as_ds2api_history(
     *,
     max_chars: int,
     protocol_marker: str = _DEFAULT_PROTOCOL_MARKER,
+    current_user_override: str | None = None,
 ) -> str:
     """Render long web prompts using ds2api's current-input-file transcript shape.
 
@@ -115,7 +116,7 @@ def compact_role_messages_as_ds2api_history(
     live_limit = _target_live_prompt_limit(limit)
     entry_list = [(role, text) for role, text in entries]
     history_transcript = build_ds2api_history_transcript(entry_list)
-    latest_user = _latest_user_request(entry_list)
+    latest_user = _normalized_current_user_override(current_user_override) or _latest_user_request(entry_list)
     snapshot = build_preserved_task_state_snapshot(
         entry_list,
         max_chars=max(600, min(1800, live_limit // 3)),
@@ -245,6 +246,16 @@ def _latest_user_request(entries: list[tuple[str, str]]) -> str:
         task_text = _current_request_task_text(content)
         if task_text and not _looks_like_current_request_control_text(task_text):
             return task_text
+    return ""
+
+
+def _normalized_current_user_override(text: str | None) -> str:
+    content = (text or "").strip()
+    if not content or _looks_like_current_request_control_text(content):
+        return ""
+    task_text = _current_request_task_text(content)
+    if task_text and not _looks_like_current_request_control_text(task_text):
+        return task_text
     return ""
 
 

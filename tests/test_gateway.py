@@ -542,6 +542,22 @@ def test_tool_controller_retries_no_task_final_in_all_profile_after_tool_loop() 
     assert decision.reason == "status_only_final_without_task_answer"
 
 
+def test_tool_controller_retries_context_missing_no_task_final_in_all_profile_after_tool_loop() -> None:
+    text = "因上下文缺失且无明确任务，请提供具体需求。我将直接执行新指令或回答您的问题。"
+    result = BridgeResult(content=text, tool_calls=[], raw_content=text)
+    context = _controller_context_with_tools(
+        ["Skill", "Glob", "Read", "Bash"],
+        task_text="审查当前项目的代码，看看有什么需要改进的",
+        recent_tool_call_names=("Skill", "Glob", "Glob", "Glob", "Glob", "Skill", "Skill", "Skill"),
+    )
+    context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
+
+    decision = classify_bridge_result(result, context, RetryState())
+
+    assert decision.state == "RETRY"
+    assert decision.reason == "status_only_final_without_task_answer"
+
+
 def test_tool_controller_retries_ds2api_history_summary_final_in_all_profile() -> None:
     text = (
         "根据提供的 `DS2API_HISTORY.txt` 上下文，当前的工作状态如下："
@@ -553,6 +569,27 @@ def test_tool_controller_retries_ds2api_history_summary_final_in_all_profile() -
         ["Glob", "Read", "Grep", "Skill"],
         task_text="审查当前项目的代码，看看有什么需要改进的",
         recent_tool_call_names=("Glob", "Read", "Skill"),
+    )
+    context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
+
+    decision = classify_bridge_result(result, context, RetryState())
+
+    assert decision.state == "RETRY"
+    assert decision.reason == "history_summary_final_without_task_answer"
+
+
+def test_tool_controller_retries_guard_history_summary_final_in_all_profile() -> None:
+    text = (
+        "根据提供的 `DS2API_HISTORY.txt` 上下文，特别是最后几条关于工具循环保护"
+        "（Tool loop guard）和技能进度保护（Skill progress guard）的指令：状态分析。"
+        "最新的用户请求明确指出：如果最新的工具结果已经提供了足够的证据、显示成功或没有进展，"
+        "应该停止请求等效工具。"
+    )
+    result = BridgeResult(content=text, tool_calls=[], raw_content=text)
+    context = _controller_context_with_tools(
+        ["Glob", "Read", "Grep", "Skill"],
+        task_text="审查当前项目的代码，看看有什么需要改进的",
+        recent_tool_call_names=("Skill", "Glob", "Glob", "Glob", "Glob", "Skill", "Skill", "Skill"),
     )
     context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
 
@@ -4916,7 +4953,7 @@ def test_tool_bridge_adds_loop_guard_for_repeated_shell_housekeeping() -> None:
                 },
             }
         ],
-        ToolBridgeConfig(exposure_policy="all"),
+        ToolBridgeConfig(exposure_policy="all", tool_profile="agent"),
     )
     messages = [
         {"role": "user", "content": "Update the local repository from origin/main."},
@@ -6755,6 +6792,63 @@ def test_tool_bridge_adds_guard_after_skill_result() -> None:
     assert "Skill progress guard" in prepared[-1]["content"]
     assert "Do not request the same Skill again" in prepared[-1]["content"]
     assert "Skill input: {\"skill\":\"using-superpowers\"}" in prepared[-1]["content"]
+
+
+def test_tool_bridge_all_profile_does_not_append_gateway_progress_guards() -> None:
+    messages = [
+        {"role": "user", "content": "/using-superpowers 审查当前项目的代码，看看有什么需要改进的"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Skill", "arguments": json.dumps({"skill": "using-superpowers"})},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "Skill loaded"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "Glob", "arguments": json.dumps({"pattern": "**/*.py"})},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "webai_gateway/app.py"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_3",
+                    "type": "function",
+                    "function": {"name": "Skill", "arguments": json.dumps({"skill": "using-superpowers"})},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_3", "content": "Skill loaded"},
+    ]
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {"name": name, "description": f"{name} tool", "parameters": {"type": "object"}},
+            }
+            for name in ["Skill", "Read", "Glob", "Grep"]
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all", max_tools_in_prompt=32),
+    )
+    context = prefer_local_tools_for_local_agent_task(context, messages)
+
+    prepared = prepare_openai_messages(messages, context)
+
+    joined = "\n".join(str(message.get("content") or "") for message in prepared)
+    assert "Tool loop guard" not in joined
+    assert "Skill progress guard" not in joined
+    assert "Do not request the same Skill again" not in joined
 
 
 def test_repeat_skill_repair_prompt_forbids_same_skill() -> None:
@@ -10156,6 +10250,39 @@ def test_qwen_messages_current_request_skips_skill_control_text() -> None:
     assert "审查当前项目的代码，看看有什么需要改进的" in current_block
     assert "/using-superpowers" not in current_block
     assert "Do not request the same Skill again" not in current_block
+
+
+def test_qwen_messages_compaction_uses_gateway_task_anchor_over_guard_user_tail() -> None:
+    huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
+    tool_protocol = (
+        "You are using WebAI Gateway's strict tool bridge.\n"
+        "Available tools: Skill, Glob, Read.\n"
+        "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+    original_task = "审查当前项目的代码，看看有什么需要改进的"
+    guard_text = (
+        "Tool loop guard: recent tool history contains repeated or equivalent calls for Skill.\n"
+        "If the latest tool results already provide enough evidence, stop requesting equivalent tools."
+    )
+
+    prompt, files = qwen_messages_to_prompt_and_files(
+        [
+            {"role": "system", "content": huge_system_prefix + "\n\n" + tool_protocol},
+            {"role": "user", "content": f"/using-superpowers {original_task}"},
+            {"role": "assistant", "content": "Assistant requested tool calls:\nSkill({\"skill\":\"using-superpowers\"})"},
+            {"role": "tool", "content": "Skill loaded"},
+            {"role": "user", "content": guard_text},
+        ],
+        max_prompt_chars=2200,
+        current_task_text=original_task,
+    )
+
+    assert files == []
+    marker = "=== CURRENT USER REQUEST (highest priority) ==="
+    assert marker in prompt
+    current_block = prompt[prompt.rfind(marker) :]
+    assert original_task in current_block
+    assert "Tool loop guard" not in current_block
 
 
 def test_qwen_messages_compaction_preserves_task_state_snapshot() -> None:
@@ -15184,6 +15311,8 @@ def test_qwen_web_all_profile_retries_no_task_final_after_tool_loop(tmp_path: Pa
 
     assert response.status_code == 200
     assert len(seen_payloads) == 2
+    assert "审查当前项目的代码" in str(seen_payloads[0].get("_webai_current_task_text") or "")
+    assert "审查当前项目的代码" in str(seen_payloads[1].get("_webai_current_task_text") or "")
     retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
     assert "status_only_final_without_task_answer" in retry_prompt
     assert "审查当前项目的代码" in retry_prompt

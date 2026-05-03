@@ -1774,6 +1774,8 @@ def _build_direct_payload(
     if not bridge:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
+    elif bridge_context.task_text:
+        payload["_webai_current_task_text"] = bridge_context.task_text
     return payload, bridge, allowed_tools, bridge_context
 
 

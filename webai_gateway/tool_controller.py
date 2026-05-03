@@ -77,10 +77,15 @@ _STATUS_ONLY_TOOL_FINAL_RE = re.compile(
     r"(?:command|tool|task|operation).{0,40}(?:no output|empty output)",
     re.IGNORECASE,
 )
+_EXPLICIT_NO_TASK_FINAL_RE = re.compile(
+    r"(?:上下文缺失|无明确任务|没有明确任务|请提供具体需求|请提供具体指令|等待(?:用户)?(?:指令|输入)|new\s+instruction)",
+    re.IGNORECASE,
+)
 _HISTORY_SUMMARY_FINAL_RE = re.compile(
     r"(?:according\s+to|based\s+on|根据|基于).{0,40}DS2API_HISTORY\.txt.{0,80}"
     r"(?:current\s+(?:work\s+)?state|work\s+status|当前(?:的)?(?:工作)?状态|工作状态)|"
-    r"DS2API_HISTORY\.txt.{0,120}(?:current\s+(?:work\s+)?state|work\s+status|当前(?:的)?(?:工作)?状态|工作状态)",
+    r"DS2API_HISTORY\.txt.{0,120}(?:current\s+(?:work\s+)?state|work\s+status|当前(?:的)?(?:工作)?状态|工作状态)|"
+    r"DS2API_HISTORY\.txt.{0,240}(?:tool\s+loop\s+guard|skill\s+progress\s+guard|工具循环保护|技能进度保护|最新的用户请求明确指出|状态分析)",
     re.IGNORECASE | re.DOTALL,
 )
 _HISTORY_SUMMARY_REQUEST_RE = re.compile(
@@ -462,6 +467,8 @@ def _is_status_only_final_without_task_answer(context: ToolBridgeContext, text: 
     raw = " ".join((text or "").split())
     if not raw or len(raw) > 320:
         return False
+    if _EXPLICIT_NO_TASK_FINAL_RE.search(raw):
+        return True
     if _SUBSTANTIVE_TASK_ANSWER_RE.search(raw):
         return False
     return bool(_STATUS_ONLY_TOOL_FINAL_RE.search(raw))

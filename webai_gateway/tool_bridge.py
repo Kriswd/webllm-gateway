@@ -1371,18 +1371,20 @@ def prepare_openai_messages(messages: list[dict[str, Any]], context: ToolBridgeC
     prompt = build_tool_prompt(context.tools, context.options)
     call_names = _assistant_tool_call_names(messages)
     converted = [_convert_message(message, call_names=call_names, options=context.options) for message in messages if isinstance(message, dict)]
-    loop_guard = _tool_loop_guard_message(messages)
-    if loop_guard:
-        converted.append({"role": "user", "content": loop_guard})
-    repeat_skill_guard = _repeat_skill_guard_message(messages)
-    if repeat_skill_guard:
-        converted.append({"role": "user", "content": repeat_skill_guard})
+    if not _allows_ds2api_style_progress_passthrough(context):
+        loop_guard = _tool_loop_guard_message(messages)
+        if loop_guard:
+            converted.append({"role": "user", "content": loop_guard})
+        repeat_skill_guard = _repeat_skill_guard_message(messages)
+        if repeat_skill_guard:
+            converted.append({"role": "user", "content": repeat_skill_guard})
     failed_path_guard = _failed_path_tool_result_guard_message(messages, context)
     if failed_path_guard:
         converted.append({"role": "user", "content": failed_path_guard})
-    unchanged_read_guard = _unchanged_read_tool_result_guard_message(messages, context)
-    if unchanged_read_guard:
-        converted.append({"role": "user", "content": unchanged_read_guard})
+    if not _allows_ds2api_style_progress_passthrough(context):
+        unchanged_read_guard = _unchanged_read_tool_result_guard_message(messages, context)
+        if unchanged_read_guard:
+            converted.append({"role": "user", "content": unchanged_read_guard})
     if converted and converted[0].get("role") == "system":
         converted[0] = {**converted[0], "content": f"{_as_text(converted[0].get('content')).strip()}\n\n{prompt}".strip()}
         return converted
