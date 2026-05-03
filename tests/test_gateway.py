@@ -526,6 +526,22 @@ def test_tool_controller_retries_no_task_final_after_tool_result() -> None:
     assert decision.reason == "status_only_final_without_task_answer"
 
 
+def test_tool_controller_retries_no_task_final_in_all_profile_after_tool_loop() -> None:
+    text = "当前无明确任务，系统处于等待状态。请提供具体指令以继续工作。"
+    result = BridgeResult(content=text, tool_calls=[], raw_content=text)
+    context = _controller_context_with_tools(
+        ["Skill", "Glob", "Read", "Bash"],
+        task_text="审查当前项目的代码，看看有什么需要改进的",
+        recent_tool_call_names=("Skill", "Glob", "Bash", "Skill", "Skill", "Skill"),
+    )
+    context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
+
+    decision = classify_bridge_result(result, context, RetryState())
+
+    assert decision.state == "RETRY"
+    assert decision.reason == "status_only_final_without_task_answer"
+
+
 def test_tool_controller_retries_ds2api_history_summary_final_in_all_profile() -> None:
     text = (
         "根据提供的 `DS2API_HISTORY.txt` 上下文，当前的工作状态如下："
@@ -15103,6 +15119,74 @@ def test_qwen_web_auto_activation_keeps_tool_bridge_for_local_agent_task(tmp_pat
     prompt = "\n".join(str(message.get("content", "")) for message in seen["payload"]["messages"])
     assert "WebAI Gateway's strict tool bridge" in prompt
     assert seen["payload"].get("_webai_native_web_search") is not True
+    assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
+
+
+def test_qwen_web_all_profile_retries_no_task_final_after_tool_loop(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class NoTaskThenToolQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response("当前无明确任务，系统处于等待状态。请提供具体指令以继续工作。")
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"toolu_read","name":"Read","input":{"file_path":"README.md"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=NoTaskThenToolQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "/using-superpowers 审查当前项目的代码，看看有什么需要改进的"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_skill", "name": "Skill", "input": {"skill": "using-superpowers"}}],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_skill", "content": "Skill loaded"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_glob", "name": "Glob", "input": {"pattern": "**/*.py"}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_glob", "content": "webai_gateway/app.py\nwebai_gateway/tool_controller.py"}],
+                },
+            ],
+            "tools": [
+                {"name": "Skill", "description": "Load skill", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run command", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 32000,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "status_only_final_without_task_answer" in retry_prompt
+    assert "审查当前项目的代码" in retry_prompt
     assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
 
 
