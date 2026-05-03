@@ -9885,6 +9885,40 @@ def test_qwen_messages_compaction_uses_ds2api_history_continuation() -> None:
     assert "WebAI Gateway's strict tool bridge" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
+    assert "=== CURRENT USER REQUEST (highest priority) ===" in prompt
+    assert prompt.rfind("LATEST_SENTINEL") > prompt.rfind("Continue from the latest state")
+
+
+def test_qwen_messages_compaction_does_not_promote_tool_history_without_task_updates() -> None:
+    huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
+    tool_protocol = (
+        "You are using WebAI Gateway's strict tool bridge.\n"
+        "Available tools: Skill, Glob, AskUserQuestion.\n"
+        "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+
+    prompt, files = qwen_messages_to_prompt_and_files(
+        [
+            {"role": "system", "content": huge_system_prefix + "\n\n" + tool_protocol},
+            {
+                "role": "assistant",
+                "content": (
+                    'Assistant requested tool calls:\n<|DSML|tool_calls><|DSML|invoke name="Skill">'
+                    '<|DSML|parameter name="skill"><![CDATA[caveman]]></|DSML|parameter>'
+                    "</|DSML|invoke></|DSML|tool_calls>"
+                ),
+            },
+            {"role": "tool", "content": "Caveman mode disabled"},
+            {"role": "user", "content": "现在处理一个全新的问题。LATEST_NEW_TASK_SENTINEL"},
+        ],
+        max_prompt_chars=1800,
+    )
+
+    assert files == []
+    assert "# WebAI Gateway preserved task state" not in prompt
+    assert "Recent tool calls:" not in prompt
+    assert "=== CURRENT USER REQUEST (highest priority) ===" in prompt
+    assert prompt.rfind("LATEST_NEW_TASK_SENTINEL") > prompt.rfind("Continue from the latest state")
 
 
 def test_qwen_messages_compaction_preserves_task_state_snapshot() -> None:

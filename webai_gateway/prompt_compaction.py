@@ -13,9 +13,14 @@ _DS2API_HISTORY_SUMMARY = "Prior conversation history and tool progress."
 PRESERVED_TASK_STATE_MARKER = "# WebAI Gateway preserved task state"
 LAYERED_HISTORY_MARKER = "[Layered history compaction]"
 _LAYERED_HISTORY_STRATEGY = "ds2api_layered_history"
+_CURRENT_USER_REQUEST_MARKER = "=== CURRENT USER REQUEST (highest priority) ==="
 _DS2API_HISTORY_CONTINUATION = (
     "Continue from the latest state in the provided DS2API_HISTORY.txt context. "
     "Treat it as the current working state and answer the latest user request directly."
+)
+_CURRENT_USER_REQUEST_INSTRUCTION = (
+    "Use the prior DS2API_HISTORY only as context. Answer this latest user request; "
+    "do not continue unrelated earlier tasks unless this request explicitly asks to."
 )
 STATELESS_WEB_API_GUARD = (
     "You are serving a stateless WebAI Gateway API request. Ignore any previous website chat, "
@@ -109,12 +114,13 @@ def compact_role_messages_as_ds2api_history(
     live_limit = _target_live_prompt_limit(limit)
     entry_list = [(role, text) for role, text in entries]
     history_transcript = build_ds2api_history_transcript(entry_list)
+    latest_user = _latest_user_request(entry_list)
     snapshot = build_preserved_task_state_snapshot(
         entry_list,
         max_chars=max(600, min(1800, live_limit // 3)),
     )
     transcript = (snapshot.rstrip() + "\n\n" + history_transcript) if snapshot else history_transcript
-    continuation = f"User: {_DS2API_HISTORY_CONTINUATION}"
+    continuation = _history_continuation_prompt(latest_user, max_user_chars=max(240, min(1800, live_limit // 5)))
     if not transcript:
         return continuation[:live_limit]
     prompt = transcript.rstrip() + "\n\n" + continuation
@@ -125,6 +131,7 @@ def compact_role_messages_as_ds2api_history(
         snapshot=snapshot,
         max_chars=live_limit,
         protocol_marker=protocol_marker,
+        latest_user=latest_user,
     )
     if layered:
         return layered[:limit]
@@ -168,6 +175,7 @@ def _compact_role_messages_layered(
     snapshot: str,
     max_chars: int,
     protocol_marker: str,
+    latest_user: str = "",
 ) -> str:
     limit = max(1000, int(max_chars or 12000))
     history_entries = _render_history_entries(entries)
@@ -180,15 +188,16 @@ def _compact_role_messages_layered(
         budget=max(800, min(9000, int(limit * 0.28))),
         protocol_marker=protocol_marker,
     )
-    continuation = f"User: {_DS2API_HISTORY_CONTINUATION}"
+    continuation = _history_continuation_prompt(latest_user, max_user_chars=max(240, min(1800, limit // 5)))
     header_lines = [
         _DS2API_HISTORY_TITLE,
         _DS2API_HISTORY_SUMMARY,
         LAYERED_HISTORY_MARKER,
         "Prompt content was compacted by WebAI Gateway using layered DS2API_HISTORY live context.",
-        (
-            f"Original entries: {len(history_entries)}. Latest entries retained: {len(latest_entries)}. "
-            "Older bulk observations were omitted from the live prompt; use the preserved task state and latest evidence."
+        _layered_history_summary_line(
+            original_count=len(history_entries),
+            latest_count=len(latest_entries),
+            has_snapshot=bool(snapshot),
         ),
     ]
 
@@ -211,6 +220,44 @@ def _compact_role_messages_layered(
         tail = tail[overflow:].lstrip()
         prompt = "\n\n".join(blocks + ["=== LATEST CONVERSATION TAIL ===", tail.rstrip(), continuation])
     return prompt[:limit]
+
+
+def _layered_history_summary_line(*, original_count: int, latest_count: int, has_snapshot: bool) -> str:
+    guidance = (
+        "use the preserved task state, latest tail, and current user request."
+        if has_snapshot
+        else "use the latest tail and current user request; older tool history is reference context only."
+    )
+    return (
+        f"Original entries: {original_count}. Latest entries retained: {latest_count}. "
+        f"Older bulk observations were omitted from the live prompt; {guidance}"
+    )
+
+
+def _latest_user_request(entries: list[tuple[str, str]]) -> str:
+    for role, text in reversed(entries):
+        if _history_role_label(role) != "USER":
+            continue
+        content = (text or "").strip()
+        if content:
+            return content
+    return ""
+
+
+def _history_continuation_prompt(latest_user: str, *, max_user_chars: int) -> str:
+    prompt = f"User: {_DS2API_HISTORY_CONTINUATION}"
+    current = _current_user_request_block(latest_user, max_chars=max_user_chars)
+    if current:
+        prompt += "\n\n" + current
+    return prompt
+
+
+def _current_user_request_block(latest_user: str, *, max_chars: int) -> str:
+    text = (latest_user or "").strip()
+    if not text:
+        return ""
+    body = _compact_entry_content(text, max(120, max_chars))
+    return f"{_CURRENT_USER_REQUEST_MARKER}\n{body}\n\nInstruction: {_CURRENT_USER_REQUEST_INSTRUCTION}"
 
 
 def _render_history_entries(entries: list[tuple[str, str]]) -> list[tuple[int, str, str]]:
@@ -356,10 +403,10 @@ _TASK_LIST_PARAM_NAMES = {"todos", "tasks", "items", "tasklist", "todolist"}
 def build_preserved_task_state_snapshot(entries: Iterable[tuple[str, str]], *, max_chars: int = 1200) -> str:
     entry_list = [(role, text or "") for role, text in entries]
     tasks = _extract_task_updates(entry_list)
+    if not tasks:
+        return ""
     recent_calls = _extract_recent_tool_call_summaries(entry_list)
     result_signals = _extract_tool_result_signals(entry_list)
-    if not tasks and not recent_calls and not result_signals:
-        return ""
 
     lines = [
         PRESERVED_TASK_STATE_MARKER,
