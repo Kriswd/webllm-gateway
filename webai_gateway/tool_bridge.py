@@ -1433,6 +1433,7 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
         if any(_compact_tool_name(str(function.get("name") or "")) in {"edit", "write", "multiedit", "applypatch"} for function in functions)
         else ""
     )
+    read_cache_guard_rule = _read_tool_cache_guard_rule() if _has_read_like_prompt_tool(specs) else ""
     return (
         "You are using WebAI Gateway's strict tool bridge. You are allowed to request the downstream client to execute listed tools; "
         "do not confuse this with executing tools inside the web model runtime yourself.\n\n"
@@ -1448,6 +1449,7 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
         "- After a Tool result message, use the observation to answer or request another allowed tool. Do not wait, do not claim that you executed a tool yourself, and do not repeat a failed identical call.\n"
         "- If a Tool result says is_error: true, do not treat it as successful data. Choose a different allowed tool/input if recovery is possible; otherwise explain the failure briefly.\n"
         f"{code_change_rule}"
+        f"{read_cache_guard_rule}"
         "- For Glob/file-discovery tools, avoid repository-wide recursive patterns such as **/*, **/*.ext, or **/package.json unless the input also scopes the search to a narrow path. Prefer Read for known files, LS/list tools for directory overviews, or scoped patterns like src/**/*.py.\n"
         "- For public GitHub repository or source-code URLs, prefer machine-readable endpoints such as https://api.github.com/repos/<owner>/<repo>, the GitHub contents API, or raw.githubusercontent.com files instead of interactive HTML pages.\n\n"
         "Required tool-call format:\n"
@@ -1461,6 +1463,23 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
         f"{_build_ds2api_style_tool_examples(specs)}"
         f"Default maximum tool calls per turn: {cfg.max_calls_per_turn}; read-only tools may use up to {cfg.max_readonly_calls_per_turn}. "
         "All arguments must be inside the input object."
+    )
+
+
+def _has_read_like_prompt_tool(specs: list[ToolSpec]) -> bool:
+    for spec in specs:
+        compact = _compact_tool_name(spec.name)
+        if compact in {"read", "readfile", "fileread"}:
+            return True
+    return False
+
+
+def _read_tool_cache_guard_rule() -> str:
+    return (
+        "- Read-tool cache guard: If a Read/read_file-style tool result says the file is unchanged, already available in history, "
+        "should be referenced from previous context, or otherwise provides no file body, treat that result as missing content. "
+        "Do not repeatedly call the same read request for that missing body. Request a full-content read if the tool supports it, "
+        "or tell the user that the file contents need to be provided again.\n"
     )
 
 

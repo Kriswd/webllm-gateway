@@ -455,6 +455,16 @@ _PARAM_RE = re.compile(
 )
 _ITEM_RE = re.compile(r"<\s*item\b[^>]*>(?P<body>.*?)</\s*item\s*>", re.IGNORECASE | re.DOTALL)
 _CDATA_RE = re.compile(r"^\s*<!\[CDATA\[(?P<body>.*)\]\]>\s*$", re.DOTALL)
+_PLAIN_TOOL_CALL_HEADER_RE = re.compile(
+    r"\b(?:Assistant requested tool calls|requested tool calls|tool calls requested)\b",
+    re.IGNORECASE,
+)
+_PLAIN_TOOL_CALL_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_:\.-]*)\((?P<args>[^)]{0,1200})\)\s*$"
+)
+_PLAIN_TOOL_ARG_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_:-]*)\s*=\s*(?P<value>.*?)(?=,\s*[A-Za-z_][A-Za-z0-9_:-]*\s*=|$)"
+)
 _RESULT_SIGNAL_RE = re.compile(
     r"\b(?:file does not exist|no such file|not found|is_error:\s*true|"
     r"unchanged content|reported unchanged|already available in history|missing content|"
@@ -668,6 +678,11 @@ def build_preserved_task_state_snapshot(entries: Iterable[tuple[str, str]], *, m
         (
             "Generated before prompt compaction. Treat this as the active task ledger and recent tool evidence; "
             "verify contradictory file evidence before marking work complete."
+        )
+        if tasks
+        else (
+            "Generated before prompt compaction. Treat this as recent tool evidence; use it only when relevant "
+            "to the current user request and verify contradictory file evidence before marking work complete."
         ),
     ]
     if tasks:
@@ -735,21 +750,48 @@ def _layered_history_counts(text: str) -> tuple[int, int]:
 
 
 def _has_active_recent_tool_evidence(entries: list[tuple[str, str]]) -> bool:
+    skipped_latest_user = False
     for role, text in reversed(entries):
         content = (text or "").strip()
         if not content:
             continue
         label = _history_role_label(role)
         if label == "TOOL":
+            if skipped_latest_user:
+                if _RESULT_SIGNAL_RE.search(content):
+                    return True
+                continue
             return True
-        if label == "ASSISTANT" and next(iter(_iter_invocations(content)), None) is not None:
+        if label == "ASSISTANT" and (
+            next(iter(_iter_invocations(content)), None) is not None or _plain_tool_call_summaries(content)
+        ):
+            if skipped_latest_user:
+                return _assistant_has_read_like_tool_call(content)
             return True
         if label == "USER" and (
             looks_like_gateway_tool_observation(content) or _looks_like_current_request_control_text(content)
         ):
             return True
+        if label == "USER" and not skipped_latest_user:
+            skipped_latest_user = True
+            continue
         return False
     return False
+
+
+def _assistant_has_read_like_tool_call(text: str) -> bool:
+    for name, _ in _iter_invocations(text):
+        if _is_read_like_tool_name(name):
+            return True
+    for summary in _plain_tool_call_summaries(text):
+        name = summary.split("(", 1)[0]
+        if _is_read_like_tool_name(name):
+            return True
+    return False
+
+
+def _is_read_like_tool_name(name: str) -> bool:
+    return _compact_name(name) in {"read", "readfile", "fileread"}
 
 
 def _latest_unique(values: list[str], *, limit: int) -> list[str]:
@@ -944,27 +986,65 @@ def _strip_outer_cdata(value: str) -> str:
 
 def _extract_recent_tool_call_summaries(entries: list[tuple[str, str]]) -> list[str]:
     summaries: list[str] = []
-    for _, text in entries:
+    for role, text in entries:
         for name, params in _iter_invocations(text):
-            pieces: list[str] = []
-            for key in (
-                "task_id",
-                "taskId",
-                "status",
-                "file_path",
-                "path",
-                "pattern",
-                "query",
-                "command",
-                "description",
-            ):
-                value = params.get(key)
-                if value:
-                    pieces.append(f"{key}={_one_line(value, 120)}")
-                if len(pieces) >= 4:
-                    break
-            summaries.append(f"{name}({', '.join(pieces)})" if pieces else f"{name}()")
+            summaries.append(_tool_call_summary(name, params))
+        if _history_role_label(role) == "ASSISTANT":
+            summaries.extend(_plain_tool_call_summaries(text))
     return summaries
+
+
+def _tool_call_summary(name: str, params: dict[str, str]) -> str:
+    pieces: list[str] = []
+    for key in (
+        "task_id",
+        "taskId",
+        "status",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "command",
+        "description",
+    ):
+        value = params.get(key)
+        if value:
+            pieces.append(f"{key}={_one_line(value, 120)}")
+        if len(pieces) >= 4:
+            break
+    return f"{name}({', '.join(pieces)})" if pieces else f"{name}()"
+
+
+def _plain_tool_call_summaries(text: str) -> list[str]:
+    if not _PLAIN_TOOL_CALL_HEADER_RE.search(text or ""):
+        return []
+    summaries: list[str] = []
+    for line in (text or "").splitlines():
+        match = _PLAIN_TOOL_CALL_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name").strip()
+        if not name:
+            continue
+        summaries.append(_tool_call_summary(name, _parse_plain_tool_call_args(match.group("args") or "")))
+    return summaries
+
+
+def _parse_plain_tool_call_args(raw: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for match in _PLAIN_TOOL_ARG_RE.finditer(raw or ""):
+        key = match.group("key").strip()
+        value = _strip_plain_arg_value(match.group("value"))
+        if key and value:
+            params[key] = _one_line(value, 1000)
+    return params
+
+
+def _strip_plain_arg_value(value: str) -> str:
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1]
+    return text
 
 
 def _extract_tool_result_signals(entries: list[tuple[str, str]]) -> list[str]:

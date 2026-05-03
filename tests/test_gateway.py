@@ -32,7 +32,7 @@ from webai_gateway.openai_api import (
 )
 from webai_gateway.deepseek_web import DeepSeekWebClient, is_deepseek_web_model, normalize_deepseek_model
 from webai_gateway.tool_controller import RetryState, classify_bridge_result
-from webai_gateway.prompt_compaction import compact_web_prompt
+from webai_gateway.prompt_compaction import build_preserved_task_state_snapshot, compact_web_prompt
 from webai_gateway.qwen_web import (
     QwenWebClient,
     _collect_qwen_stream_lines,
@@ -54,6 +54,7 @@ from webai_gateway.tool_bridge import (
     build_local_repo_preflight_tool_call,
     build_context,
     build_repair_messages,
+    build_tool_prompt,
     parse_tool_response,
     prefer_local_tools_for_local_agent_task,
     prepare_openai_messages,
@@ -2522,7 +2523,7 @@ def test_converts_tool_result_with_observation_compression() -> None:
     joined = "\n".join(str(m["content"]) for m in seen["body"]["messages"])
     assert "Tool result was too long and has been compressed" in joined
     assert "Original length" in joined
-    assert len(joined) < 7600
+    assert len(joined) < 8200
 
 
 def test_compress_observation_filters_dependency_path_lists() -> None:
@@ -10153,6 +10154,62 @@ def test_qwen_messages_compacts_oversized_prompt_for_web_provider() -> None:
     assert "WebAI Gateway's strict tool bridge" in prompt
     assert "Please analyze this codebase" in prompt
     assert prompt.count("skill listing entry") < 10
+
+
+def test_tool_prompt_read_like_tool_includes_ds2api_cache_guard() -> None:
+    prompt = build_tool_prompt(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read files",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+    )
+
+    assert "Read-tool cache guard" in prompt
+    assert "already available in history" in prompt
+    assert "Do not repeatedly call the same read request" in prompt
+
+
+def test_tool_prompt_non_read_tool_omits_ds2api_cache_guard() -> None:
+    prompt = build_tool_prompt(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+    )
+
+    assert "Read-tool cache guard" not in prompt
+
+
+def test_preserved_task_state_keeps_recent_plain_tool_call_before_latest_request() -> None:
+    snapshot = build_preserved_task_state_snapshot(
+        [
+            ("assistant", "Assistant requested tool calls:\nRead(path=fetch_wechat.py)"),
+            ("tool", "fetch_wechat.py content"),
+            ("user", "继续这个任务"),
+        ]
+    )
+
+    assert "# WebAI Gateway preserved task state" in snapshot
+    assert "Recent tool calls:" in snapshot
+    assert "Read(path=fetch_wechat.py)" in snapshot
 
 
 def test_qwen_messages_prepend_stateless_web_api_guard() -> None:
