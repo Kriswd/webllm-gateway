@@ -57,6 +57,7 @@ from webai_gateway.tool_bridge import (
     parse_tool_response,
     prefer_local_tools_for_local_agent_task,
     prepare_openai_messages,
+    should_bridge_tools,
     compress_observation,
     sanitize_leaked_tool_protocol_output,
 )
@@ -817,6 +818,29 @@ def _qwen_coder_credential_store(tmp_path: Path) -> CredentialStore:
 
 def _not_found_client() -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(404, request=request)))
+
+
+def test_auto_activation_does_not_inherit_tool_loop_for_meta_capability_question() -> None:
+    assert (
+        should_bridge_tools(
+            [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+            ],
+            "strict",
+            activation_policy="auto",
+            messages=[
+                {"role": "user", "content": "Audit this local repository."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_read", "content": "README contents"}]},
+                {"role": "user", "content": "你有什么功能？"},
+            ],
+        )
+        is False
+    )
 
 
 def test_gitignore_protects_local_credentials_and_runtime_state() -> None:
@@ -15150,6 +15174,70 @@ def test_qwen_web_auto_activation_routes_plain_web_search_to_native_provider(tmp
     body = response.json()
     assert body["stop_reason"] == "end_turn"
     assert body["content"] == [{"type": "text", "text": "Qwen native web search returned a final answer."}]
+
+
+def test_qwen_web_auto_activation_does_not_bridge_meta_question_after_tool_loop(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return _openai_response("我可以回答问题、解释代码，也可以在明确任务中配合客户端工具完成项目操作。")
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "Audit this local repository."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_read", "content": "README contents"}]},
+                {"role": "user", "content": "你有什么功能？"},
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = seen["payload"]
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "WebAI Gateway's strict tool bridge" not in prompt
+    assert "Required tool-call format" not in prompt
+    body = response.json()
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == [{"type": "text", "text": "我可以回答问题、解释代码，也可以在明确任务中配合客户端工具完成项目操作。"}]
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+    started = next(event for event in diagnostics if event["kind"] == "completion_request_started")
+    assert started["bridge"] is False
+    assert started["requestToolCount"] == 3
 
 
 def test_qwen_web_native_search_retries_placeholder_response_for_final_answer(tmp_path: Path) -> None:

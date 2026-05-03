@@ -683,9 +683,11 @@ def should_bridge_tools(
         return True
     if _tool_choice_requires_tool(tool_choice):
         return True
+    latest = _effective_human_task_text(messages)
+    if _looks_like_meta_capability_question(latest):
+        return False
     if _messages_have_tool_loop(messages):
         return True
-    latest = _effective_human_task_text(messages)
     if _looks_like_local_agent_task(latest):
         return True
     if provider_native_web_search:
@@ -4059,6 +4061,64 @@ def _looks_like_continuation_task(text: str) -> bool:
         return True
     prefixes = ("继续 ", "接着 ", "continue ", "proceed ", "go on ", "keep going ", "more ", "next ")
     return any(value.startswith(prefix) for prefix in prefixes)
+
+
+def _looks_like_meta_capability_question(text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    english = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+    english_patterns = (
+        "what can you do",
+        "what can u do",
+        "what are your capabilities",
+        "what capabilities do you have",
+        "what capability do you have",
+        "what tools do you have",
+        "what functions do you have",
+        "what features do you have",
+        "what can you help with",
+        "what do you support",
+        "which tools do you have",
+        "list your tools",
+        "show your tools",
+        "your capabilities",
+    )
+    if any(pattern in english for pattern in english_patterns):
+        return True
+
+    compact = re.sub(r"[\s？?！!。,.，、:：；;\"'“”‘’（）()【】\[\]{}<>《》]+", "", lowered)
+    subject_markers = ("你", "助手", "模型", "ai", "agent", "claude", "qwen")
+    capability_markers = (
+        "有什么功能",
+        "有哪些功能",
+        "有什么能力",
+        "有哪些能力",
+        "能做什么",
+        "可以做什么",
+        "会做什么",
+        "能干什么",
+        "会干什么",
+        "支持什么功能",
+        "支持哪些功能",
+        "有什么工具",
+        "有哪些工具",
+        "支持什么工具",
+        "支持哪些工具",
+    )
+    if any(subject in compact for subject in subject_markers) and any(marker in compact for marker in capability_markers):
+        return True
+    return compact in {
+        "能做什么",
+        "可以做什么",
+        "会做什么",
+        "能干什么",
+        "有什么功能",
+        "有哪些功能",
+        "有什么能力",
+        "有哪些能力",
+    }
 
 
 def _looks_like_local_agent_task(text: str) -> bool:
