@@ -691,6 +691,9 @@ def should_bridge_tools(
     if _looks_like_meta_capability_question(latest):
         return False
     if provider_native_web_search:
+        raw_latest = _latest_human_user_text(messages)
+        if _looks_like_search_followup_task(raw_latest) or _looks_like_referential_followup_task(raw_latest):
+            return True
         return False
     if _messages_have_tool_loop(_messages_for_current_human_task(messages)):
         return True
@@ -4069,16 +4072,18 @@ def _effective_human_task_text(messages: Any) -> str:
     local_project_context = _recent_local_project_context_anchor(messages, latest)
     if local_project_context:
         return f"{local_project_context}\nLatest user request: {latest.strip()}".strip()
-    if not _looks_like_continuation_task(latest):
+    if not (_looks_like_continuation_task(latest) or _looks_like_search_followup_task(latest)):
         return latest
     for text in texts[1:]:
-        if text.strip() and not _looks_like_continuation_task(text):
+        if text.strip() and not (_looks_like_continuation_task(text) or _looks_like_search_followup_task(text)):
             return f"{text.strip()}\n{latest.strip()}".strip()
     return latest
 
 
 def _recent_local_project_context_anchor(messages: Any, latest_user_text: str) -> str:
-    if not isinstance(messages, list) or not _looks_like_local_project_reference_task(latest_user_text):
+    if not isinstance(messages, list) or _looks_like_project_context_reset_task(latest_user_text):
+        return ""
+    if not _looks_like_local_project_reference_task(latest_user_text):
         return ""
     project_path = _recent_local_project_path(messages)
     if not project_path:
@@ -4099,6 +4104,8 @@ def _recent_local_project_context_anchor(messages: Any, latest_user_text: str) -
 def _looks_like_local_project_reference_task(text: str) -> bool:
     value = re.sub(r"\s+", " ", (text or "").strip().lower())
     if not value or len(value) > 500:
+        return False
+    if _looks_like_project_context_reset_task(value):
         return False
     markers = (
         "\u8fd9\u4e2a\u9879\u76ee",
@@ -4124,6 +4131,47 @@ def _looks_like_local_project_reference_task(text: str) -> bool:
     if any(marker in value for marker in markers):
         return True
     return bool(re.search(r"\b[\w.-]+\s+(?:project|repo|repository)\b", value))
+
+
+def _looks_like_project_context_reset_task(text: str) -> bool:
+    value = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not value or len(value) > 500:
+        return False
+    markers = (
+        "\u53e6\u4e00\u4e2a\u9879\u76ee",
+        "\u53e6\u4e00\u4e2a\u4ed3\u5e93",
+        "\u53e6\u5916\u4e00\u4e2a\u9879\u76ee",
+        "\u53e6\u5916\u4e00\u4e2a\u4ed3\u5e93",
+        "\u5916\u90e8\u9879\u76ee",
+        "\u5916\u90e8\u4ed3\u5e93",
+        "\u72ec\u7acb\u9879\u76ee",
+        "\u72ec\u7acb\u4ed3\u5e93",
+        "\u4e0d\u540c\u9879\u76ee",
+        "\u4e0d\u540c\u4ed3\u5e93",
+        "\u4e0d\u662f\u8fd9\u4e2a\u9879\u76ee",
+        "\u4e0d\u662f\u8fd9\u4e2a\u4ed3\u5e93",
+        "\u4e0d\u662f\u5f53\u524d\u9879\u76ee",
+        "\u4e0d\u662f\u5f53\u524d\u4ed3\u5e93",
+        "another project",
+        "another repo",
+        "another repository",
+        "different project",
+        "different repo",
+        "different repository",
+        "external project",
+        "external repo",
+        "external repository",
+        "separate project",
+        "separate repo",
+        "separate repository",
+        "not this project",
+        "not this repo",
+        "not this repository",
+        "not the current project",
+        "not the current repo",
+        "not the current repository",
+    )
+    return any(marker in value for marker in markers)
 
 
 def _recent_local_project_path(messages: list[Any]) -> str:
@@ -4460,6 +4508,35 @@ def _looks_like_referential_followup_task(value: str) -> bool:
     return ("\u94fe\u63a5" in value or "url" in value) and (
         "\u63d0\u4f9b\u8fc7" in value or "provided" in value or "same" in value
     )
+
+
+def _looks_like_search_followup_task(text: str) -> bool:
+    value = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not value or len(value) > 160:
+        return False
+    markers = (
+        "\u4f60\u81ea\u5df1\u641c",
+        "\u81ea\u5df1\u641c",
+        "\u641c\u554a",
+        "\u641c\u4e00\u4e0b",
+        "\u53bb\u641c",
+        "\u5e2e\u6211\u641c",
+        "\u4f60\u81ea\u5df1\u67e5",
+        "\u81ea\u5df1\u67e5",
+        "\u67e5\u4e00\u4e0b",
+        "\u4e0a\u7f51\u67e5",
+        "\u4e0a\u7f51\u641c",
+        "\u8054\u7f51\u67e5",
+        "\u8054\u7f51\u641c",
+        "search it",
+        "search yourself",
+        "look it up",
+        "google it",
+        "browse for it",
+    )
+    if any(marker in value for marker in markers):
+        return True
+    return len(value) <= 80 and ("\u81ea\u5df1" in value or "\u4f60" in value) and _looks_like_web_search_task(value)
 
 
 def _looks_like_meta_capability_question(text: str) -> bool:

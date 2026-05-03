@@ -120,6 +120,8 @@ def build_upstream_payload(
         body.get("messages"),
         tool_choice=body.get("tool_choice"),
     )
+    if bridge and bridge_context.enabled:
+        native_web_search = False
     allowed_tools: set[str] = set()
     allowed_tools = bridge_context.allowed_names
     payload["model"] = model

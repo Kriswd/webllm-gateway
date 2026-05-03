@@ -15140,6 +15140,99 @@ def test_qwen_web_compaction_preserves_local_project_context_for_project_followu
     assert followup in current_block
 
 
+def test_qwen_web_compaction_drops_local_project_context_for_external_project_reset() -> None:
+    first_task = "\u66f4\u65b0\u4e0bnexu\u8fd9\u4e2a\u9879\u76ee\u6700\u65b0\u7684github\u4ee3\u7801"
+    external_reset = "\u6211\u662f\u8bf4nexu-openai-proxy\u662f\u53e6\u4e00\u4e2a\u9879\u76ee"
+    search_followup = "\u4f60\u81ea\u5df1\u641c\u554a"
+    prompt, files = qwen_messages_to_prompt_and_files(
+        [
+            {"role": "system", "content": "system bootstrap\n" + ("large history\n" * 500)},
+            {"role": "user", "content": first_task},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_bash",
+                        "type": "function",
+                        "function": {
+                            "name": "Bash",
+                            "arguments": json.dumps(
+                                {"command": "cd E:/ProjectX/nexu && git status"},
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_bash",
+                "name": "Bash",
+                "content": "On branch main\nYour branch is up to date with 'origin/main'.",
+            },
+            {"role": "user", "content": external_reset},
+            {"role": "assistant", "content": "\u8bf7\u63d0\u4f9b GitHub URL\uff0c\u6216\u8005\u4ed3\u5e93\u540d\u79f0\u3002"},
+            {"role": "user", "content": search_followup},
+        ],
+        max_prompt_chars=1800,
+    )
+
+    assert files == []
+    marker = "=== CURRENT USER REQUEST (highest priority) ==="
+    assert marker in prompt
+    current_block = prompt[prompt.rfind(marker) :]
+    assert external_reset in current_block
+    assert search_followup in current_block
+    assert "Active local project context" not in current_block
+    assert "Project path: E:/ProjectX/nexu" not in current_block
+
+
+def test_tool_bridge_drops_local_project_context_for_external_project_reset() -> None:
+    first_task = "\u66f4\u65b0\u4e0bnexu\u8fd9\u4e2a\u9879\u76ee\u6700\u65b0\u7684github\u4ee3\u7801"
+    external_reset = "\u6211\u662f\u8bf4nexu-openai-proxy\u662f\u53e6\u4e00\u4e2a\u9879\u76ee"
+    messages = [
+        {"role": "user", "content": first_task},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_bash",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": json.dumps({"command": "cd E:/ProjectX/nexu && git status"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_bash",
+            "name": "Bash",
+            "content": "On branch main\nYour branch is up to date with 'origin/main'.",
+        },
+        {"role": "user", "content": external_reset},
+    ]
+    context = prefer_local_tools_for_local_agent_task(
+        build_context(
+            [
+                {"type": "function", "function": {"name": "Bash", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "WebSearch", "parameters": {"type": "object"}}},
+            ],
+            ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+        ),
+        messages,
+    )
+
+    assert context.enabled is True
+    assert "nexu-openai-proxy" in context.task_text
+    assert "Active local project context" not in context.task_text
+    assert "E:/ProjectX/nexu" not in context.task_text
+
+
 def test_qwen_web_direct_payload_keeps_current_task_anchor_when_bridge_disabled(tmp_path: Path) -> None:
     seen_payloads: list[dict[str, Any]] = []
 
@@ -15774,6 +15867,162 @@ def test_qwen_web_auto_activation_keeps_local_project_reference_on_tool_bridge(t
     assert followup in prompt
     assert response.json()["content"] == [
         {"type": "tool_use", "id": "toolu_call_1", "name": "Read", "input": {"file_path": "E:/ProjectX/nexu/README.md"}}
+    ]
+
+
+def test_qwen_web_auto_activation_uses_websearch_for_external_project_search_followup(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"call_1","name":"WebSearch","input":{"query":"nexu-openai-proxy GitHub"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        provider_runtime=ProviderRuntimeConfig(native_web_search_policy="auto"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    first_task = "\u66f4\u65b0\u4e0bnexu\u8fd9\u4e2a\u9879\u76ee\u6700\u65b0\u7684github\u4ee3\u7801"
+    external_reset = "\u6211\u662f\u8bf4nexu-openai-proxy\u662f\u53e6\u4e00\u4e2a\u9879\u76ee"
+    search_followup = "\u4f60\u81ea\u5df1\u641c\u554a"
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [
+                {"role": "user", "content": first_task},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_git_status",
+                            "name": "Bash",
+                            "input": {"command": "cd E:/ProjectX/nexu && git status"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_git_status",
+                            "content": "On branch main\nYour branch is up to date with 'origin/main'.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": external_reset},
+                {"role": "assistant", "content": "\u8bf7\u63d0\u4f9b GitHub URL\uff0c\u6216\u8005\u4ed3\u5e93\u540d\u79f0\u3002"},
+                {"role": "user", "content": search_followup},
+            ],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = seen["payload"]
+    assert payload.get("_webai_native_web_search") is False
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "nexu-openai-proxy" in prompt
+    assert search_followup in prompt
+    assert "Active local project context" not in prompt
+    assert "Project path: E:/ProjectX/nexu" not in prompt
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_1",
+            "name": "WebSearch",
+            "input": {"query": "nexu-openai-proxy GitHub"},
+        }
+    ]
+
+
+def test_qwen_web_search_followup_prefers_downstream_tool_over_native_search(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"call_1","name":"WebSearch","input":{"query":"foo-lib latest release"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        provider_runtime=ProviderRuntimeConfig(native_web_search_policy="auto"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [
+                {"role": "user", "content": "\u67e5\u4e00\u4e0b foo-lib \u7684\u6700\u65b0\u7248\u672c"},
+                {"role": "assistant", "content": "\u8bf7\u63d0\u4f9b GitHub URL\u3002"},
+                {"role": "user", "content": "\u4f60\u81ea\u5df1\u641c\u554a"},
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = seen["payload"]
+    assert payload.get("_webai_native_web_search") is False
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "foo-lib" in prompt
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_1",
+            "name": "WebSearch",
+            "input": {"query": "foo-lib latest release"},
+        }
     ]
 
 
