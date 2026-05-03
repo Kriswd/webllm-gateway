@@ -20,7 +20,8 @@ _DS2API_HISTORY_CONTINUATION = (
 )
 _CURRENT_USER_REQUEST_INSTRUCTION = (
     "Use the prior DS2API_HISTORY only as context. Answer this latest user request; "
-    "do not continue unrelated earlier tasks unless this request explicitly asks to."
+    "do not continue unrelated earlier tasks unless this request explicitly asks to. "
+    "Do not summarize DS2API_HISTORY.txt or the current state unless the latest user request asks for a status summary."
 )
 STATELESS_WEB_API_GUARD = (
     "You are serving a stateless WebAI Gateway API request. Ignore any previous website chat, "

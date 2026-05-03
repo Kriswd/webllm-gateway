@@ -2220,6 +2220,11 @@ def _controller_retry_error_message(error_kind: str) -> str:
             "The model returned only a tool execution status instead of answering the user's local-agent task. "
             "Continue with an allowed discovery/read/search tool or produce a substantive final review, plan, or implementation summary."
         )
+    if error_kind == "history_summary_final_without_task_answer":
+        return (
+            "The model summarized DS2API_HISTORY.txt or the current state instead of answering the latest local-agent task. "
+            "Use DS2API_HISTORY only as context, then answer the current user request directly from gathered evidence."
+        )
     return (
         "The controller rejected this response as incomplete for local-agent work. "
         "Request an allowed tool if more evidence is needed, otherwise provide a substantive final answer."

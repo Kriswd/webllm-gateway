@@ -526,6 +526,26 @@ def test_tool_controller_retries_no_task_final_after_tool_result() -> None:
     assert decision.reason == "status_only_final_without_task_answer"
 
 
+def test_tool_controller_retries_ds2api_history_summary_final_in_all_profile() -> None:
+    text = (
+        "根据提供的 `DS2API_HISTORY.txt` 上下文，当前的工作状态如下："
+        "用户之前正在探索如何为 Claude 创建 Skills，助手读取了相关文档。"
+        "当前状态是文件内容已经压缩返回，下一步可以继续阅读或总结。"
+    )
+    result = BridgeResult(content=text, tool_calls=[], raw_content=text)
+    context = _controller_context_with_tools(
+        ["Glob", "Read", "Grep", "Skill"],
+        task_text="审查当前项目的代码，看看有什么需要改进的",
+        recent_tool_call_names=("Glob", "Read", "Skill"),
+    )
+    context = replace(context, options=ToolBridgeConfig(exposure_policy="all", tool_profile="all"))
+
+    decision = classify_bridge_result(result, context, RetryState())
+
+    assert decision.state == "RETRY"
+    assert decision.reason == "history_summary_final_without_task_answer"
+
+
 def test_tool_controller_retries_off_task_environment_config_final_after_tool_loop() -> None:
     text = (
         'CAVEMAN MODE ACTIVE. Statusline badge not configured. Add to `~/.claude/settings.json`: '
@@ -9918,6 +9938,7 @@ def test_qwen_messages_compaction_uses_ds2api_history_continuation() -> None:
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
     assert "=== CURRENT USER REQUEST (highest priority) ===" in prompt
+    assert "Do not summarize DS2API_HISTORY.txt" in prompt
     assert prompt.rfind("LATEST_SENTINEL") > prompt.rfind("Continue from the latest state")
 
 

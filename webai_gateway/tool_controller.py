@@ -76,6 +76,16 @@ _STATUS_ONLY_TOOL_FINAL_RE = re.compile(
     r"(?:command|tool|task|operation).{0,40}(?:no output|empty output)",
     re.IGNORECASE,
 )
+_HISTORY_SUMMARY_FINAL_RE = re.compile(
+    r"(?:according\s+to|based\s+on|根据|基于).{0,40}DS2API_HISTORY\.txt.{0,80}"
+    r"(?:current\s+(?:work\s+)?state|work\s+status|当前(?:的)?(?:工作)?状态|工作状态)|"
+    r"DS2API_HISTORY\.txt.{0,120}(?:current\s+(?:work\s+)?state|work\s+status|当前(?:的)?(?:工作)?状态|工作状态)",
+    re.IGNORECASE | re.DOTALL,
+)
+_HISTORY_SUMMARY_REQUEST_RE = re.compile(
+    r"\b(?:status|state|progress|recap|summar(?:y|ize))\b|(?:状态|进展|总结|回顾|复盘)",
+    re.IGNORECASE,
+)
 _OFF_TASK_ENV_CONFIG_FINAL_RE = re.compile(
     r"\bcaveman\s+mode\s+active\b.{0,200}\b(?:statusline|status\s+line|settings\.json|badge|plugins?|hooks?)\b|"
     r"\b(?:statusline|status\s+line|badge)\b.{0,160}\b(?:settings\.json|configured|configure|command)\b|"
@@ -139,6 +149,21 @@ def classify_bridge_result(
                 ),
             )
         return ControllerDecision("FINAL", reason="non_repairable_error", bridge_result=result, retry_state=state)
+
+    if _is_history_summary_final_without_task_answer(context, result.content):
+        if state.repair_attempts >= max_repair_attempts:
+            return ControllerDecision("FINAL", reason="retry_budget_exhausted", bridge_result=result, retry_state=state)
+        return ControllerDecision(
+            "RETRY",
+            retry_kind="history_summary_final_without_task_answer",
+            reason="history_summary_final_without_task_answer",
+            bridge_result=result,
+            retry_state=RetryState(
+                repair_attempts=state.repair_attempts + 1,
+                recovery_attempts=state.recovery_attempts,
+                ask_user_attempts=state.ask_user_attempts,
+            ),
+        )
 
     if _allows_ds2api_style_controller_passthrough(context):
         return ControllerDecision("FINAL", bridge_result=result, retry_state=state)
@@ -380,6 +405,20 @@ def _is_status_only_final_without_task_answer(context: ToolBridgeContext, text: 
     if _SUBSTANTIVE_TASK_ANSWER_RE.search(raw):
         return False
     return bool(_STATUS_ONLY_TOOL_FINAL_RE.search(raw))
+
+
+def _is_history_summary_final_without_task_answer(context: ToolBridgeContext, text: str) -> bool:
+    if not context.has_tool_loop or not context.allowed_names:
+        return False
+    task = context.task_text or ""
+    if _HISTORY_SUMMARY_REQUEST_RE.search(task) or "DS2API_HISTORY" in task:
+        return False
+    if not (_REVIEW_TASK_RE.search(task) or _MUTATION_TASK_RE.search(task)):
+        return False
+    raw = " ".join((text or "").split())
+    if not raw:
+        return False
+    return bool(_HISTORY_SUMMARY_FINAL_RE.search(raw[:1200]))
 
 
 def _is_off_task_environment_configuration_final(context: ToolBridgeContext, text: str) -> bool:
