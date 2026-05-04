@@ -19,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from webai_gateway.auto_research import build_auto_research_status
 from webai_gateway.config import GatewayConfig, config_to_admin, config_to_public, load_config, save_config, update_config
 from webai_gateway.deepseek_web import DEEPSEEK_DEFAULT_MODEL, DeepSeekWebClient, is_deepseek_web_model
+from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.openai_api import (
     bridge_error_headers,
     build_incomplete_response_retry_payload,
@@ -596,11 +597,19 @@ def _runtime_status(app: FastAPI) -> dict[str, Any]:
     started_epoch = float(getattr(app.state, "runtime_started_epoch", 0) or 0)
     latest_epoch = float(latest.get("mtimeEpoch") or 0)
     stale = latest_epoch > started_epoch + 0.5
+    ds2api_status = {
+        "oracleCommit": DS2API_ORACLE_COMMIT,
+        "oracleVersion": DS2API_ORACLE_VERSION,
+        "sidecarVersion": "unknown",
+        "sidecarCommit": "unknown",
+        "latestAlignmentClaimAllowed": False,
+    }
     return {
         "startedAt": getattr(app.state, "runtime_started_at", ""),
         "sourceFresh": not stale,
         "sourceStale": stale,
         "latestSource": latest,
+        "ds2api": ds2api_status,
         "statusText": "运行代码是最新的" if not stale else "源码已更新，请重启 Gateway 让补丁生效",
     }
 
@@ -1262,6 +1271,7 @@ def _openai_stream_response(
     bridge: bool,
     sse_body: str,
     provider_diagnostic: Any = None,
+    content_type: str = "text/event-stream",
 ) -> Response:
     _record_completion_diagnostic(
         app,
@@ -1274,7 +1284,7 @@ def _openai_stream_response(
         **_openai_sse_response_fields(sse_body),
         **_provider_diagnostic_fields(provider_diagnostic),
     )
-    return Response(sse_body, media_type="text/event-stream")
+    return Response(sse_body, media_type=content_type or "text/event-stream")
 
 
 def _provider_diagnostic_fields(diagnostic: Any) -> dict[str, Any]:
@@ -2346,6 +2356,17 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
         raise HTTPException(status_code=502, detail=f"DeepSeek Web 调用失败：{exc}") from exc
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="DeepSeek Web 响应必须是 JSON 对象")
+    if data.get("_webai_stream") and bool(body.get("stream")):
+        return _openai_stream_response(
+            app,
+            body=body,
+            route="deepseek-web",
+            model=model,
+            bridge=bridge,
+            sse_body=str(data.get("_webai_sse_body") or ""),
+            provider_diagnostic=getattr(web_client, "last_diagnostic", None),
+            content_type=str(data.get("_webai_content_type") or "text/event-stream"),
+        )
     try:
         parsed, bridge_result = _parse_bridge_chat_data(
             data,

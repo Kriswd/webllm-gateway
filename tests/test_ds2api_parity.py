@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import textwrap
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from ds2api_oracle import (
+    DS2API_ORACLE_COMMIT,
+    DS2API_ORACLE_VERSION,
+    assert_oracle_is_latest,
+    build_ds2api_runner,
+    run_ds2api_runner,
+)
 from webai_gateway.config import ToolBridgeConfig
 from webai_gateway.openai_api import build_tool_call_sse, parse_chat_response
 from webai_gateway.tool_bridge import (
@@ -20,115 +25,15 @@ from webai_gateway.tool_bridge import (
 )
 
 
-DS2API_MAIN_COMMIT = "3d52040b3b0420c6602d08a0627cb1078ed320aa"
-DS2API_DEV_COMMIT = "e620752"
+DS2API_MAIN_COMMIT = DS2API_ORACLE_COMMIT
+DS2API_DEV_COMMIT = ""
 DS2API_REFERENCE_ROOT = Path(os.environ.get("DS2API_REFERENCE_ROOT", r"E:\ProjectX\_reference\ds2api"))
-
-
-DS2API_RUNNER_SOURCE = r'''
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-
-	"ds2api/internal/toolcall"
-)
-
-type request struct {
-	Mode      string `json:"mode"`
-	Text      string `json:"text"`
-	Thinking  string `json:"thinking"`
-	Names     []string `json:"names"`
-	ToolsRaw  any `json:"toolsRaw"`
-}
-
-type response struct {
-	Calls             []toolcall.ParsedToolCall `json:"calls"`
-	SawToolCallSyntax bool `json:"sawToolCallSyntax"`
-	RejectedByPolicy  bool `json:"rejectedByPolicy"`
-	RejectedToolNames []string `json:"rejectedToolNames"`
-	OpenAI            []map[string]any `json:"openai,omitempty"`
-	Stream            []map[string]any `json:"stream,omitempty"`
-}
-
-func main() {
-	var req request
-	if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
-		fmt.Fprintf(os.Stderr, "decode request: %v\n", err)
-		os.Exit(2)
-	}
-	var parsed toolcall.ToolCallParseResult
-	switch req.Mode {
-	case "assistant":
-		parsed = toolcall.ParseAssistantToolCallsDetailed(req.Text, req.Thinking, req.Names)
-	default:
-		parsed = toolcall.ParseToolCallsDetailed(req.Text, req.Names)
-	}
-	resp := response{
-		Calls: parsed.Calls,
-		SawToolCallSyntax: parsed.SawToolCallSyntax,
-		RejectedByPolicy: parsed.RejectedByPolicy,
-		RejectedToolNames: parsed.RejectedToolNames,
-	}
-	if req.Mode == "format" {
-		resp.OpenAI = toolcall.FormatOpenAIToolCalls(parsed.Calls, req.ToolsRaw)
-	}
-	if req.Mode == "stream" {
-		resp.Stream = toolcall.FormatOpenAIStreamToolCalls(parsed.Calls, req.ToolsRaw)
-	}
-	if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
-		fmt.Fprintf(os.Stderr, "encode response: %v\n", err)
-		os.Exit(2)
-	}
-}
-'''
 
 
 @pytest.fixture(scope="session")
 def ds2api_runner(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    root = DS2API_REFERENCE_ROOT
-    if not root.exists():
-        pytest.skip(f"ds2api reference repo not found: {root}")
-    commit = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert commit == DS2API_MAIN_COMMIT
-
-    workdir = tmp_path_factory.mktemp("ds2api_toolcall_runner")
-    (workdir / "go.mod").write_text(
-        textwrap.dedent(
-            f"""
-            module ds2api/parityrunner
-
-            go 1.26.0
-
-            require ds2api v0.0.0
-
-            replace ds2api => {root.as_posix()}
-            """
-        ).strip()
-        + "\n",
-        encoding="utf-8",
-    )
-    (workdir / "main.go").write_text(DS2API_RUNNER_SOURCE, encoding="utf-8")
-    reference_sum = root / "go.sum"
-    if reference_sum.exists():
-        (workdir / "go.sum").write_text(reference_sum.read_text(encoding="utf-8"), encoding="utf-8")
-    exe = workdir / ("ds2api-toolcall-runner.exe" if os.name == "nt" else "ds2api-toolcall-runner")
-    subprocess.run(
-        ["go", "build", "-mod=mod", "-o", str(exe), "."],
-        cwd=workdir,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=_go_test_env(workdir),
-    )
-    return exe
+    assert_oracle_is_latest()
+    return build_ds2api_runner(tmp_path_factory.mktemp("ds2api_toolcall_runner"))
 
 
 def _context(names: list[str]):
@@ -182,27 +87,22 @@ def _run_ds2api_runner(
     names: list[str],
     mode: str = "parse",
     thinking: str = "",
+    detection_thinking: str = "",
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: str = "auto",
+    content_filter: bool = False,
 ) -> dict[str, Any]:
-    request = {
-        "mode": mode,
-        "text": text,
-        "thinking": thinking,
-        "names": names,
-        "toolsRaw": tools if tools is not None else _tools_for_names(names),
-    }
-    completed = subprocess.run(
-        [str(runner)],
-        input=json.dumps(request, ensure_ascii=False),
-        check=True,
-        capture_output=True,
-        text=True,
+    return run_ds2api_runner(
+        runner,
+        text=text,
+        names=names,
+        mode=mode,
+        thinking=thinking,
+        detection_thinking=detection_thinking,
+        tools=tools,
+        tool_choice=tool_choice,
+        content_filter=content_filter,
     )
-    response = json.loads(completed.stdout)
-    response["calls"] = response.get("calls") or []
-    response["openai"] = response.get("openai") or []
-    response["stream"] = response.get("stream") or []
-    return response
 
 
 def _go_test_env(workdir: Path) -> dict[str, str]:
@@ -267,6 +167,28 @@ DS2API_DIFFERENTIAL_PARSE_CASES: list[dict[str, Any]] = [
         "names": ["Bash"],
     },
     {
+        "id": "hyphenated_dsml_shell_heredoc",
+        "text": (
+            '<dsml-tool-calls>\n'
+            '<dsml-invoke name="Bash">\n'
+            '<dsml-parameter name="command"><![CDATA[git commit -m "$(cat <<\'EOF\'\n'
+            "docs: add architecture updates\n"
+            "\n"
+            "Co-Authored-By: Claude Opus 4.7 noreply@anthropic.com\n"
+            "EOF\n"
+            ')"]]></dsml-parameter>\n'
+            '<dsml-parameter name="description"><![CDATA[Create commit with architecture doc updates]]></dsml-parameter>\n'
+            "</dsml-invoke>\n"
+            "</dsml-tool-calls>"
+        ),
+        "names": ["Bash"],
+    },
+    {
+        "id": "bare_hyphenated_tool_calls_rejected",
+        "text": '<tool-calls><invoke name="Bash"><parameter name="command">pwd</parameter></invoke></tool-calls>',
+        "names": ["Bash"],
+    },
+    {
         "id": "dsml_trailing_pipe",
         "text": '<|DSML|tool_calls| <|DSML|invoke name="terminal"><|DSML|parameter name="command"><![CDATA[find "/home" -type d]]></|DSML|parameter><|DSML|parameter name="timeout"><![CDATA[10]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>',
         "names": ["terminal"],
@@ -304,6 +226,45 @@ DS2API_DIFFERENTIAL_PARSE_CASES: list[dict[str, Any]] = [
     {
         "id": "nested_tool_syntax_inside_cdata",
         "text": '<tool_calls><invoke name="Write"><parameter name="content"><![CDATA[# Release notes\n\n```xml\n<tool_calls>\n  <invoke name="demo">\n    <parameter name="value">x</parameter>\n  </invoke>\n</tool_calls>\n```]]></parameter><parameter name="file_path">DS2API-4.0-Release-Notes.md</parameter></invoke></tool_calls>',
+        "names": ["Write"],
+    },
+    {
+        "id": "heredoc_cdata_with_fenced_dsml_and_literal_cdata_end",
+        "text": (
+            '<|DSML|tool_calls><|DSML|invoke name="Bash">'
+            '<|DSML|parameter name="command"><![CDATA['
+            "cat > docs/project-value.md << 'ENDOFFILE'\n"
+            "# DS2API project value\n\n"
+            "```xml\n"
+            "<|DSML|tool_calls>\n"
+            '  <|DSML|invoke name="Bash">\n'
+            '    <|DSML|parameter name="command"><![CDATA[grep -E "error|fail" < input.log 2>&1]]></|DSML|parameter>\n'
+            "  </|DSML|invoke>\n"
+            "</|DSML|tool_calls>\n"
+            "```\n\n"
+            "Only the literal `]]>` needs special handling.\n\n"
+            "ENDOFFILE\n"
+            'echo "Done. Lines: $(wc -l < docs/project-value.md)"'
+            "]]></|DSML|parameter>"
+            '<|DSML|parameter name="description"><![CDATA[Write project value doc]]></|DSML|parameter>'
+            "</|DSML|invoke></|DSML|tool_calls>"
+        ),
+        "names": ["Bash"],
+    },
+    {
+        "id": "compact_fenced_dsml_inside_cdata",
+        "text": (
+            '<tool_calls><invoke name="Write"><parameter name="content"><![CDATA['
+            "```xml\n"
+            "<|DSML|tool_calls>\n"
+            '  <|DSML|invoke name="Bash">\n'
+            '    <|DSML|parameter name="command"><![CDATA[echo compact]]></|DSML|parameter>\n'
+            "  </|DSML|invoke>\n"
+            "</|DSML|tool_calls>\n"
+            "```\n"
+            "tail"
+            "]]></parameter></invoke></tool_calls>"
+        ),
         "names": ["Write"],
     },
     {
@@ -517,8 +478,96 @@ def test_ds2api_differential_openai_stream_format(ds2api_runner: Path) -> None:
 
 
 def test_ds2api_reference_commits_are_documented() -> None:
-    assert DS2API_MAIN_COMMIT == "3d52040b3b0420c6602d08a0627cb1078ed320aa"
-    assert DS2API_DEV_COMMIT == "e620752"
+    assert_oracle_is_latest()
+    assert DS2API_MAIN_COMMIT == "f413d42b0c61551b64deff7c7ab93cfca1f1ec98"
+    assert DS2API_ORACLE_VERSION == "4.4.1"
+
+
+def test_ds2api_parity_accepts_hyphenated_dsml_but_rejects_bare_hyphenated_xml() -> None:
+    command = "git commit -m \"$(cat <<'EOF'\nfeat: document architecture\nEOF\n)\""
+    payload = (
+        "<dsml-tool-calls>"
+        '<dsml-invoke name="Bash">'
+        f'<dsml-parameter name="command"><![CDATA[{command}]]></dsml-parameter>'
+        '<dsml-parameter name="description"><![CDATA[Commit architecture docs]]></dsml-parameter>'
+        "</dsml-invoke>"
+        "</dsml-tool-calls>"
+    )
+
+    assert _single_call(payload, ["Bash"]) == (
+        "Bash",
+        {"command": command, "description": "Commit architecture docs"},
+    )
+
+    bare = '<tool-calls><invoke name="Bash"><parameter name="command">pwd</parameter></invoke></tool-calls>'
+    result = _parse(bare, ["Bash"])
+    assert result.error is None
+    assert result.tool_calls == []
+    assert result.content == bare
+
+
+def test_ds2api_parity_preserves_cdata_with_fenced_dsml_and_literal_cdata_end() -> None:
+    content = "\n".join(
+        [
+            "```xml",
+            "<|DSML|tool_calls>",
+            '  <|DSML|invoke name="Bash">',
+            '    <|DSML|parameter name="command"><![CDATA[echo compact]]></|DSML|parameter>',
+            "  </|DSML|invoke>",
+            "</|DSML|tool_calls>",
+            "```",
+            "Only literal `]]>` should stay inside content.",
+            "tail",
+        ]
+    )
+    payload = (
+        '<tool_calls><invoke name="Write">'
+        f'<parameter name="content"><![CDATA[{content}]]></parameter>'
+        "</invoke></tool_calls>"
+    )
+
+    assert _single_call(payload, ["Write"]) == ("Write", {"content": content})
+
+
+def test_ds2api_assistant_turn_matches_required_and_empty_output_oracle(ds2api_runner: Path) -> None:
+    from webai_gateway.assistant_turn import build_assistant_turn
+
+    context = _context(["Read"])
+    reference = _run_ds2api_runner(
+        ds2api_runner,
+        mode="turn",
+        text="plain answer",
+        names=["Read"],
+        tool_choice="required",
+    )
+    turn = build_assistant_turn(
+        raw_text="plain answer",
+        visible_text="plain answer",
+        thinking="",
+        detection_thinking="",
+        bridge_context=context,
+        tool_choice_required=True,
+    )
+    assert turn.error_code == reference["turn"]["error"]["code"]
+    assert turn.finish_reason == reference["turn"]["finishReason"]
+    assert turn.should_fail == reference["turn"]["shouldFail"]
+
+    reference = _run_ds2api_runner(
+        ds2api_runner,
+        mode="turn",
+        text="",
+        thinking="reasoning only",
+        names=["Read"],
+    )
+    turn = build_assistant_turn(
+        raw_text="",
+        visible_text="",
+        thinking="reasoning only",
+        detection_thinking="",
+        bridge_context=context,
+    )
+    assert turn.error_code == reference["turn"]["error"]["code"]
+    assert turn.has_visible_output == reference["turn"]["hasVisibleOutput"]
 
 
 def test_ds2api_parity_accepts_canonical_and_dsml_xml_wrappers() -> None:

@@ -34,6 +34,14 @@ _XML_INVOKE_OPEN_RE = re.compile(
     r"<+\s*(?!/)[^<>]{0,80}invoke(?=\s|[|｜>])[^<>]*>",
     re.IGNORECASE | re.DOTALL,
 )
+_XML_TOOL_CALLS_OPEN_RE = re.compile(
+    r"<+\s*(?!/)(?:[^<>]{0,80}tool_calls(?=\s|[|>])|[^<>]{0,80}dsml[-_\s|]*tool-calls(?=\s|[|>]))[^<>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_XML_TOOL_CALLS_CLOSE_RE = re.compile(
+    r"<+\s*/\s*(?:[^<>]{0,80}tool_calls(?=\s|[|>])|[^<>]{0,80}dsml[-_\s|]*tool-calls(?=\s|[|>]))[^<>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
 _XML_ANY_TAG_RE = re.compile(r"<+(?P<closing>/?)\s*(?P<body>[^<>]*?)>", re.DOTALL)
 _XML_CHILD_START_RE = re.compile(r"<(?P<tag>[A-Za-z_][\w.:-]*)\b(?P<attrs>[^>]*)>", re.DOTALL)
 _CDATA_RE = re.compile(r"<!\[CDATA\[(?P<body>.*?)\]\]>", re.DOTALL)
@@ -3111,7 +3119,21 @@ def _is_fence_close_marker(line: str, marker: str) -> bool:
 
 
 def _cdata_ranges(text: str) -> list[tuple[int, int]]:
-    return [(match.start(), match.end()) for match in _CDATA_RE.finditer(text or "")]
+    raw = text or ""
+    ranges: list[tuple[int, int]] = []
+    lower = raw.lower()
+    pos = 0
+    marker = "<![cdata["
+    while True:
+        start = lower.find(marker, pos)
+        if start < 0:
+            break
+        end = _find_tool_cdata_end_index(raw, start)
+        if end is None:
+            break
+        ranges.append((start, end))
+        pos = end
+    return ranges
 
 
 def _index_in_ranges(index: int, ranges: list[tuple[int, int]]) -> bool:
@@ -3119,12 +3141,7 @@ def _index_in_ranges(index: int, ranges: list[tuple[int, int]]) -> bool:
 
 
 def _index_inside_cdata(text: str, index: int) -> bool:
-    raw = text or ""
-    start = raw.rfind("<![CDATA[", 0, index + 1)
-    if start < 0:
-        return False
-    end = raw.rfind("]]>", 0, index + 1)
-    return end < start
+    return _index_in_ranges(index, _cdata_ranges(text))
 
 
 def _find_regex_outside_cdata(pattern: re.Pattern[str], text: str, start: int = 0) -> re.Match[str] | None:
@@ -3178,6 +3195,29 @@ def _dsml_local_tag_from_body(body: str) -> tuple[str, int] | None:
             noise = prefix.replace("dsml", "").replace("|", "").strip()
             noise = noise.replace("｜", "")
             if noise:
+                continue
+            return tag, match.end()
+    return None
+
+
+def _dsml_local_tag_from_body(body: str) -> tuple[str, int] | None:
+    lowered = (body or "").replace("｜", "|").lower()
+    alias_specs = (
+        ("tool_calls", "tool_calls", False),
+        ("tool_calls", "tool-calls", True),
+        ("invoke", "invoke", False),
+        ("parameter", "parameter", False),
+    )
+    for tag, alias, dsml_only in alias_specs:
+        for match in re.finditer(re.escape(alias), lowered):
+            tail = lowered[match.end() : match.end() + 1]
+            if tail and (tail.isalnum() or tail in "_:-"):
+                continue
+            prefix = lowered[: match.start()]
+            noise = prefix.replace("dsml", "").replace("|", "").replace("-", "").replace("_", "").strip()
+            if noise:
+                continue
+            if dsml_only and "dsml" not in prefix:
                 continue
             return tag, match.end()
     return None
@@ -3318,16 +3358,97 @@ def _standalone_cdata_text(raw: str) -> str | None:
     stripped = text.strip()
     if not stripped.lower().startswith("<![cdata["):
         return None
-    matches = list(_CDATA_RE.finditer(stripped))
-    if matches:
-        remainder = _CDATA_RE.sub("", stripped).strip()
-        if not remainder:
-            return "".join(match.group("body") or "" for match in matches)
-    if stripped.lower().startswith("<![cdata[") and stripped.endswith("]]>"):
-        return stripped[len("<![CDATA[") : -len("]]>")]
+    extracted = _extract_tool_cdata_text(stripped)
+    if extracted is not None:
+        return extracted
     if stripped.lower().startswith("<![cdata[") and "]]>" not in stripped:
         return stripped[len("<![CDATA[") :]
     return None
+
+
+def _extract_tool_cdata_text(raw: str) -> str | None:
+    lowered = raw.lower()
+    open_marker = "<![cdata["
+    if not lowered.startswith(open_marker):
+        return None
+    start = len(open_marker)
+    end = _find_tool_cdata_end_index(raw, 0)
+    if end is not None:
+        return raw[start : end - len("]]>")]
+    first_non_fence_end = _find_first_non_fence_cdata_end(raw, start)
+    if first_non_fence_end is not None:
+        return raw[start:first_non_fence_end]
+    return None
+
+
+def _find_tool_cdata_end_index(raw: str, start_index: int) -> int | None:
+    lowered = raw.lower()
+    marker = "<![cdata["
+    if not lowered.startswith(marker, start_index):
+        return None
+    content_start = start_index + len(marker)
+    content_end = _find_first_structural_cdata_end(raw, content_start)
+    if content_end is None:
+        return None
+    return content_end + len("]]>")
+
+
+def _find_first_structural_cdata_end(raw: str, content_start: int) -> int | None:
+    lowered = raw.lower()
+    close_marker = "]]>"
+    search_from = content_start
+    first_non_fence_end: int | None = None
+    while search_from < len(raw):
+        end = lowered.find(close_marker, search_from)
+        if end < 0:
+            break
+        search_from = end + len(close_marker)
+        if _cdata_offset_is_inside_markdown_fence(raw[content_start:end]):
+            continue
+        if first_non_fence_end is None:
+            first_non_fence_end = end
+        if _cdata_end_looks_structural(lowered, search_from) or not raw[search_from:].strip():
+            return end
+    return first_non_fence_end
+
+
+def _find_first_non_fence_cdata_end(raw: str, content_start: int) -> int | None:
+    return _find_first_structural_cdata_end(raw, content_start)
+
+
+def _cdata_offset_is_inside_markdown_fence(fragment: str) -> bool:
+    if not fragment:
+        return False
+    in_fence = False
+    fence_marker = ""
+    for line in fragment.splitlines(keepends=True):
+        trimmed = line.lstrip(" \t")
+        if not in_fence:
+            marker = _fence_open_marker(trimmed)
+            if marker:
+                in_fence = True
+                fence_marker = marker
+            continue
+        if _is_fence_close_marker(trimmed, fence_marker):
+            in_fence = False
+            fence_marker = ""
+    return in_fence
+
+
+def _cdata_end_looks_structural(lowered: str, after: int) -> bool:
+    while after < len(lowered) and lowered[after] in " \t\r\n":
+        after += 1
+    if not lowered.startswith("</", after):
+        return False
+    remainder = lowered[after + 2 :]
+    tag = []
+    for char in remainder:
+        if char.isalnum() or char in {"_", "-", "|"}:
+            tag.append(char)
+            continue
+        break
+    normalized = "".join(tag).replace("dsml", "").replace("|", "").replace("-", "_").strip("_")
+    return normalized in {"parameter", "invoke", "tool_calls"}
 
 
 def _preserves_cdata_string_parameter(name: str) -> bool:
@@ -6765,13 +6886,15 @@ def _normalize_shell_tool_command(call: ToolCallDraft, canonical_name: str, tool
 
 def _normalize_shell_command_syntax(command: str) -> str:
     normalized = html.unescape(command or "").strip()
+    multiline = "\n" in normalized or "\r" in normalized
     # Web models often emit shell connectors as entities or duplicate/trailing tokens.
     # Keep command semantics intact; only remove syntax that would create empty segments.
     for _ in range(3):
         previous = normalized
         normalized = re.sub(r"\s*(&&|\|\||;)\s*(?:\1\s*)+", r" \1 ", normalized).strip()
         normalized = re.sub(r"\s*(?:&&|\|\||;)\s*$", "", normalized).strip()
-        normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+        if not multiline:
+            normalized = re.sub(r"[^\S\r\n]{2,}", " ", normalized).strip()
         if normalized == previous:
             break
     return normalized

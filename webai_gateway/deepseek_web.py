@@ -89,6 +89,14 @@ class DeepSeekWebClient:
         except httpx.HTTPStatusError as exc:
             raise RuntimeError(_format_ds2api_error(response)) from exc
 
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "text/event-stream" in content_type:
+            return {
+                "_webai_stream": True,
+                "_webai_sse_body": response.text,
+                "_webai_content_type": content_type,
+            }
+
         data = response.json()
         if not isinstance(data, dict):
             raise RuntimeError("ds2api 返回内容不是 JSON 对象")
@@ -101,7 +109,6 @@ class DeepSeekWebClient:
             if not key.startswith("_webai_")
         }
         ds2api_payload["model"] = normalize_deepseek_model(str(payload.get("model") or DEEPSEEK_DEFAULT_MODEL))
-        ds2api_payload["stream"] = False
         return ds2api_payload
 
 

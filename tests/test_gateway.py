@@ -23,6 +23,7 @@ from webai_gateway.config import (
     UpstreamConfig,
     load_config,
 )
+from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.openai_api import (
     EMPTY_ASSISTANT_RESPONSE_TEXT,
     build_tool_call_sse,
@@ -1002,9 +1003,41 @@ def test_deepseek_web_client_forwards_to_ds2api_with_saved_bearer() -> None:
     assert seen["path"] == "/v1/chat/completions"
     assert seen["authorization"] == "Bearer bearer-secret"
     assert seen["body"]["model"] == "deepseek-v4-pro"
-    assert seen["body"]["stream"] is False
+    assert seen["body"]["stream"] is True
     assert "_webai_native_web_search" not in seen["body"]
     assert response["choices"][0]["message"]["content"] == "OK"
+
+
+def test_deepseek_web_client_returns_ds2api_stream_passthrough_body() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            content='data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    deepseek = DeepSeekWebClient(
+        {"bearer": "bearer-secret", "cookie": "ds_session_id=session-secret", "userAgent": "Chrome Test"},
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        ds2api_base_url="http://ds2api.test/v1",
+    )
+
+    response = deepseek.chat_completions(
+        {
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+    )
+
+    assert seen["body"]["stream"] is True
+    assert response["_webai_stream"] is True
+    assert response["_webai_sse_body"].startswith("data: ")
+    assert response["_webai_content_type"].startswith("text/event-stream")
 
 
 def test_requires_bearer_api_key() -> None:
@@ -8938,6 +8971,11 @@ def test_health_reports_runtime_source_freshness(tmp_path: Path) -> None:
     assert runtime["sourceFresh"] is True
     assert runtime["sourceStale"] is False
     assert runtime["latestSource"]["path"].endswith(".py")
+    assert runtime["ds2api"]["oracleCommit"] == DS2API_ORACLE_COMMIT
+    assert runtime["ds2api"]["oracleVersion"] == DS2API_ORACLE_VERSION
+    assert runtime["ds2api"]["sidecarVersion"] == "unknown"
+    assert runtime["ds2api"]["sidecarCommit"] == "unknown"
+    assert runtime["ds2api"]["latestAlignmentClaimAllowed"] is False
     assert runtime["statusText"] == "运行代码是最新的"
 
 
@@ -8952,6 +8990,7 @@ def test_health_flags_runtime_when_source_changed_after_start(tmp_path: Path) ->
     runtime = response.json()["runtime"]
     assert runtime["sourceFresh"] is False
     assert runtime["sourceStale"] is True
+    assert runtime["ds2api"]["latestAlignmentClaimAllowed"] is False
     assert runtime["statusText"] == "源码已更新，请重启 Gateway 让补丁生效"
 
 
@@ -16969,6 +17008,36 @@ def test_parse_chat_response_normalizes_malformed_empty_upstream_response() -> N
 
     assert parsed["choices"][0]["message"]["content"] == EMPTY_ASSISTANT_RESPONSE_TEXT
     assert bridge_result.content == EMPTY_ASSISTANT_RESPONSE_TEXT
+
+
+def test_parse_chat_response_routes_thinking_only_empty_output_through_assistant_turn() -> None:
+    context = build_context(
+        [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
+        ToolBridgeConfig(exposure_policy="all"),
+    )
+    parsed, bridge_result = parse_chat_response(
+        {
+            "id": "upstream-chatcmpl",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "", "thinking": "reasoning only"},
+                }
+            ],
+        },
+        bridge=True,
+        allowed_tools={"Read"},
+        model="web-model",
+        bridge_context=context,
+        return_bridge_result=True,
+    )
+
+    assert parsed["choices"][0]["message"]["content"] == EMPTY_ASSISTANT_RESPONSE_TEXT
+    assert bridge_result.error is not None
+    assert bridge_result.error.kind == "upstream_empty_output"
+    assert bridge_result.raw_content == "reasoning only"
 
 
 def test_parse_chat_response_ignores_spontaneous_tool_json_when_context_has_no_tools() -> None:

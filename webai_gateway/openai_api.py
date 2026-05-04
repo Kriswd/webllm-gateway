@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from webai_gateway.config import GatewayConfig
+from webai_gateway.assistant_turn import build_assistant_turn
 from webai_gateway.tool_bridge import (
     BridgeResult,
     ToolBridgeContext,
@@ -619,19 +620,28 @@ def parse_chat_response(
             content = EMPTY_ASSISTANT_RESPONSE_TEXT
         result = BridgeResult(content=content, tool_calls=[], raw_content=content)
         return (data, result) if return_bridge_result else data
-    parse_source, used_hidden_detection = _assistant_tool_detection_source(msg, content)
-    result = parse_tool_response(parse_source, context)
-    if used_hidden_detection and not result.tool_calls:
-        result = BridgeResult(
-            content=content,
-            tool_calls=[],
-            error=result.error,
-            warning=result.warning,
-            raw_content=result.raw_content,
-            phases=result.phases,
-        )
+    assistant_turn = build_assistant_turn(
+        raw_text=content,
+        visible_text=content,
+        thinking=_assistant_message_thinking(msg),
+        detection_thinking=_assistant_message_detection_thinking(msg),
+        bridge_context=context,
+        tool_choice_required=_bridge_context_requires_tool(context),
+        content_filter=str(choice0.get("finish_reason") or "").strip().lower() == "content_filter",
+    )
+    result = assistant_turn.bridge_result
     if not result.tool_calls:
-        if not result.error and not result.warning and not result.content.strip():
+        if result.error and result.error.kind in {"upstream_empty_output", "content_filter"}:
+            msg["content"] = EMPTY_ASSISTANT_RESPONSE_TEXT
+            result = BridgeResult(
+                content=EMPTY_ASSISTANT_RESPONSE_TEXT,
+                tool_calls=[],
+                error=result.error,
+                warning=result.warning,
+                raw_content=result.raw_content,
+                phases=result.phases,
+            )
+        elif not result.error and not result.warning and not result.content.strip():
             msg["content"] = EMPTY_ASSISTANT_RESPONSE_TEXT
             result = BridgeResult(content=EMPTY_ASSISTANT_RESPONSE_TEXT, tool_calls=[], raw_content=result.raw_content)
         elif not result.error and result.content:
@@ -644,7 +654,11 @@ def parse_chat_response(
                     raw_content=result.raw_content,
                     phases=result.phases,
                 )
-        if result.error and (not result.error.repairable or _looks_like_raw_tool_json(result.raw_content)):
+        if (
+            result.error
+            and result.error.kind not in {"upstream_empty_output", "content_filter"}
+            and (not result.error.repairable or _looks_like_raw_tool_json(result.raw_content))
+        ):
             rejected_text = tool_bridge_rejected_response_text(result, allowed_tools)
             msg["content"] = rejected_text
             result = BridgeResult(
@@ -669,7 +683,7 @@ def parse_chat_response(
         "choices": [
             {
                 "index": int(choice0.get("index") or 0),
-                "finish_reason": "tool_calls",
+                "finish_reason": assistant_turn.finish_reason,
                 "message": {
                     "role": "assistant",
                     "content": result.content,
@@ -981,6 +995,24 @@ def _assistant_tool_detection_source(message: dict[str, Any], visible_text: str)
         if hidden.strip():
             return hidden, True
     return visible_text, False
+
+
+def _assistant_message_detection_thinking(message: dict[str, Any]) -> str:
+    for key in ("detection_thinking", "reasoning_content", "reasoning", "exposed_thinking"):
+        hidden = _as_text(message.get(key))
+        if hidden.strip():
+            return hidden
+    return ""
+
+
+def _assistant_message_thinking(message: dict[str, Any]) -> str:
+    return _as_text(message.get("thinking"))
+
+
+def _bridge_context_requires_tool(context: ToolBridgeContext) -> bool:
+    policy = getattr(context, "tool_choice_policy", None)
+    is_required = getattr(policy, "is_required", None)
+    return bool(is_required()) if callable(is_required) else False
 
 
 def _as_text(value: Any) -> str:
