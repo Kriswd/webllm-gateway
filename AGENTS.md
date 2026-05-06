@@ -6,6 +6,10 @@ WebAI Gateway 是一个独立的网页登录模型 API 网关。它位于 KrisAI
 
 本项目的核心目标是：把“不稳定的网页模型文本交互”包装成“稳定的 OpenAI / Anthropic 兼容 API”，让下游客户端像使用原生模型 API 一样使用网页登录模型。
 
+当前适配层的核心原则是尽可能 100% 复刻 `ds2api` 的协议行为、错误形态、模型目录、请求历史、工具调用往返和网页登录体验；任何偏差都必须抽象为通用 provider/model capability 或 Gateway 配置，并用 parity/oracle 测试证明。
+
+当前核心产品价值是让网页大模型能够在 Claude Code 中承担编程模型角色，也能够被小龙虾、Hermes 等 OpenAI / Anthropic 兼容客户端直接使用，并实现稳定、可验证、标准化的工具调用。
+
 ## 最高优先级边界
 
 - 不为任何单一下游客户端写定制逻辑。不要出现 “KrisAI 专用”、“OpenClaw 专用”、“Hermes 专用”、“Claude Code 专用” 的业务分支；如确实需要兼容差异，必须抽象成标准协议能力、模型能力或可配置的 Gateway 通用策略。
@@ -13,6 +17,7 @@ WebAI Gateway 是一个独立的网页登录模型 API 网关。它位于 KrisAI
 - Gateway 永远不执行本地工具。不得在 Gateway 中执行文件读写、终端命令、浏览器自动化、MCP、插件、技能、代码解释器或任何本地副作用操作。
 - Gateway 不接管下游权限系统。文件系统访问、终端权限、MCP 权限、用户确认、审计日志都应留在下游客户端。
 - Gateway 不保存或输出敏感凭证。日志、测试输出、错误信息、前端提示都不得暴露 cookie、bearer、session token、API key 或加密后的密钥正文。
+- 所有项目用户数据、登录态、凭证目录、浏览器 profile、WebAI2API / ds2api runtime 数据、`data/`、`credentials/`、`.webai-gateway/` 等默认不读取、不修改、不移动、不清空、不删除；健康检查所需的非敏感 metadata 除外。任何清理、重置、迁移或覆盖用户数据的操作都必须先逐项说明风险并获得用户明确确认。
 - 每次兼容、加速或降级方案都必须符合产品边界和通用性：优先抽象为标准协议行为、provider/model capability 或可配置 Gateway 策略，禁止为单一模型、单一下游客户端或一次性任务写特判。
 
 ## 架构原则
@@ -130,6 +135,7 @@ pnpm build
 ## 开发流程约束
 
 - 这个目录目前可能不是独立 git 仓库；改动前先检查 `git status`，不要假设可以提交。
+- 所有代码开发任务完成并通过端到端验证后，必须在确认不会覆盖用户改动的前提下更新本地 `main` 和远程 `origin/main`，然后启动本机最新 Gateway 代码供用户验收；如果仓库没有远程、推送失败或存在无法安全合并的用户改动，必须明确报告阻塞原因和当前分支状态。
 - 优先改 Gateway 自己的模块和测试，不要跨目录修改 KrisAI、OpenClaw、Hermes 或 Claude Code。
 - 如果必须改下游示例或文档，只能作为接入说明，不得改变下游运行时代码。
 - 修改文本文件使用 `apply_patch`，避免脚本化批量重写造成编码和无关 diff。

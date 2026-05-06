@@ -18,6 +18,7 @@ webui/node_modules/
 
 # Local runtime state and credentials
 config.json
+data/
 credentials/
 .webai-gateway/
 

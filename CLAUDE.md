@@ -6,6 +6,10 @@ WebAI Gateway 是一个独立的网页登录模型 API 网关，位于 Claude Co
 
 核心目标是把不稳定的网页登录模型文本交互包装成稳定的 OpenAI / Anthropic 兼容 API，并通过严格工具桥把网页模型输出转换为标准 `tool_calls` / `tool_use`。
 
+适配层核心原则是尽可能 100% 复刻 `ds2api` 的协议行为、错误形态、模型目录、请求历史、工具调用往返和网页登录体验；任何偏差都必须抽象为通用 provider/model capability 或 Gateway 配置，并用 parity/oracle 测试证明。
+
+核心产品价值是让网页大模型能够在 Claude Code 中承担编程模型角色，也能够被小龙虾、Hermes 等 OpenAI / Anthropic 兼容客户端直接使用，并实现稳定、可验证、标准化的工具调用。
+
 ## 架构边界
 
 - Gateway 只做协议适配、工具调用格式修复、网页登录模型交互和错误降级。
@@ -13,6 +17,7 @@ WebAI Gateway 是一个独立的网页登录模型 API 网关，位于 Claude Co
 - 下游客户端负责 agent loop、工具注册、MCP、Skill、文件系统、终端权限和用户确认。
 - 不为单一下游客户端写业务分支；兼容差异应抽象为标准协议能力、provider capability、model capability 或通用配置。
 - 不保存、不输出 cookie、bearer、session token、API key 或其他敏感凭证。
+- 所有项目用户数据、登录态、凭证目录、浏览器 profile、WebAI2API / ds2api runtime 数据、`data/`、`credentials/`、`.webai-gateway/` 等默认不读取、不修改、不移动、不清空、不删除；健康检查所需的非敏感 metadata 除外。任何清理、重置、迁移或覆盖用户数据的操作都必须先逐项说明风险并获得用户明确确认。
 
 ## 关键模块
 
@@ -86,6 +91,7 @@ http://127.0.0.1:8610/v1
 ## 开发约束
 
 - 新增或修改用户可见界面默认使用简体中文。
+- 所有代码开发任务完成并通过端到端验证后，必须在确认不会覆盖用户改动的前提下更新本地 `main` 和远程 `origin/main`，然后启动本机最新 Gateway 代码供用户验收；如果仓库没有远程、推送失败或存在无法安全合并的用户改动，必须明确报告阻塞原因和当前分支状态。
 - 修改协议、工具桥、provider、授权或前端关键流程时必须补充测试。
 - 优先做小而可验证的改动，不做无关重构。
 - 文档、测试 fixture、日志和错误信息不得包含真实 token、cookie、bearer 或 session。
