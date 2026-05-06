@@ -3338,8 +3338,22 @@ def _parse_bridge_chat_data(
                         stage="tool_refusal_recovery",
                         bridge_context=bridge_context,
                     )
+        elif _should_retry_controller_final_repair(bridge_result):
+            parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
+                parsed,
+                bridge_result,
+                retry_state,
+                app=app,
+                payload=payload,
+                bridge=bridge,
+                allowed_tools=allowed_tools,
+                bridge_context=bridge_context,
+                model=model,
+                retry_chat=retry_chat,
+                stage="post_repair_controller_final_repair",
+            )
         elif _should_retry_malformed_tool_format_repair(bridge_result):
-            parsed, bridge_result, retry_state = _retry_repairable_tool_format_error(
+            parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
                 parsed,
                 bridge_result,
                 retry_state,
@@ -3532,8 +3546,22 @@ def _parse_bridge_chat_data(
                                 stage="incomplete_missing_required_tool_input_recovery",
                                 bridge_context=bridge_context,
                             )
+                elif _should_retry_controller_final_repair(bridge_result):
+                    parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
+                        parsed,
+                        bridge_result,
+                        retry_state,
+                        app=app,
+                        payload=payload,
+                        bridge=bridge,
+                        allowed_tools=allowed_tools,
+                        bridge_context=bridge_context,
+                        model=model,
+                        retry_chat=retry_chat,
+                        stage="incomplete_post_repair_controller_final_repair",
+                    )
                 elif _should_retry_malformed_tool_format_repair(bridge_result):
-                    parsed, bridge_result, retry_state = _retry_repairable_tool_format_error(
+                    parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
                         parsed,
                         bridge_result,
                         retry_state,
@@ -3598,7 +3626,7 @@ def _parse_bridge_chat_data(
     return parsed, bridge_result
 
 
-def _retry_repairable_tool_format_error(
+def _retry_repairable_bridge_error(
     parsed: dict[str, Any],
     bridge_result: Any,
     retry_state: RetryState,
@@ -3842,6 +3870,23 @@ def _should_retry_malformed_tool_format_repair(bridge_result: Any) -> bool:
         and getattr(error, "repairable", False)
         and getattr(error, "kind", "")
         in {"malformed_json", "empty_tool_call", "invalid_tool_call", "invalid_input"}
+    )
+
+
+def _should_retry_controller_final_repair(bridge_result: Any) -> bool:
+    error = getattr(bridge_result, "error", None)
+    return bool(
+        error
+        and getattr(error, "repairable", False)
+        and getattr(error, "kind", "")
+        in {
+            "insufficient_final_evidence",
+            "status_only_final_without_task_answer",
+            "history_summary_final_without_task_answer",
+            "unknown_project_structure_final_without_task_answer",
+            "review_next_step_menu_final_without_task_answer",
+            "off_task_environment_configuration_final",
+        }
     )
 
 

@@ -265,7 +265,8 @@ def classify_bridge_result(
         return ControllerDecision("FINAL", bridge_result=result, retry_state=state)
 
     if _requires_final_evidence(context, result.content) and not _has_required_final_evidence(context, result.content):
-        if state.repair_attempts >= max_repair_attempts:
+        repair_limit = _final_evidence_repair_limit(context, max_repair_attempts)
+        if state.repair_attempts >= repair_limit:
             return ControllerDecision("FINAL", reason="retry_budget_exhausted", bridge_result=result, retry_state=state)
         return ControllerDecision(
             "RETRY",
@@ -279,6 +280,15 @@ def classify_bridge_result(
             ),
         )
     return ControllerDecision("FINAL", bridge_result=result, retry_state=state)
+
+
+def _final_evidence_repair_limit(context: ToolBridgeContext, default_limit: int) -> int:
+    if not context.allowed_names:
+        return default_limit
+    task = context.task_text or ""
+    if _MUTATION_TASK_RE.search(task) and not context.has_tool_loop:
+        return max(default_limit, 2)
+    return default_limit
 
 
 def _allows_ds2api_style_controller_passthrough(context: ToolBridgeContext) -> bool:
