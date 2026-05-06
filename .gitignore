@@ -8,6 +8,8 @@ __pycache__/
 venv/
 node_modules/
 webui/node_modules/
+webui/.pnpm-store/
+webui/node_modules.broken_acl_*/
 
 # Logs and temp files
 *.log

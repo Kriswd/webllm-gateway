@@ -6,6 +6,7 @@ import inspect
 import json
 import re
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -686,6 +687,141 @@ def create_app(
         app.state.account_registry.update_metadata(account_id, body)
         return admin_accounts(request, providerId=parsed.provider_id)
 
+    @app.post("/api/admin/webai2api/login/start")
+    async def admin_webai2api_login_start(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider_id = str(body.get("providerId") or body.get("provider_id") or "").strip()
+        provider = get_provider(provider_id)
+        if provider.route == "direct":
+            raise HTTPException(status_code=400, detail="该 Provider 使用 Gateway 直连授权，不需要 WebAI2API 登录模式")
+        cfg = current_config()
+        instances = _load_webai2api_instances(client, cfg)
+        if not instances:
+            raise HTTPException(status_code=502, detail="WebAI2API 工作池为空或不可读取，无法启动登录模式")
+        requested_worker = str(body.get("workerName") or body.get("worker_name") or "").strip()
+        create_account = bool(body.get("newAccount", body.get("new_account", not requested_worker)))
+        if create_account:
+            instances, instance_name, worker_name = _webai2api_instances_with_new_login_account(provider, instances)
+            response = client.post(
+                f"{_sidecar_root_from_base_url(cfg.upstream.base_url)}/admin/config/instances",
+                json=instances,
+                headers=upstream_headers(cfg),
+            )
+            if response.status_code >= 400:
+                raise HTTPException(status_code=502, detail=_upstream_http_error_message(response))
+            account_id = webai2api_account_id(provider.id, instance_name, worker_name)
+            app.state.account_registry.update_metadata(
+                account_id,
+                {
+                    "providerId": provider.id,
+                    "displayName": f"{provider.name} 新账号",
+                    "planType": "unknown",
+                },
+            )
+        else:
+            worker_name = requested_worker or _first_webai2api_worker_for_provider(provider, instances)
+            if not worker_name:
+                raise HTTPException(status_code=400, detail="未找到可用于该 Provider 的 WebAI2API Worker")
+            instance_name = _instance_name_for_worker(instances, worker_name)
+            account_id = webai2api_account_id(provider.id, instance_name, worker_name) if instance_name else ""
+
+        restart_response = client.post(
+            f"{_sidecar_root_from_base_url(cfg.upstream.base_url)}/admin/restart",
+            json={"loginMode": True, "workerName": worker_name},
+            headers=upstream_headers(cfg),
+        )
+        if restart_response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=_upstream_http_error_message(restart_response))
+        app.state.webai2api_login_mode_started_at = time.time()
+        return {
+            "success": True,
+            "providerId": provider.id,
+            "instanceName": instance_name,
+            "workerName": worker_name,
+            "accountId": account_id,
+            "newAccount": create_account,
+            "message": (
+                f"已为 {provider.name} 创建独立浏览器 Profile 并进入登录模式"
+                if create_account
+                else f"已进入 {worker_name} 的登录模式"
+            ),
+        }
+
+    @app.post("/api/admin/webai2api/login/finish")
+    async def admin_webai2api_login_finish(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        cfg = current_config()
+        restarted = _restart_webai2api_api_mode(client, cfg)
+        if not restarted:
+            raise HTTPException(status_code=502, detail="WebAI2API 未能恢复普通 API 模式，请在缓存与重启页面手动重启")
+        app.state.webai2api_login_mode_started_at = None
+        return {"success": True, "message": "WebAI2API 已恢复普通 API 模式，可以继续调用模型"}
+
+    def _webai2api_instances_with_new_login_account(
+        provider: Any,
+        instances: list[Any],
+    ) -> tuple[list[Any], str, str]:
+        adapters = [str(adapter) for adapter in getattr(provider, "adapters", ()) if str(adapter).strip()]
+        if not adapters:
+            raise HTTPException(status_code=400, detail="Provider 没有可用于 WebAI2API 的 adapter")
+        existing_instance_names = {str(item.get("name") or "") for item in instances if isinstance(item, dict)}
+        existing_worker_names = {
+            str(worker.get("name") or "")
+            for item in instances
+            if isinstance(item, dict)
+            for worker in (item.get("workers") if isinstance(item.get("workers"), list) else [])
+            if isinstance(worker, dict)
+        }
+        provider_slug = _safe_webai2api_name_part(provider.id)
+        for _ in range(20):
+            suffix = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(3)}"
+            instance_name = f"gateway_{provider_slug}_{suffix}"
+            worker_name = f"gateway_{provider_slug}_{suffix}"
+            user_data_mark = f"gateway_{provider_slug}_{suffix}"
+            if instance_name not in existing_instance_names and worker_name not in existing_worker_names:
+                break
+        else:
+            raise HTTPException(status_code=500, detail="无法生成唯一的 WebAI2API 账号名称")
+        if len(adapters) == 1:
+            worker = {"name": worker_name, "type": adapters[0]}
+        else:
+            worker = {
+                "name": worker_name,
+                "type": "merge",
+                "mergeTypes": adapters,
+                "mergeMonitor": adapters[0],
+            }
+        new_instance = {
+            "name": instance_name,
+            "userDataMark": user_data_mark,
+            "workers": [worker],
+        }
+        return [*instances, new_instance], instance_name, worker_name
+
+    def _first_webai2api_worker_for_provider(provider: Any, instances: list[Any]) -> str:
+        provider_dict = {"adapters": list(getattr(provider, "adapters", ()))}
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            for worker in workers:
+                if isinstance(worker, dict) and _worker_supports_provider(worker, provider_dict):
+                    worker_name = str(worker.get("name") or "")
+                    if worker_name:
+                        return worker_name
+        return ""
+
+    def _instance_name_for_worker(instances: list[Any], worker_name: str) -> str:
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            for worker in workers:
+                if isinstance(worker, dict) and str(worker.get("name") or "") == worker_name:
+                    return str(instance.get("name") or "")
+        return ""
+
     def _sync_webai2api_selected_account(provider: Any, parsed_account: Any) -> None:
         if not parsed_account.instance_name or not parsed_account.worker_name:
             raise HTTPException(status_code=400, detail="WebAI2API 账号缺少 instance/worker")
@@ -991,7 +1127,13 @@ def create_app(
             bridge=bridge,
             bridge_context=bridge_context,
         )
-        response = await run_in_threadpool(post_upstream, client, cfg, payload)
+        response = await run_in_threadpool(
+            _post_upstream_with_login_mode_recovery,
+            client,
+            cfg,
+            payload,
+            _webai2api_login_mode_recovery_allowed(app),
+        )
         if response.status_code >= 400:
             return _openai_upstream_http_error_response(
                 app,
@@ -1010,7 +1152,12 @@ def create_app(
                 stream_data = _openai_response_from_stream_buffer(content, finish_reason=_finish_reason, model=model)
 
                 def retry_upstream_stream(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
-                    retry_response = post_upstream(client, cfg, retry_payload)
+                    retry_response = _post_upstream_with_login_mode_recovery(
+                        client,
+                        cfg,
+                        retry_payload,
+                        _webai2api_login_mode_recovery_allowed(app),
+                    )
                     if retry_response.status_code >= 400:
                         message = _upstream_http_error_message(retry_response)
                         _record_completion_error_diagnostic(
@@ -1097,7 +1244,12 @@ def create_app(
         if not isinstance(data, dict):
             raise HTTPException(status_code=502, detail="Upstream response must be a JSON object")
         def retry_upstream(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
-            retry_response = post_upstream(client, cfg, retry_payload)
+            retry_response = _post_upstream_with_login_mode_recovery(
+                client,
+                cfg,
+                retry_payload,
+                _webai2api_login_mode_recovery_allowed(app),
+            )
             if retry_response.status_code >= 400:
                 message = _upstream_http_error_message(retry_response)
                 _record_completion_error_diagnostic(
@@ -1207,7 +1359,13 @@ def create_app(
                 _record_tool_bridge_event(app, "local_repo_preflight", model=model, **_tool_call_event_fields(preflight_data))
                 parsed = preflight_data
             else:
-                response = await run_in_threadpool(post_upstream, client, cfg, payload)
+                response = await run_in_threadpool(
+                    _post_upstream_with_login_mode_recovery,
+                    client,
+                    cfg,
+                    payload,
+                    _webai2api_login_mode_recovery_allowed(app),
+                )
                 if response.status_code >= 400:
                     message = _upstream_http_error_message(response)
                     _record_completion_error_diagnostic(
@@ -1232,7 +1390,12 @@ def create_app(
                     raise HTTPException(status_code=502, detail="Upstream response must be a JSON object")
 
                 def retry_upstream(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
-                    retry_response = post_upstream(client, cfg, retry_payload)
+                    retry_response = _post_upstream_with_login_mode_recovery(
+                        client,
+                        cfg,
+                        retry_payload,
+                        _webai2api_login_mode_recovery_allowed(app),
+                    )
                     if retry_response.status_code >= 400:
                         message = _upstream_http_error_message(retry_response)
                         _record_completion_error_diagnostic(
@@ -1489,7 +1652,12 @@ def _webai2api_upstream_chat_payload(
     preflight = _local_preflight_response(app, body, model, bridge_context)
     if preflight is not None:
         return json_loads_response_from_any(preflight)
-    response = post_upstream(client, config, payload)
+    response = _post_upstream_with_login_mode_recovery(
+        client,
+        config,
+        payload,
+        _webai2api_login_mode_recovery_allowed(app),
+    )
     if response.status_code >= 400:
         raise RuntimeError(_upstream_http_error_message(response))
     data = response.json()
@@ -1497,7 +1665,12 @@ def _webai2api_upstream_chat_payload(
         raise RuntimeError("WebAI2API upstream response must be a JSON object")
 
     def retry_chat(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
-        retry_response = post_upstream(client, config, retry_payload)
+        retry_response = _post_upstream_with_login_mode_recovery(
+            client,
+            config,
+            retry_payload,
+            _webai2api_login_mode_recovery_allowed(app),
+        )
         if retry_response.status_code >= 400:
             raise RuntimeError(_upstream_http_error_message(retry_response))
         retry_data = retry_response.json()
@@ -1834,6 +2007,63 @@ def _sidecar_root_from_base_url(base_url: str) -> str:
         path = path[:-3]
     root = urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
     return root.rstrip("/")
+
+
+def _safe_webai2api_name_part(value: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", (value or "").strip()).strip("_-")
+    return (safe or "account")[:40]
+
+
+def _restart_webai2api_api_mode(client: httpx.Client, cfg: GatewayConfig) -> bool:
+    root = _sidecar_root_from_base_url(cfg.upstream.base_url)
+    try:
+        response = client.post(f"{root}/admin/restart", json={"loginMode": False}, headers=upstream_headers(cfg))
+    except httpx.HTTPError:
+        return False
+    if response.status_code >= 400:
+        return False
+    return _wait_for_webai2api_api_mode(client, cfg)
+
+
+def _post_upstream_with_login_mode_recovery(
+    client: httpx.Client,
+    cfg: GatewayConfig,
+    payload: dict[str, Any],
+    allow_recovery: bool = True,
+) -> httpx.Response:
+    response = post_upstream(client, cfg, payload)
+    if allow_recovery and _is_webai2api_login_mode_response(response) and _restart_webai2api_api_mode(client, cfg):
+        return post_upstream(client, cfg, payload)
+    return response
+
+
+def _webai2api_login_mode_recovery_allowed(app: FastAPI) -> bool:
+    started_at = getattr(app.state, "webai2api_login_mode_started_at", None)
+    if not isinstance(started_at, (int, float)):
+        return True
+    return time.time() - started_at > 30 * 60
+
+
+def _wait_for_webai2api_api_mode(client: httpx.Client, cfg: GatewayConfig) -> bool:
+    models_url = f"{cfg.upstream.base_url.rstrip('/')}/models"
+    for _ in range(24):
+        try:
+            response = client.get(models_url, headers=upstream_headers(cfg))
+            if response.status_code == 200:
+                return True
+            if response.status_code != 503 or not _is_webai2api_login_mode_response(response):
+                return True
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _is_webai2api_login_mode_response(response: httpx.Response) -> bool:
+    if response.status_code != 503:
+        return False
+    preview = _extract_upstream_error_preview(response)
+    return "登录模式" in preview and "OpenAI API" in preview and "不可用" in preview
 
 
 async def _proxy_to_sidecar(

@@ -12,6 +12,7 @@ import {
   ExperimentOutlined,
   LinkOutlined,
   LoginOutlined,
+  PlusOutlined,
   ReloadOutlined,
   RocketOutlined,
   SettingOutlined,
@@ -347,20 +348,23 @@ function resetActionState(kind) {
   progressVisible.value = true;
 }
 
-async function handleStartLogin() {
+async function handleStartLogin(options = {}) {
   const provider = selectedProvider.value;
   if (!provider) return;
   if (provider.loginKind === 'direct') {
     await startDirectAuth(provider);
     return;
   }
+  const newAccount = Boolean(options.newAccount);
   Modal.confirm({
-    title: '进入 WebAI2API 登录模式？',
-    content: '这会让 WebAI2API 以网页登录模式重启。重启后请在打开的浏览器或虚拟显示器里完成登录，再回到这里刷新模型。',
+    title: newAccount ? '新增 WebAI2API 授权账号？' : '进入 WebAI2API 登录模式？',
+    content: newAccount
+      ? '这会为新账号创建独立浏览器 Profile，并让 WebAI2API 以网页登录模式重启。完成登录后请回到这里恢复 API 并刷新模型。'
+      : '这会让当前 Worker 以网页登录模式重启，用于修复或更新该账号登录态。完成后请回到这里恢复 API 并刷新模型。',
     okText: '进入登录模式',
     cancelText: '取消',
     async onOk() {
-      await startWebAI2APILogin(provider);
+      await startWebAI2APILogin(provider, { newAccount });
     },
   });
 }
@@ -415,31 +419,68 @@ async function pollAuthJob(jobId) {
   throw new Error('等待网页登录超时，请确认登录完成后重试');
 }
 
-async function startWebAI2APILogin(provider) {
+async function startWebAI2APILogin(provider, options = {}) {
   resetActionState('webai2api');
   actionLoading.value = true;
   try {
-    const workerName = selectedWorkerName.value || undefined;
-    appendLog(workerName ? `正在以登录模式重启 Worker：${workerName}` : '正在以登录模式重启 WebAI2API');
-    const res = await fetch('/admin/restart', {
+    const workerName = options.newAccount ? undefined : (selectedWorkerName.value || undefined);
+    const newAccount = Boolean(options.newAccount || !workerName);
+    appendLog(
+      workerName
+        ? `正在以登录模式重启 Worker：${workerName}`
+        : '正在创建独立浏览器 Profile 并进入 WebAI2API 登录模式',
+    );
+    const res = await fetch('/api/admin/webai2api/login/start', {
       method: 'POST',
       headers: {
         ...settingsStore.getHeaders(),
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ loginMode: true, workerName }),
+      body: JSON.stringify({ providerId: provider.id, workerName, newAccount }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.success === false) {
       throw new Error(data.message || data.error?.message || `HTTP ${res.status}`);
     }
     appendLog(data.message || 'WebAI2API 已进入登录模式');
-    appendLog(`请完成 ${provider.name} 网页登录，然后点击“刷新模型”确认可用模型`);
+    if (data.instanceName || data.workerName) {
+      appendLog(`登录目标：${data.instanceName || '-'} / ${data.workerName || '-'}`);
+    }
+    appendLog(`请完成 ${provider.name} 网页登录，然后点击“恢复 API 并刷新”确认可用模型`);
     message.success('已进入网页登录模式');
     window.open('/tools/display', '_blank', 'noopener,noreferrer');
   } catch (error) {
     actionError.value = error.message || String(error);
     appendLog(`登录模式启动失败：${actionError.value}`);
+    message.error(actionError.value);
+  } finally {
+    actionLoading.value = false;
+  }
+}
+
+async function finishWebAI2APILogin({ close = false } = {}) {
+  actionLoading.value = true;
+  try {
+    appendLog('正在恢复 WebAI2API 普通 API 模式');
+    const res = await fetch('/api/admin/webai2api/login/finish', {
+      method: 'POST',
+      headers: {
+        ...settingsStore.getHeaders(),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) {
+      throw new Error(data.message || data.detail || data.error?.message || `HTTP ${res.status}`);
+    }
+    appendLog(data.message || 'WebAI2API 已恢复普通 API 模式');
+    await loadOnboarding();
+    message.success('已恢复 API 并刷新模型');
+    if (close) progressVisible.value = false;
+  } catch (error) {
+    actionError.value = error.message || String(error);
+    appendLog(`恢复 API 模式失败：${actionError.value}`);
     message.error(actionError.value);
   } finally {
     actionLoading.value = false;
@@ -851,7 +892,16 @@ onMounted(loadOnboarding);
             <div class="action-row">
               <a-button type="primary" size="large" :loading="actionLoading" @click="handleStartLogin">
                 <template #icon><LoginOutlined /></template>
-                {{ selectedProvider.loginKind === 'direct' ? '打开授权浏览器' : '进入登录模式' }}
+                {{ selectedProvider.loginKind === 'direct' ? '打开授权浏览器' : '修复当前登录' }}
+              </a-button>
+              <a-button
+                v-if="selectedProvider.loginKind !== 'direct'"
+                size="large"
+                :loading="actionLoading"
+                @click="handleStartLogin({ newAccount: true })"
+              >
+                <template #icon><PlusOutlined /></template>
+                新增账号登录
               </a-button>
               <a-button size="large" :disabled="!selectedProviderDefaultModel" @click="copySelectedDefaultModel">
                 <template #icon><CopyOutlined /></template>
@@ -1046,11 +1096,20 @@ onMounted(loadOnboarding);
         <div v-if="!actionLogs.length">等待操作开始。</div>
       </div>
       <div class="modal-actions">
-        <a-button @click="loadOnboarding">
+        <a-button
+          :loading="actionLoading && actionKind === 'webai2api'"
+          @click="actionKind === 'webai2api' ? finishWebAI2APILogin() : loadOnboarding()"
+        >
           <template #icon><ReloadOutlined /></template>
-          刷新模型
+          {{ actionKind === 'webai2api' ? '恢复 API 并刷新' : '刷新模型' }}
         </a-button>
-        <a-button type="primary" @click="progressVisible = false">完成</a-button>
+        <a-button
+          type="primary"
+          :loading="actionLoading && actionKind === 'webai2api'"
+          @click="actionKind === 'webai2api' ? finishWebAI2APILogin({ close: true }) : (progressVisible = false)"
+        >
+          {{ actionKind === 'webai2api' ? '恢复并完成' : '完成' }}
+        </a-button>
       </div>
     </a-modal>
   </div>

@@ -10176,6 +10176,158 @@ def test_selecting_webai2api_account_refuses_to_overwrite_user_edited_worker_con
     assert len(posted_instances) == 1
 
 
+def test_webai2api_login_start_creates_isolated_profile_without_touching_existing_instances(tmp_path: Path) -> None:
+    posted_instances: list[Any] = []
+    restart_payloads: list[Any] = []
+    original_instances = [
+        {
+            "name": "browser_default",
+            "userDataMark": None,
+            "proxy": None,
+            "workers": [{"name": "default", "type": "chatgpt_text", "mergeTypes": []}],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            return httpx.Response(200, json=original_instances, request=request)
+        if request.url.path == "/admin/config/instances" and request.method == "POST":
+            posted_instances.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post("/api/admin/webai2api/login/start", json={"providerId": "chatgpt"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["newAccount"] is True
+    assert body["instanceName"].startswith("gateway_chatgpt_")
+    assert body["workerName"].startswith("gateway_chatgpt_")
+    assert posted_instances
+    saved_instances = posted_instances[-1]
+    assert saved_instances[0] == original_instances[0]
+    new_instance = saved_instances[-1]
+    assert new_instance["name"] == body["instanceName"]
+    assert new_instance["userDataMark"] == body["workerName"]
+    assert new_instance["userDataMark"] != "default"
+    worker = new_instance["workers"][0]
+    assert worker == {
+        "name": body["workerName"],
+        "type": "merge",
+        "mergeTypes": ["chatgpt_text", "chatgpt"],
+        "mergeMonitor": "chatgpt_text",
+    }
+    assert restart_payloads == [{"loginMode": True, "workerName": body["workerName"]}]
+    assert "session-token" not in response.text
+    assert "cookie" not in response.text.lower()
+
+
+def test_webai2api_login_finish_restores_api_mode(tmp_path: Path) -> None:
+    restart_payloads: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/v1/models" and request.method == "GET":
+            return httpx.Response(200, json={"object": "list", "data": []}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post("/api/admin/webai2api/login/finish")
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert restart_payloads == [{"loginMode": False}]
+
+
+def test_upstream_login_mode_503_restores_api_mode_and_retries_chat() -> None:
+    chat_calls = 0
+    restart_payloads: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chat_calls
+        if request.url.path == "/v1/chat/completions" and request.method == "POST":
+            chat_calls += 1
+            if chat_calls == 1:
+                return httpx.Response(
+                    503,
+                    json={"error": {"message": "服务运行在登录模式，OpenAI API 不可用"}},
+                    request=request,
+                )
+            return httpx.Response(200, json=_openai_response("ok after restart"), request=request)
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/v1/models" and request.method == "GET":
+            return httpx.Response(200, json={"object": "list", "data": []}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = _client(handler)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "web-model", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok after restart"
+    assert chat_calls == 2
+    assert restart_payloads == [{"loginMode": False}]
+
+
+def test_active_webai2api_login_session_does_not_auto_restore_api_mode() -> None:
+    restart_payloads: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions" and request.method == "POST":
+            return httpx.Response(
+                503,
+                json={"error": {"message": "服务运行在登录模式，OpenAI API 不可用"}},
+                request=request,
+            )
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    app = create_app(config=_config(), http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    app.state.webai2api_login_mode_started_at = 10**12
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "web-model", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 502
+    assert "登录模式" in response.text
+    assert restart_payloads == []
+
+
 def test_direct_provider_legacy_credential_is_exposed_as_default_account(tmp_path: Path) -> None:
     store = CredentialStore(tmp_path / "credentials")
     store.save(
@@ -10313,8 +10465,10 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "管理登录" in app_source
     assert "/api/admin/onboarding" in bridge_source
     assert "/api/admin/web-auth/browser/start" in bridge_source
-    assert "/admin/restart" in bridge_source
+    assert "/api/admin/webai2api/login/start" in bridge_source
+    assert "/api/admin/webai2api/login/finish" in bridge_source
     assert "打开授权浏览器" in bridge_source
+    assert "新增账号登录" in bridge_source
     assert "未授权" in bridge_source
     assert "可用模型" in bridge_source
     assert "http://127.0.0.1:8610/v1" in bridge_source
