@@ -163,7 +163,7 @@ def create_app(
     @app.get("/", include_in_schema=False)
     def admin_ui(request: Request) -> FileResponse:
         require_local_admin(request)
-        index_path = static_dir / "index.html"
+        index_path = _native_index_path(webai2api_ui_dir) or (static_dir / "index.html")
         if not index_path.exists():
             raise HTTPException(status_code=404, detail="Admin UI assets are missing")
         return _native_file_response(index_path)
@@ -256,6 +256,7 @@ def create_app(
                     "loginKind": "direct" if is_direct else "webai2api",
                 }
             )
+        connection_profiles = _onboarding_connection_profiles(providers, cfg)
         return {
             "gateway": {
                 "baseUrl": "/v1",
@@ -279,6 +280,8 @@ def create_app(
             },
             "providers": providers,
             "models": models,
+            "connectionProfiles": connection_profiles,
+            "recommendedConnectionProfile": _recommended_connection_profile(connection_profiles),
         }
 
 
@@ -1984,6 +1987,75 @@ def _latest_gateway_source_mtime() -> dict[str, Any]:
 def _native_index_path(native_ui_dir: Path) -> Path | None:
     index_path = native_ui_dir / "index.html"
     return index_path if index_path.exists() else None
+
+
+def _onboarding_connection_profiles(providers: list[dict[str, Any]], cfg: GatewayConfig) -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    for provider in providers:
+        provider_id = str(provider.get("id") or "")
+        provider_name = str(provider.get("name") or provider_id or "网页模型")
+        route = str(provider.get("route") or "")
+        credential = provider.get("credential") if isinstance(provider.get("credential"), dict) else {}
+        model_availability = provider.get("modelAvailability") if isinstance(provider.get("modelAvailability"), dict) else {}
+        authorized = bool(credential.get("authorized"))
+        backend_kind, backend_base_url = _onboarding_backend_metadata(provider, cfg)
+        available_models = provider.get("availableModels") if isinstance(provider.get("availableModels"), list) else []
+        profile_model_ids: list[str] = []
+        seen_model_ids: set[str] = set()
+        for candidate in [*available_models, *model_availability.keys()]:
+            if isinstance(candidate, str) and candidate.strip() and candidate not in seen_model_ids:
+                seen_model_ids.add(candidate)
+                profile_model_ids.append(candidate)
+
+        for model_id in profile_model_ids:
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            availability = model_availability.get(model_id) if isinstance(model_availability.get(model_id), dict) else {}
+            status = str(availability.get("status") or ("available" if authorized else "pending"))
+            message = str(availability.get("message") or provider.get("availabilityMessage") or "")
+            profiles.append(
+                {
+                    "id": f"{provider_id}:{model_id}",
+                    "providerId": provider_id,
+                    "providerName": provider_name,
+                    "displayName": f"{provider_name} / {model_id}",
+                    "modelId": model_id,
+                    "route": route,
+                    "loginKind": provider.get("loginKind") or ("direct" if route == "direct" else "webai2api"),
+                    "authorized": authorized,
+                    "available": status != "unavailable",
+                    "availabilityStatus": status,
+                    "availabilityMessage": message,
+                    "clientBaseUrl": "/v1",
+                    "openaiBaseUrl": "/v1",
+                    "anthropicBaseUrl": "/v1",
+                    "openaiEndpoint": "/v1/chat/completions",
+                    "anthropicEndpoint": "/v1/messages",
+                    "backendKind": backend_kind,
+                    "backendBaseUrl": backend_base_url,
+                }
+            )
+    return profiles
+
+
+def _onboarding_backend_metadata(provider: dict[str, Any], cfg: GatewayConfig) -> tuple[str, str]:
+    provider_id = str(provider.get("id") or "")
+    route = str(provider.get("route") or "")
+    if provider_id == "deepseek-web":
+        return "ds2api-sidecar", cfg.provider_runtime.deepseek_ds2api_base_url
+    if route == "webai2api":
+        return "webai2api-sidecar", cfg.upstream.base_url
+    return "direct-http", str(provider.get("loginUrl") or "").rstrip("/")
+
+
+def _recommended_connection_profile(profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for profile in profiles:
+        if profile.get("authorized") and profile.get("available"):
+            return profile
+    for profile in profiles:
+        if profile.get("available"):
+            return profile
+    return profiles[0] if profiles else None
 
 
 def _safe_native_file(base_dir: Path, relative_path: str) -> FileResponse:

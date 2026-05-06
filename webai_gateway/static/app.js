@@ -361,7 +361,7 @@ function renderSelectedAuthProvider() {
     $("authStatus").className = authorized && hasModels ? "is-ok" : "is-warning";
     $("authUpdatedAt").textContent = availabilityMessage || (credential.updatedAt ? `更新时间：${new Date(credential.updatedAt).toLocaleString()}` : "尚未授权");
     $("authBadge").textContent = authorized ? (hasModels ? "本地可用" : "等待适配") : "待登录";
-    $("startAuthButton").textContent = "一键启动 DeepSeek 授权浏览器";
+    $("startAuthButton").textContent = `一键启动 ${provider.name} 授权浏览器`;
     $("captureAuthButton").textContent = "重新捕获登录态";
     $("captureAuthButton").disabled = false;
     $("clearAuthButton").disabled = !authorized;
@@ -371,7 +371,7 @@ function renderSelectedAuthProvider() {
     $("authUpdatedAt").textContent = `${capabilityText || "网页模型"}，${adapterText || "适配器由 WebAI2API 管理"}`;
     $("authBadge").textContent = "复用 WebAI2API";
     $("startAuthButton").textContent = "打开 WebAI2API 登录管理";
-    $("captureAuthButton").textContent = "本地捕获仅支持 DeepSeek";
+    $("captureAuthButton").textContent = "本地捕获仅支持直连 Provider";
     $("captureAuthButton").disabled = true;
     $("clearAuthButton").disabled = true;
   }
@@ -411,7 +411,7 @@ async function startAuthFlow() {
     showToast(data.message || "需要手动启动浏览器");
     return;
   }
-  showToast("请在弹出的浏览器里完成 DeepSeek 登录");
+  showToast(`请在弹出的浏览器里完成 ${providerInfo?.name || provider} 登录`);
   await startAuthCapture();
 }
 

@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from webai_gateway.app import create_app
 from webai_gateway.anthropic_api import anthropic_body_to_openai
+from webai_gateway.accounts import AccountRegistry, webai2api_account_id
 from webai_gateway.config import (
     GatewayConfig,
     ObservationPolicyConfig,
@@ -9974,11 +9975,11 @@ def test_startup_bat_exists() -> None:
     assert (root / "start_webai_gateway.bat").exists()
 
 
-def test_root_serves_gateway_console_when_webai2api_native_spa_is_available(tmp_path: Path) -> None:
+def test_root_serves_fused_gateway_webui_when_available(tmp_path: Path) -> None:
     native_dist = tmp_path / "webui" / "dist"
     native_dist.mkdir(parents=True)
     (native_dist / "index.html").write_text(
-        '<!doctype html><html lang="zh-CN"><head><title>WebAI2API</title></head><body><div id="app"></div></body></html>',
+        '<!doctype html><html lang="zh-CN"><head><title>WebAI Gateway</title></head><body><div id="app">融合向导</div></body></html>',
         encoding="utf-8",
     )
     client = TestClient(create_app(config=_config(), native_ui_dir=native_dist, http_client=_not_found_client()))
@@ -9986,8 +9987,8 @@ def test_root_serves_gateway_console_when_webai2api_native_spa_is_available(tmp_
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "WebAI Gateway 控制台" in response.text
-    assert "<title>WebAI2API</title>" not in response.text
+    assert "<title>WebAI Gateway</title>" in response.text
+    assert "融合向导" in response.text
 
 
 def test_assets_serve_webai2api_native_files(tmp_path: Path) -> None:
@@ -10311,6 +10312,157 @@ def test_onboarding_marks_webai2api_chatgpt_authorized_from_worker_cookies(tmp_p
     assert response.json()["summary"]["authorizedProviders"] == 1
     assert "session-secret" not in response.text
     assert "visitor-cookie" not in response.text
+
+
+def test_onboarding_returns_claude_code_connection_profiles_for_web_providers(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "qwen",
+        {
+            "cookie": "qwen_session=session-secret",
+            "bearer": "qwen-bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=deepseek-session-secret",
+            "bearer": "deepseek-bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    config = replace(
+        _config(),
+        provider_runtime=ProviderRuntimeConfig(deepseek_ds2api_base_url="http://127.0.0.1:9331/v1"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"},
+                        {
+                            "id": "chatgpt_text/gpt-instant",
+                            "object": "model",
+                            "owned_by": "chatgpt_text",
+                            "type": "text",
+                        },
+                    ],
+                },
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "browser_default",
+                        "workers": [{"name": "default", "type": "chatgpt_text", "mergeTypes": []}],
+                    }
+                ],
+                request=request,
+            )
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(
+                200,
+                json={"cookies": [{"name": "__Secure-next-auth.session-token.0", "value": "chatgpt-session-secret"}]},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=config,
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/onboarding")
+
+    assert response.status_code == 200
+    body = response.json()
+    profiles = body["connectionProfiles"]
+    profiles_by_provider = {profile["providerId"]: profile for profile in profiles}
+
+    for provider_id in ("qwen", "deepseek-web", "chatgpt"):
+        profile = profiles_by_provider[provider_id]
+        assert profile["clientBaseUrl"] == "/v1"
+        assert profile["openaiEndpoint"] == "/v1/chat/completions"
+        assert profile["anthropicEndpoint"] == "/v1/messages"
+        assert profile["modelId"]
+
+    assert profiles_by_provider["qwen"]["backendKind"] == "direct-http"
+    assert profiles_by_provider["deepseek-web"]["backendKind"] == "ds2api-sidecar"
+    assert profiles_by_provider["deepseek-web"]["backendBaseUrl"] == "http://127.0.0.1:9331/v1"
+    assert profiles_by_provider["chatgpt"]["backendKind"] == "webai2api-sidecar"
+    assert profiles_by_provider["chatgpt"]["backendBaseUrl"] == "http://upstream.test/v1"
+    assert body["recommendedConnectionProfile"]["providerId"] in profiles_by_provider
+    assert "session-secret" not in response.text
+    assert "bearer-secret" not in response.text
+
+
+def test_onboarding_connection_profiles_keep_stale_unavailable_models_for_recheck(tmp_path: Path) -> None:
+    account_id = webai2api_account_id("chatgpt", "browser_default", "default")
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    registry.set_current("chatgpt", account_id)
+    registry.save_validation(account_id, "gpt-instant", {"status": "unavailable", "message": "stale captcha"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [{"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"}],
+                },
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "browser_default",
+                        "workers": [{"name": "default", "type": "chatgpt_text", "mergeTypes": []}],
+                    }
+                ],
+                request=request,
+            )
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(
+                200,
+                json={"cookies": [{"name": "__Secure-next-auth.session-token.0", "value": "chatgpt-session-secret"}]},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/onboarding")
+
+    assert response.status_code == 200
+    body = response.json()
+    chatgpt = next(item for item in body["providers"] if item["id"] == "chatgpt")
+    assert chatgpt["availableModels"] == []
+    profile = next(item for item in body["connectionProfiles"] if item["providerId"] == "chatgpt")
+    assert profile["modelId"] == "gpt-instant"
+    assert profile["available"] is False
+    assert profile["availabilityStatus"] == "unavailable"
+    assert profile["anthropicEndpoint"] == "/v1/messages"
+    assert "chatgpt-session-secret" not in response.text
 
 
 def test_onboarding_exposes_multiple_webai2api_accounts_without_cookie_values(tmp_path: Path) -> None:
@@ -10803,7 +10955,8 @@ def test_admin_root_serves_management_ui() -> None:
 
     assert response.status_code == 200
     assert 'lang="zh-CN"' in response.text
-    assert "WebAI Gateway 控制台" in response.text
+    assert "<title>WebAI Gateway</title>" in response.text
+    assert '<div id="app">' in response.text
     assert "<title>WebAI2API</title>" not in response.text
 
 
@@ -10815,7 +10968,8 @@ def test_admin_static_script_uses_chinese_ui_messages() -> None:
     assert response.status_code == 200
     assert "配置已保存并生效" in response.text
     assert "令牌已复制。" in response.text
-    assert "请在弹出的浏览器里完成 DeepSeek 登录" in response.text
+    assert "请在弹出的浏览器里完成 " in response.text
+    assert "本地捕获仅支持直连 Provider" in response.text
     assert "打开 WebAI2API 登录管理" in response.text
     assert "WebAI2API 原生界面管理" in response.text
 
@@ -13366,6 +13520,42 @@ def test_qwen_web_chat_uses_saved_credentials(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "来自 Qwen 网页模型"
+
+
+def test_anthropic_messages_routes_qwen_web_direct_provider(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "qwen",
+        {
+            "cookie": "qwen_session=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=store,
+            qwen_client_factory=_FakeQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["content"][0]["type"] == "text"
+    assert body["content"][0]["text"] == "来自 Qwen 网页模型"
 
 
 def test_anthropic_messages_routes_qwen_coder_direct_provider(tmp_path: Path) -> None:

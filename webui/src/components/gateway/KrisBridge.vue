@@ -65,6 +65,8 @@ const onboarding = ref({
   },
   providers: [],
   models: [],
+  connectionProfiles: [],
+  recommendedConnectionProfile: null,
 });
 
 const gatewayBaseUrl = computed(() => `${window.location.origin}${onboarding.value.gateway?.baseUrl || '/v1'}`);
@@ -114,7 +116,31 @@ const selectedProviderWorkers = computed(() => {
   return matched.length ? matched : workerOptions.value;
 });
 
-const selectedProviderDefaultModel = computed(() => providerAvailableModels(selectedProvider.value)[0] || '');
+const connectionProfiles = computed(() => (
+  Array.isArray(onboarding.value.connectionProfiles) ? onboarding.value.connectionProfiles : []
+));
+const recommendedConnectionProfile = computed(() => (
+  onboarding.value.recommendedConnectionProfile || connectionProfiles.value[0] || null
+));
+const selectedConnectionProfile = computed(() => {
+  const provider = selectedProvider.value;
+  if (!provider) return recommendedConnectionProfile.value;
+  const visibleModels = new Set(providerVisibleModelIds(provider));
+  return connectionProfiles.value.find((profile) => (
+    profile.providerId === provider.id && visibleModels.has(profile.modelId) && profile.available !== false
+  ))
+    || connectionProfiles.value.find((profile) => profile.providerId === provider.id && profile.available !== false)
+    || connectionProfiles.value.find((profile) => profile.providerId === provider.id)
+    || null;
+});
+const selectedProviderDefaultModel = computed(() => (
+  selectedConnectionProfile.value?.modelId || providerAvailableModels(selectedProvider.value)[0] || ''
+));
+const selectedClientModel = computed(() => (
+  selectedProvider.value
+    ? (selectedProviderDefaultModel.value || '<当前平台没有验证可用模型>')
+    : (recommendedConnectionProfile.value?.modelId || onboarding.value.gateway?.defaultModel || '<模型 ID>')
+));
 
 const filteredModels = computed(() => {
   const query = modelSearch.value.trim().toLowerCase();
@@ -131,11 +157,19 @@ const filteredModels = computed(() => {
 });
 
 const clientConfig = computed(() => [
+  '# OpenAI-compatible clients',
   `base_url = ${gatewayBaseUrl.value}`,
   `api_key = ${gatewayToken.value || '<网关令牌>'}`,
-  `model = ${selectedProvider.value ? (selectedProviderDefaultModel.value || '<当前平台没有验证可用模型>') : (onboarding.value.gateway?.defaultModel || '<模型 ID>')}`,
+  `model = ${selectedClientModel.value}`,
   '',
-  '# KrisAI / OpenClaw / Hermes / Claude Code 都可以使用这组 OpenAI 兼容配置',
+  '# Claude Code / Anthropic-compatible clients',
+  `ANTHROPIC_BASE_URL=${gatewayBaseUrl.value}`,
+  `ANTHROPIC_AUTH_TOKEN=${gatewayToken.value || '<网关令牌>'}`,
+  `ANTHROPIC_DEFAULT_SONNET_MODEL=${selectedClientModel.value}`,
+  `ANTHROPIC_DEFAULT_OPUS_MODEL=${selectedClientModel.value}`,
+  '',
+  `# 当前平台：${selectedConnectionProfile.value?.providerName || selectedProvider.value?.name || 'Gateway 默认上游'}`,
+  `# 实际通路：${selectedConnectionProfile.value?.backendKind || 'gateway'}`,
   '# 工具调用由 WebAI Gateway 转换为网页模型可理解的 prompt 协议',
 ].join('\n'));
 
@@ -680,7 +714,7 @@ onMounted(loadOnboarding);
       <div class="hero-copy">
         <a-tag color="blue">WebAI Gateway</a-tag>
         <h1>网页登录向导</h1>
-        <p>选择网页模型平台，按提示完成浏览器登录，然后直接复制模型 ID 给 KrisAI 使用。</p>
+        <p>选择网页模型平台，按提示完成浏览器登录，然后直接复制模型 ID 给 Claude Code / KrisAI 等客户端使用。</p>
         <div class="hero-actions">
           <a-button type="primary" size="large" :loading="actionLoading" @click="handleStartLogin">
             <template #icon><LoginOutlined /></template>
@@ -1004,15 +1038,15 @@ onMounted(loadOnboarding);
       <section class="panel config-panel">
         <div class="panel-heading compact">
           <div>
-            <h2>接入 KrisAI</h2>
-            <p>把下面三项填到 KrisAI、OpenClaw、Hermes 或 Claude Code 的 OpenAI 兼容配置里。</p>
+            <h2>接入客户端</h2>
+            <p>Claude Code 使用 Anthropic-compatible `/v1/messages`；KrisAI、OpenClaw、Hermes 使用 OpenAI-compatible `/v1/chat/completions`。</p>
           </div>
           <ApiOutlined />
         </div>
 
         <div class="config-grid">
           <div class="config-item">
-            <span>OpenAI 地址</span>
+            <span>Gateway 地址</span>
             <a-typography-text copyable>{{ gatewayBaseUrl }}</a-typography-text>
           </div>
           <div class="config-item">
