@@ -24,6 +24,24 @@ _CURRENT_USER_REQUEST_INSTRUCTION = (
     "do not continue unrelated earlier tasks unless this request explicitly asks to. "
     "Do not summarize DS2API_HISTORY.txt or the current state unless the latest user request asks for a status summary."
 )
+_ERROR_RECOVERY_CONTROL_MARKERS = (
+    "system-generated error correction",
+    "system generated error correction",
+    "previous answer went off task",
+    "went off task into agent",
+    "environment configuration advice",
+    "continue the original local-agent task",
+    "continue the original local agent task",
+    "original task is missing",
+    "valid dsml tool block",
+    "latest user request is a system",
+    "\u7cfb\u7edf\u751f\u6210\u7684\u9519\u8bef\u7ea0\u6b63",
+    "\u9519\u8bef\u5904\u7406\u6307\u4ee4",
+    "\u4e4b\u524d\u7684\u56de\u7b54\u504f\u79bb\u4e86\u4efb\u52a1",
+    "\u7ee7\u7eed\u539f\u59cb\u672c\u5730\u4ee3\u7406\u4efb\u52a1",
+    "\u539f\u59cb\u4efb\u52a1\u7f3a\u5931",
+    "\u6ca1\u6709\u539f\u59cb\u4efb\u52a1",
+)
 STATELESS_WEB_API_GUARD = (
     "You are serving a stateless WebAI Gateway API request. Ignore any previous website chat, "
     "account memory, profile memory, or project context that is not included in this request. "
@@ -120,7 +138,7 @@ def compact_role_messages_as_ds2api_history(
     latest_user = _normalized_current_user_override(current_user_override) or _latest_user_request(entry_list)
     snapshot = build_preserved_task_state_snapshot(
         entry_list,
-        max_chars=max(600, min(1800, live_limit // 3)),
+        max_chars=max(800, min(18000, int(live_limit * 0.45))),
     )
     transcript = (snapshot.rstrip() + "\n\n" + history_transcript) if snapshot else history_transcript
     continuation = _history_continuation_prompt(latest_user, max_user_chars=max(240, min(1800, live_limit // 5)))
@@ -580,7 +598,18 @@ def _looks_like_current_request_control_text(text: str) -> bool:
         "继续原始用户任务",
         "已加载技能",
     )
-    return any(marker in compact for marker in control_markers)
+    if any(marker in compact for marker in control_markers):
+        return True
+    return _looks_like_error_recovery_control_text(compact)
+
+
+def _looks_like_error_recovery_control_text(compact: str) -> bool:
+    if not compact:
+        return False
+    has_history_context = "ds2api_history" in compact or "latest user request" in compact
+    if not has_history_context:
+        return False
+    return any(marker in compact for marker in _ERROR_RECOVERY_CONTROL_MARKERS)
 
 
 def _history_continuation_prompt(latest_user: str, *, max_user_chars: int) -> str:
@@ -787,7 +816,8 @@ def message_entries_for_ds2api_prompt(message: dict[str, Any], content_text: str
         return entries
 
     if role == "tool":
-        return [("tool", text)] if text else []
+        rendered = _format_tool_result_for_ds2api_prompt(message, text)
+        return [("tool", rendered)] if rendered else []
     return [(role, text)] if text else []
 
 
@@ -904,8 +934,23 @@ def _prompt_visible_tool_results_from_content(content: Any) -> list[str]:
             continue
         text = _tool_result_content_to_text(block.get("content"))
         if text.strip():
-            results.append(text.strip())
+            results.append(_format_tool_result_for_ds2api_prompt(block, text))
     return results
+
+
+def _format_tool_result_for_ds2api_prompt(message: dict[str, Any], text: str) -> str:
+    content = str(text or "").strip()
+    parts: list[str] = []
+    name = str(message.get("name") or "").strip()
+    tool_call_id = str(message.get("tool_call_id") or message.get("tool_use_id") or "").strip()
+    if name:
+        parts.append(f"name={name}")
+    if tool_call_id:
+        parts.append(f"tool_call_id={tool_call_id}")
+    if not parts:
+        return content
+    header = "[" + " ".join(parts) + "]"
+    return f"{header}\n{content}" if content else header
 
 
 def _tool_result_content_to_text(value: Any) -> str:
@@ -942,18 +987,26 @@ def looks_like_gateway_tool_observation(text: str) -> bool:
 
 def build_preserved_task_state_snapshot(entries: Iterable[tuple[str, str]], *, max_chars: int = 1200) -> str:
     entry_list = [(role, text or "") for role, text in entries]
+    snapshot_limit = int(max_chars or 1200)
     tasks = _extract_task_updates(entry_list)
-    recent_calls = _latest_unique(_extract_recent_tool_call_summaries(entry_list), limit=10)
+    raw_recent_calls = _extract_recent_tool_call_summaries(entry_list)
+    recent_calls = _latest_unique(raw_recent_calls, limit=10)
+    no_progress_signals = _extract_no_progress_loop_signals(raw_recent_calls)
     result_signals = _latest_unique(_extract_tool_result_signals(entry_list), limit=6)
+    read_excerpts = _extract_recent_read_result_excerpts(
+        entry_list,
+        limit=8 if snapshot_limit >= 9000 else 5 if snapshot_limit >= 3000 else 3,
+        max_excerpt_chars=max(240, min(2600, snapshot_limit // 3)),
+    )
     user_candidates = _user_request_candidates(entry_list)
     local_project_context = _recent_local_project_context_lines(
         entry_list,
         user_candidates[0] if user_candidates else "",
         prior_task=user_candidates[1] if len(user_candidates) > 1 else "",
     )
-    if not tasks and not (recent_calls or result_signals or local_project_context):
+    if not tasks and not (recent_calls or no_progress_signals or result_signals or read_excerpts or local_project_context):
         return ""
-    if not tasks and not local_project_context and not _has_active_recent_tool_evidence(entry_list):
+    if not tasks and not local_project_context and not no_progress_signals and not _has_active_recent_tool_evidence(entry_list):
         return ""
 
     lines = [
@@ -981,6 +1034,20 @@ def build_preserved_task_state_snapshot(entries: Iterable[tuple[str, str]], *, m
     if result_signals and not tasks:
         lines.append("Tool result signals:")
         lines.extend(f"- {_one_line(signal, 220)}" for signal in result_signals)
+    if read_excerpts:
+        lines.append("Read result excerpts:")
+        lines.append(
+            "- Cache rule: if a later Read result says unchanged or already available in history, reuse these "
+            "cached excerpts as current file context. Do not Read/Glob the same path only to recover content."
+        )
+        for path, excerpt in read_excerpts:
+            alias_text = _read_path_alias_text(path)
+            suffix = f" ({alias_text})" if alias_text else ""
+            lines.append(f"- {_one_line(path, 180)}{suffix}:")
+            lines.extend(_indent_snapshot_block(excerpt))
+    if no_progress_signals:
+        lines.append("No-progress tool loop signals:")
+        lines.extend(f"- {signal}" for signal in no_progress_signals)
     if recent_calls:
         lines.append("Recent tool calls:")
         lines.extend(f"- {summary}" for summary in recent_calls)
@@ -1280,6 +1347,50 @@ def _extract_recent_tool_call_summaries(entries: list[tuple[str, str]]) -> list[
     return summaries
 
 
+def _extract_no_progress_loop_signals(call_summaries: list[str], *, limit: int = 4) -> list[str]:
+    window = [summary for summary in call_summaries[-32:] if summary]
+    if not window:
+        return []
+    if any(_is_mutation_tool_summary(summary) for summary in window[-12:]):
+        return []
+
+    records: dict[str, dict[str, int | str]] = {}
+    for index, summary in enumerate(window):
+        if not _is_no_progress_loop_tool_summary(summary):
+            continue
+        key = _recent_evidence_dedupe_key(summary)
+        record = records.setdefault(key, {"summary": summary, "count": 0, "last": 0})
+        record["count"] = int(record["count"]) + 1
+        record["last"] = index
+
+    repeated = [
+        record
+        for record in records.values()
+        if int(record["count"]) >= 3
+    ]
+    repeated.sort(key=lambda item: (-int(item["count"]), -int(item["last"])))
+    signals: list[str] = []
+    for record in repeated[: max(1, int(limit or 1))]:
+        summary = str(record["summary"])
+        count = int(record["count"])
+        signals.append(
+            f"{summary} repeated {count} times recently. Do not request the same input again; "
+            "treat the earlier DS2API_HISTORY/preserved result as current context, then use a materially "
+            "different input, Edit/Write when ready, or answer from available evidence."
+        )
+    return signals
+
+
+def _is_no_progress_loop_tool_summary(summary: str) -> bool:
+    name = _compact_name((summary or "").split("(", 1)[0])
+    return name in {"read", "readfile", "fileread", "glob", "grep", "ls", "lsp", "list", "listdir", "listdirectory"}
+
+
+def _is_mutation_tool_summary(summary: str) -> bool:
+    name = _compact_name((summary or "").split("(", 1)[0])
+    return name in {"edit", "editfile", "multiedit", "write", "writefile", "applypatch", "patch", "notebookedit"}
+
+
 def _tool_call_summary(name: str, params: dict[str, str]) -> str:
     pieces: list[str] = []
     for key in (
@@ -1351,9 +1462,142 @@ def _extract_tool_result_signals(entries: list[tuple[str, str]]) -> list[str]:
     return signals
 
 
+def _extract_recent_read_result_excerpts(
+    entries: list[tuple[str, str]],
+    *,
+    limit: int,
+    max_excerpt_chars: int,
+) -> list[tuple[str, str]]:
+    pending_read_paths: list[str] = []
+    captured: list[tuple[str, str]] = []
+
+    for role, text in entries:
+        content = (text or "").strip()
+        if not content:
+            continue
+        label = _history_role_label(role)
+        if label == "ASSISTANT":
+            pending_read_paths.extend(_read_like_tool_paths_from_assistant_text(content))
+            if len(pending_read_paths) > 16:
+                pending_read_paths = pending_read_paths[-16:]
+            continue
+        if label != "TOOL" or not pending_read_paths:
+            continue
+
+        path = pending_read_paths.pop(0)
+        reusable_content = _strip_tool_result_metadata_for_snapshot(content)
+        if not _is_reusable_read_result_content(reusable_content):
+            continue
+        captured.append((path, _compact_multiline_excerpt(reusable_content, max_chars=max_excerpt_chars)))
+
+    kept: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for path, excerpt in reversed(captured):
+        key = _recent_read_result_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.insert(0, (path, excerpt))
+        if len(kept) >= max(1, int(limit or 1)):
+            break
+    return kept
+
+
+def _read_like_tool_paths_from_assistant_text(text: str) -> list[str]:
+    paths: list[str] = []
+    for name, params in _iter_invocations(text):
+        if _is_read_like_tool_name(name):
+            paths.append(_read_path_from_tool_params(params))
+    if _PLAIN_TOOL_CALL_HEADER_RE.search(text or ""):
+        for line in (text or "").splitlines():
+            match = _PLAIN_TOOL_CALL_RE.match(line)
+            if not match:
+                continue
+            name = match.group("name").strip()
+            if _is_read_like_tool_name(name):
+                paths.append(_read_path_from_tool_params(_parse_plain_tool_call_args(match.group("args") or "")))
+    return paths
+
+
+def _read_path_from_tool_params(params: dict[str, str]) -> str:
+    for key in ("file_path", "path", "filename", "file", "target_file"):
+        value = params.get(key)
+        if value:
+            return _one_line(value, 180)
+    return "unknown read target"
+
+
+def _strip_tool_result_metadata_for_snapshot(content: str) -> str:
+    lines = (content or "").strip().splitlines()
+    while len(lines) >= 2:
+        first = lines[0].strip()
+        if not (_looks_like_non_error_tool_result_header(first) or _looks_like_ds2api_tool_result_header(first)):
+            break
+        lines = lines[1:]
+    stripped = "\n".join(lines).strip()
+    return stripped or (content or "").strip()
+
+
+def _is_reusable_read_result_content(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    head_lines = [line.strip() for line in text.splitlines() if line.strip()][:6]
+    first_line = head_lines[0] if head_lines else ""
+    if _looks_like_tool_result_error_header(first_line):
+        return False
+    for line in head_lines:
+        if len(line) <= 500 and _RESULT_SIGNAL_RE.search(line):
+            return False
+    lowered = "\n".join(head_lines).lower()
+    if "the tool call failed" in lowered[:300]:
+        return False
+    return True
+
+
+def _compact_multiline_excerpt(value: str, *, max_chars: int) -> str:
+    text = (value or "").strip()
+    limit = max(120, int(max_chars or 600))
+    if len(text) <= limit:
+        return text
+    omission = "\n...[read result excerpt truncated]...\n"
+    body_budget = max(80, limit - len(omission))
+    head_budget = max(60, int(body_budget * 0.65))
+    tail_budget = max(20, body_budget - head_budget)
+    return (text[:head_budget].rstrip() + omission + text[-tail_budget:].lstrip())[:limit]
+
+
+def _indent_snapshot_block(value: str) -> list[str]:
+    lines = (value or "").splitlines() or [""]
+    return [f"  {line}" if line else "  " for line in lines]
+
+
+def _recent_read_result_key(path: str) -> str:
+    return re.sub(r"[\\]+", "/", (path or "").strip().lower())
+
+
+def _read_path_alias_text(path: str) -> str:
+    normalized = _recent_read_result_key(path)
+    if not normalized or "/" not in normalized:
+        return ""
+    leaf = normalized.rsplit("/", 1)[-1]
+    if not leaf or leaf == normalized:
+        return ""
+    return f"also matches {leaf}"
+
+
 def _looks_like_tool_result_error_header(line: str) -> bool:
     lowered = (line or "").lower()
-    return "tool result for" in lowered and "is_error:" in lowered
+    return "tool result for" in lowered and re.search(r"\bis_error:\s*true\b", lowered) is not None
+
+
+def _looks_like_non_error_tool_result_header(line: str) -> bool:
+    lowered = (line or "").lower()
+    return "tool result for" in lowered and re.search(r"\bis_error:\s*false\b", lowered) is not None
+
+
+def _looks_like_ds2api_tool_result_header(line: str) -> bool:
+    return re.match(r"^\s*\[(?:name|tool_call_id)=[^\]]+\]\s*$", line or "", re.IGNORECASE) is not None
 
 
 def _first_tool_result_detail_after(lines: list[str], index: int) -> str:

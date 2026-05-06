@@ -23,7 +23,11 @@ echo.
 
 set "WEBAI2API_DIR=%WEBAI2API_SIDECAR_DIR%"
 if "%WEBAI2API_DIR%"=="" set "WEBAI2API_DIR=%~dp0..\WebAI2API-sidecar"
-for %%I in ("%WEBAI2API_DIR%") do set "WEBAI2API_DIR=%%~fI"
+if exist "%WEBAI2API_DIR%\" (
+  pushd "%WEBAI2API_DIR%" >nul 2>&1
+  set "WEBAI2API_DIR=!CD!"
+  popd >nul 2>&1
+)
 
 set "WEBAI2API_PID="
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8500.*LISTENING"') do set "WEBAI2API_PID=%%a"

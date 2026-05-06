@@ -16,6 +16,13 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
+from webai_gateway.accounts import (
+    AccountRegistry,
+    direct_account_id,
+    parse_account_id,
+    stable_json_hash,
+    webai2api_account_id,
+)
 from webai_gateway.auto_research import build_auto_research_status
 from webai_gateway.config import GatewayConfig, config_to_admin, config_to_public, load_config, save_config, update_config
 from webai_gateway.deepseek_web import DEEPSEEK_DEFAULT_MODEL, DeepSeekWebClient, is_deepseek_web_model
@@ -23,10 +30,12 @@ from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERS
 from webai_gateway.openai_api import (
     bridge_error_headers,
     build_incomplete_response_retry_payload,
+    build_missing_required_tool_input_recovery_payload,
     build_native_web_search_retry_payload,
     build_off_task_question_recovery_payload,
     build_preflight_chat_response,
     build_repair_payload,
+    build_required_tool_choice_recovery_payload,
     build_tool_refusal_recovery_payload,
     build_unknown_tool_recovery_payload,
     build_virtual_loader_tool_recovery_payload,
@@ -70,6 +79,13 @@ from webai_gateway.web_auth import (
 
 
 LOCAL_ADMIN_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+WEBAI2API_AUTH_COOKIE_HINTS: dict[str, tuple[str, ...]] = {
+    "chatgpt": (
+        "__secure-next-auth.session-token",
+        "oai-client-auth-info",
+        "__secure-oai-is",
+    ),
+}
 TOOL_BRIDGE_EVENT_LIMIT = 200
 REQUEST_DIAGNOSTIC_LIMIT = 200
 TOOL_CALL_REGISTRY_LIMIT = 512
@@ -108,6 +124,7 @@ def create_app(
     app = FastAPI(title="WebAI Gateway", version="0.1.0")
     app.state.config = cfg
     app.state.credential_store = credential_store or CredentialStore(config_file.parent / "credentials")
+    app.state.account_registry = AccountRegistry(config_file.parent / ".webai-gateway" / "accounts.json")
     app.state.web_auth_service = web_auth_service or DeepSeekWebAuthService()
     app.state.browser_launcher = browser_launcher or BrowserLauncher(config_file.parent / ".webai-gateway" / "chrome-auth-profile")
     app.state.deepseek_client_factory = deepseek_client_factory or DeepSeekWebClient
@@ -145,7 +162,7 @@ def create_app(
     @app.get("/", include_in_schema=False)
     def admin_ui(request: Request) -> FileResponse:
         require_local_admin(request)
-        index_path = _native_index_path(webai2api_ui_dir) or (static_dir / "index.html")
+        index_path = static_dir / "index.html"
         if not index_path.exists():
             raise HTTPException(status_code=404, detail="Admin UI assets are missing")
         return _native_file_response(index_path)
@@ -199,16 +216,28 @@ def create_app(
         models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
         model_ids = {item.get("id") for item in models if isinstance(item, dict)}
         provider_data = provider_payload(app.state.credential_store)["providers"]
+        webai2api_instances = _load_webai2api_instances(client, cfg)
+        webai2api_auth = _load_webai2api_auth_states(client, cfg, provider_data, webai2api_instances)
         providers: list[dict[str, Any]] = []
+        authorized_count = 0
         authorized_direct = 0
         webai2api_count = 0
         for provider in provider_data:
-            declared_models = provider.get("availableModels")
-            if not isinstance(declared_models, list):
-                declared_models = provider.get("models", [])
-            provider_models = [model_id for model_id in declared_models if model_id in model_ids]
+            provider_models = _available_models_for_provider(provider, models, model_ids)
+            account_state = _provider_account_state(provider, provider_models, webai2api_instances)
+            provider_models = account_state["availableModels"]
             is_direct = provider.get("route") == "direct"
-            is_authorized = bool(provider.get("credential", {}).get("authorized"))
+            provider_auth = webai2api_auth.get(str(provider.get("id") or ""), {"checked": False, "authorized": False})
+            credential = provider.get("credential") if isinstance(provider.get("credential"), dict) else {}
+            if provider_auth.get("authorized"):
+                credential = {
+                    **credential,
+                    "authorized": True,
+                    "fields": {**(credential.get("fields") if isinstance(credential.get("fields"), dict) else {}), "cookie": True},
+                }
+            is_authorized = bool(credential.get("authorized"))
+            if is_authorized:
+                authorized_count += 1
             if is_direct and is_authorized:
                 authorized_direct += 1
             if not is_direct:
@@ -216,8 +245,13 @@ def create_app(
             providers.append(
                 {
                     **provider,
+                    "credential": credential,
+                    "webAI2APIAuth": provider_auth,
                     "availableModels": provider_models,
                     "modelCount": len(provider_models),
+                    "accounts": account_state["accounts"],
+                    "currentAccountId": account_state["currentAccountId"],
+                    "modelAvailability": account_state["modelAvailability"],
                     "loginKind": "direct" if is_direct else "webai2api",
                 }
             )
@@ -238,12 +272,566 @@ def create_app(
             "summary": {
                 "providers": len(providers),
                 "models": len(models),
+                "authorizedProviders": authorized_count,
                 "authorizedDirectProviders": authorized_direct,
                 "webAI2APIProviders": webai2api_count,
             },
             "providers": providers,
             "models": models,
         }
+
+
+    def _available_models_for_provider(
+        provider: dict[str, Any],
+        models: list[Any],
+        model_ids: set[Any],
+    ) -> list[str]:
+        declared_models = provider.get("availableModels")
+        if not isinstance(declared_models, list):
+            declared_models = provider.get("models", [])
+        declared_model_ids = [model_id for model_id in declared_models if isinstance(model_id, str)]
+        provider_models: list[str] = []
+        seen: set[str] = set()
+
+        def add_model(model_id: str) -> None:
+            if model_id not in seen:
+                seen.add(model_id)
+                provider_models.append(model_id)
+
+        for model_id in declared_model_ids:
+            if model_id in model_ids:
+                add_model(model_id)
+
+        if provider.get("route") == "direct":
+            return provider_models
+
+        provider_id = str(provider.get("id") or "")
+        adapter_ids = {str(adapter) for adapter in provider.get("adapters", []) if isinstance(adapter, str)}
+        adapter_prefixes = tuple(f"{adapter}/" for adapter in adapter_ids)
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if not isinstance(model_id, str):
+                continue
+            owner = str(item.get("owned_by") or "")
+            if owner == provider_id or owner in adapter_ids or model_id.startswith(adapter_prefixes):
+                add_model(model_id)
+        return provider_models
+
+    def _load_webai2api_instances(http_client: httpx.Client, cfg: GatewayConfig) -> list[Any]:
+        try:
+            response = http_client.get(
+                f"{_sidecar_root_from_base_url(cfg.upstream.base_url)}/admin/config/instances",
+                headers=upstream_headers(cfg),
+            )
+            if response.status_code != 200:
+                return []
+            instances = response.json()
+        except Exception:
+            return []
+        return instances if isinstance(instances, list) else []
+
+    def _load_webai2api_auth_states(
+        http_client: httpx.Client,
+        cfg: GatewayConfig,
+        providers: list[dict[str, Any]],
+        instances: list[Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if instances is None:
+            instances = _load_webai2api_instances(http_client, cfg)
+        if not isinstance(instances, list):
+            return {}
+        states: dict[str, dict[str, Any]] = {}
+        for provider in providers:
+            if provider.get("route") == "direct":
+                continue
+            provider_id = str(provider.get("id") or "")
+            matching_instances = _webai2api_provider_instances(provider, instances)
+            if not matching_instances:
+                continue
+            cookie_count = 0
+            authorized = False
+            for instance_name in matching_instances:
+                for domain in _webai2api_auth_domains(provider):
+                    cookie_names = _load_webai2api_cookie_names(http_client, cfg, instance_name, domain)
+                    if cookie_names is None:
+                        continue
+                    cookie_count += len(cookie_names)
+                    if _webai2api_cookies_authorized(provider_id, cookie_names):
+                        authorized = True
+            states[provider_id] = {
+                "checked": True,
+                "authorized": authorized,
+                "cookieCount": cookie_count,
+                "instances": matching_instances,
+            }
+        return states
+
+    def _webai2api_provider_instances(provider: dict[str, Any], instances: list[Any]) -> list[str]:
+        adapter_ids = {str(adapter) for adapter in provider.get("adapters", []) if isinstance(adapter, str)}
+        matching: list[str] = []
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            instance_name = str(instance.get("name") or "")
+            if not instance_name:
+                continue
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            for worker in workers:
+                if not isinstance(worker, dict):
+                    continue
+                worker_type = str(worker.get("type") or "")
+                merge_types = {str(item) for item in worker.get("mergeTypes", []) if isinstance(item, str)}
+                if worker_type in adapter_ids or adapter_ids.intersection(merge_types):
+                    matching.append(instance_name)
+                    break
+        return list(dict.fromkeys(matching))
+
+    def _webai2api_auth_domains(provider: dict[str, Any]) -> list[str]:
+        login_url = str(provider.get("loginUrl") or "")
+        parsed = urlsplit(login_url)
+        host = parsed.netloc or parsed.path
+        return [host.split("@")[-1].split(":")[0]] if host else []
+
+    def _load_webai2api_cookie_names(
+        http_client: httpx.Client,
+        cfg: GatewayConfig,
+        instance_name: str,
+        domain: str,
+    ) -> list[str] | None:
+        try:
+            response = http_client.get(
+                f"{cfg.upstream.base_url.rstrip('/')}/cookies",
+                params={"name": instance_name, "domain": domain},
+                headers=upstream_headers(cfg),
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except Exception:
+            return None
+        cookies = payload.get("cookies") if isinstance(payload, dict) else None
+        if not isinstance(cookies, list):
+            return []
+        names: list[str] = []
+        for item in cookies:
+            if isinstance(item, dict) and item.get("name"):
+                names.append(str(item["name"]))
+        return names
+
+    def _webai2api_cookies_authorized(provider_id: str, cookie_names: list[str]) -> bool:
+        hints = WEBAI2API_AUTH_COOKIE_HINTS.get(provider_id)
+        if not hints:
+            return False
+        lowered = [name.lower() for name in cookie_names]
+        return any(name == hint or name.startswith(f"{hint}.") for name in lowered for hint in hints)
+
+    def _provider_account_state(
+        provider: dict[str, Any],
+        provider_models: list[str],
+        webai2api_instances: list[Any],
+    ) -> dict[str, Any]:
+        provider_id = str(provider.get("id") or "")
+        accounts = _provider_accounts(provider, provider_models, webai2api_instances)
+        current = app.state.account_registry.current_account_id(provider_id)
+        account_ids = {account["id"] for account in accounts}
+        if current not in account_ids:
+            current = next((account["id"] for account in accounts if account.get("authorized")), accounts[0]["id"] if accounts else "")
+        model_availability = _model_availability_for_account(current, provider_models)
+        available_models = [
+            model_id
+            for model_id in provider_models
+            if model_availability.get(model_id, {}).get("status") != "unavailable"
+        ]
+        for account in accounts:
+            account["current"] = account["id"] == current
+            account["availableModelCount"] = _available_model_count_for_account(account["id"], provider_models)
+        return {
+            "accounts": accounts,
+            "currentAccountId": current,
+            "availableModels": available_models,
+            "modelAvailability": model_availability,
+        }
+
+    def _provider_accounts(
+        provider: dict[str, Any],
+        provider_models: list[str],
+        webai2api_instances: list[Any],
+    ) -> list[dict[str, Any]]:
+        if provider.get("route") == "direct":
+            return _direct_provider_accounts(provider, provider_models)
+        return _webai2api_provider_accounts(provider, provider_models, webai2api_instances)
+
+    def _direct_provider_accounts(provider: dict[str, Any], provider_models: list[str]) -> list[dict[str, Any]]:
+        provider_id = str(provider.get("id") or "")
+        credential = app.state.credential_store.get(provider_id)
+        if not is_credential_authorized(provider_id, credential):
+            return []
+        account_id = direct_account_id(provider_id)
+        metadata = app.state.account_registry.metadata(account_id)
+        validation = _public_account_validation(metadata.get("validation"))
+        return [
+            {
+                "id": account_id,
+                "providerId": provider_id,
+                "source": "direct-profile",
+                "displayName": str(metadata.get("displayName") or "默认账号"),
+                "planType": str(metadata.get("planType") or "unknown"),
+                "authorized": True,
+                "current": False,
+                "instanceName": None,
+                "workerName": None,
+                "workerType": None,
+                "availableModelCount": _available_model_count_from_validation(provider_models, validation),
+                "lastValidatedAt": metadata.get("lastValidatedAt") if isinstance(metadata.get("lastValidatedAt"), str) else None,
+                "validation": validation,
+            }
+        ]
+
+    def _webai2api_provider_accounts(
+        provider: dict[str, Any],
+        provider_models: list[str],
+        instances: list[Any],
+    ) -> list[dict[str, Any]]:
+        provider_id = str(provider.get("id") or "")
+        accounts: list[dict[str, Any]] = []
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            instance_name = str(instance.get("name") or "")
+            if not instance_name:
+                continue
+            user_data_mark = str(instance.get("userDataMark") or "").strip()
+            authorized = _webai2api_instance_authorized(provider, instance_name)
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            for worker in workers:
+                if not isinstance(worker, dict) or not _worker_supports_provider(worker, provider):
+                    continue
+                worker_name = str(worker.get("name") or "")
+                if not worker_name:
+                    continue
+                account_id = webai2api_account_id(provider_id, instance_name, worker_name)
+                metadata = app.state.account_registry.metadata(account_id)
+                validation = _public_account_validation(metadata.get("validation"))
+                fallback_name = f"{user_data_mark or instance_name} / {worker_name}"
+                accounts.append(
+                    {
+                        "id": account_id,
+                        "providerId": provider_id,
+                        "source": "webai2api-worker",
+                        "displayName": str(metadata.get("displayName") or fallback_name),
+                        "planType": str(metadata.get("planType") or "unknown"),
+                        "authorized": authorized,
+                        "current": False,
+                        "instanceName": instance_name,
+                        "workerName": worker_name,
+                        "workerType": str(worker.get("type") or ""),
+                        "availableModelCount": _available_model_count_from_validation(provider_models, validation),
+                        "lastValidatedAt": metadata.get("lastValidatedAt") if isinstance(metadata.get("lastValidatedAt"), str) else None,
+                        "validation": validation,
+                    }
+                )
+        return accounts
+
+    def _webai2api_instance_authorized(provider: dict[str, Any], instance_name: str) -> bool:
+        provider_id = str(provider.get("id") or "")
+        cookie_count = 0
+        for domain in _webai2api_auth_domains(provider):
+            cookie_names = _load_webai2api_cookie_names(client, current_config(), instance_name, domain)
+            if cookie_names is None:
+                continue
+            cookie_count += len(cookie_names)
+            if _webai2api_cookies_authorized(provider_id, cookie_names):
+                return True
+        return cookie_count > 0 and provider_id not in WEBAI2API_AUTH_COOKIE_HINTS
+
+    def _worker_supports_provider(worker: dict[str, Any], provider: dict[str, Any]) -> bool:
+        adapter_ids = {str(adapter) for adapter in provider.get("adapters", []) if isinstance(adapter, str)}
+        worker_type = str(worker.get("type") or "")
+        merge_types = {str(item) for item in worker.get("mergeTypes", []) if isinstance(item, str)}
+        return worker_type in adapter_ids or bool(adapter_ids.intersection(merge_types))
+
+    def _public_account_validation(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for model_id, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "pending")
+            if status not in {"available", "unavailable", "pending"}:
+                status = "pending"
+            entry: dict[str, Any] = {
+                "status": status,
+                "ok": status == "available",
+            }
+            if isinstance(item.get("message"), str):
+                entry["message"] = item["message"]
+            if isinstance(item.get("checkedAt"), str):
+                entry["checkedAt"] = item["checkedAt"]
+            out[str(model_id)] = entry
+        return out
+
+    def _model_availability_for_account(account_id: str, provider_models: list[str]) -> dict[str, dict[str, Any]]:
+        validation = app.state.account_registry.validation_for(account_id) if account_id else {}
+        availability: dict[str, dict[str, Any]] = {}
+        for model_id in provider_models:
+            item = validation.get(model_id) if isinstance(validation, dict) else None
+            if isinstance(item, dict):
+                public = _public_account_validation({model_id: item}).get(model_id)
+                availability[model_id] = public or {"status": "pending", "ok": False}
+            else:
+                availability[model_id] = {"status": "pending", "ok": False}
+        return availability
+
+    def _available_model_count_for_account(account_id: str, provider_models: list[str]) -> int:
+        validation = _public_account_validation(app.state.account_registry.validation_for(account_id))
+        return _available_model_count_from_validation(provider_models, validation)
+
+    def _available_model_count_from_validation(provider_models: list[str], validation: dict[str, Any]) -> int:
+        return sum(1 for model_id in provider_models if validation.get(model_id, {}).get("status") != "unavailable")
+
+    @app.get("/api/admin/accounts")
+    def admin_accounts(request: Request, providerId: str | None = None) -> dict[str, Any]:
+        require_local_admin(request)
+        cfg = current_config()
+        provider_data = provider_payload(app.state.credential_store)["providers"]
+        models_payload = _load_gateway_models(client, cfg)
+        models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
+        model_ids = {item.get("id") for item in models if isinstance(item, dict)}
+        instances = _load_webai2api_instances(client, cfg)
+        providers = []
+        for provider in provider_data:
+            if providerId and str(provider.get("id") or "") != providerId:
+                continue
+            provider_models = _available_models_for_provider(provider, models, model_ids)
+            state = _provider_account_state(provider, provider_models, instances)
+            providers.append(
+                {
+                    "providerId": str(provider.get("id") or ""),
+                    "name": provider.get("name"),
+                    **state,
+                }
+            )
+        if providerId:
+            if not providers:
+                raise HTTPException(status_code=404, detail="Provider 不存在")
+            return providers[0]
+        return {"providers": providers}
+
+    @app.post("/api/admin/accounts/select")
+    async def admin_accounts_select(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider_id = str(body.get("providerId") or body.get("provider_id") or "").strip()
+        account_id = str(body.get("accountId") or body.get("account_id") or "").strip()
+        provider = get_provider(provider_id)
+        parsed = parse_account_id(account_id)
+        if not parsed or parsed.provider_id != provider_id:
+            raise HTTPException(status_code=400, detail="账号不属于当前 Provider")
+        if provider.route != "direct":
+            _sync_webai2api_selected_account(provider, parsed)
+        app.state.account_registry.set_current(provider_id, account_id)
+        return admin_accounts(request, providerId=provider_id)
+
+    @app.post("/api/admin/accounts/validate")
+    async def admin_accounts_validate(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider_id = str(body.get("providerId") or body.get("provider_id") or "").strip()
+        account_id = str(body.get("accountId") or body.get("account_id") or "").strip()
+        provider = get_provider(provider_id)
+        parsed = parse_account_id(account_id)
+        if not parsed or parsed.provider_id != provider_id:
+            raise HTTPException(status_code=400, detail="账号不属于当前 Provider")
+        model_ids = body.get("modelIds") if isinstance(body.get("modelIds"), list) else body.get("model_ids")
+        if not isinstance(model_ids, list):
+            model_ids = []
+        cfg = current_config()
+        models_payload = _load_gateway_models(client, cfg)
+        models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
+        model_ids_known = {item.get("id") for item in models if isinstance(item, dict)}
+        provider_payloads = provider_payload(app.state.credential_store)["providers"]
+        provider_dict = next((item for item in provider_payloads if item.get("id") == provider_id), None)
+        if not provider_dict:
+            raise HTTPException(status_code=404, detail="Provider 不存在")
+        provider_models = _available_models_for_provider(provider_dict, models, model_ids_known)
+        requested = [str(model_id) for model_id in model_ids if isinstance(model_id, str) and model_id in provider_models]
+        if not requested:
+            requested = provider_models
+        validation: dict[str, Any] = {}
+        for model_id in requested:
+            cached = app.state.account_registry.fresh_validation(account_id, model_id)
+            if cached is not None:
+                validation[model_id] = _public_account_validation({model_id: cached})[model_id]
+                continue
+            result = await run_in_threadpool(_validate_account_model, cfg, model_id)
+            saved = app.state.account_registry.save_validation(account_id, model_id, result)
+            validation[model_id] = _public_account_validation({model_id: saved})[model_id]
+        return {
+            "providerId": provider.id,
+            "accountId": account_id,
+            "validation": validation,
+        }
+
+    @app.patch("/api/admin/accounts/{account_id:path}")
+    async def admin_accounts_update(account_id: str, request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider_id = str(body.get("providerId") or body.get("provider_id") or "").strip()
+        parsed = parse_account_id(account_id)
+        if not parsed or (provider_id and parsed.provider_id != provider_id):
+            raise HTTPException(status_code=400, detail="账号不属于当前 Provider")
+        app.state.account_registry.update_metadata(account_id, body)
+        return admin_accounts(request, providerId=parsed.provider_id)
+
+    def _sync_webai2api_selected_account(provider: Any, parsed_account: Any) -> None:
+        if not parsed_account.instance_name or not parsed_account.worker_name:
+            raise HTTPException(status_code=400, detail="WebAI2API 账号缺少 instance/worker")
+        cfg = current_config()
+        instances = _load_webai2api_instances(client, cfg)
+        current_hash = stable_json_hash(instances)
+        state = app.state.account_registry.sync_state(provider.id)
+        base_instances = instances
+        if state.get("managedHash"):
+            if current_hash == state.get("managedHash"):
+                base_instances = _restore_provider_workers_snapshot(instances, provider, state.get("baseProviderWorkers"))
+            elif current_hash == state.get("baseHash"):
+                base_instances = instances
+            else:
+                raise HTTPException(status_code=409, detail="WebAI2API 工作池配置已被手动修改，未自动覆盖。请刷新账号列表后再选择。")
+        synced = _webai2api_instances_for_selected_account(base_instances, provider, parsed_account.instance_name, parsed_account.worker_name)
+        response = client.post(
+            f"{_sidecar_root_from_base_url(cfg.upstream.base_url)}/admin/config/instances",
+            json=synced,
+            headers=upstream_headers(cfg),
+        )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=_upstream_http_error_message(response))
+        restart_response = client.post(
+            f"{_sidecar_root_from_base_url(cfg.upstream.base_url)}/admin/restart",
+            json={"loginMode": False},
+            headers=upstream_headers(cfg),
+        )
+        if restart_response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=_upstream_http_error_message(restart_response))
+        app.state.account_registry.save_sync_state(
+            provider.id,
+            {
+                "baseHash": stable_json_hash(base_instances),
+                "baseProviderWorkers": _provider_workers_snapshot(base_instances, provider),
+                "managedHash": stable_json_hash(synced),
+                "selectedAccountId": webai2api_account_id(provider.id, parsed_account.instance_name, parsed_account.worker_name),
+                "updatedAt": utc_now(),
+            },
+        )
+
+    def _webai2api_instances_for_selected_account(
+        instances: list[Any],
+        provider: Any,
+        instance_name: str,
+        worker_name: str,
+    ) -> list[Any]:
+        out: list[Any] = []
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            copied = {**instance}
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            kept_workers: list[Any] = []
+            for worker in workers:
+                if not isinstance(worker, dict):
+                    continue
+                if not _worker_supports_provider(worker, {"adapters": list(provider.adapters)}):
+                    kept_workers.append(worker)
+                    continue
+                if str(instance.get("name") or "") == instance_name and str(worker.get("name") or "") == worker_name:
+                    kept_workers.append(worker)
+                    continue
+                trimmed = _worker_without_provider_adapters(worker, set(provider.adapters))
+                if trimmed is not None:
+                    kept_workers.append(trimmed)
+            copied["workers"] = kept_workers
+            out.append(copied)
+        return out
+
+    def _provider_workers_snapshot(instances: list[Any], provider: Any) -> list[dict[str, Any]]:
+        snapshot: list[dict[str, Any]] = []
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            provider_workers = [
+                worker
+                for worker in workers
+                if isinstance(worker, dict) and _worker_supports_provider(worker, {"adapters": list(provider.adapters)})
+            ]
+            if provider_workers:
+                snapshot.append({"name": str(instance.get("name") or ""), "workers": provider_workers})
+        return snapshot
+
+    def _restore_provider_workers_snapshot(instances: list[Any], provider: Any, snapshot: Any) -> list[Any]:
+        if not isinstance(snapshot, list):
+            return instances
+        snapshot_by_instance = {
+            str(item.get("name") or ""): item.get("workers")
+            for item in snapshot
+            if isinstance(item, dict) and isinstance(item.get("workers"), list)
+        }
+        out: list[Any] = []
+        seen_instances: set[str] = set()
+        for instance in instances:
+            if not isinstance(instance, dict):
+                continue
+            instance_name = str(instance.get("name") or "")
+            seen_instances.add(instance_name)
+            workers = instance.get("workers") if isinstance(instance.get("workers"), list) else []
+            non_provider_workers = [
+                worker
+                for worker in workers
+                if isinstance(worker, dict) and not _worker_supports_provider(worker, {"adapters": list(provider.adapters)})
+            ]
+            restored_workers = snapshot_by_instance.get(instance_name, [])
+            out.append({**instance, "workers": [*restored_workers, *non_provider_workers]})
+        for instance_name, workers in snapshot_by_instance.items():
+            if instance_name and instance_name not in seen_instances:
+                out.append({"name": instance_name, "workers": workers})
+        return out
+
+    def _worker_without_provider_adapters(worker: dict[str, Any], adapter_ids: set[str]) -> dict[str, Any] | None:
+        worker_type = str(worker.get("type") or "")
+        merge_types = [str(item) for item in worker.get("mergeTypes", []) if isinstance(item, str)]
+        remaining_merge = [item for item in merge_types if item not in adapter_ids]
+        if worker_type not in adapter_ids:
+            return {**worker, "mergeTypes": remaining_merge}
+        if not remaining_merge:
+            return None
+        return {**worker, "type": remaining_merge[0], "mergeTypes": remaining_merge[1:]}
+
+    def _validate_account_model(cfg: GatewayConfig, model_id: str) -> dict[str, Any]:
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "请只回复 OK。"}],
+            "stream": False,
+            "max_tokens": 8,
+        }
+        try:
+            response = client.post(
+                cfg.upstream.base_url.rstrip("/") + "/chat/completions",
+                json=payload,
+                headers=upstream_headers(cfg),
+                timeout=max(30, int(cfg.provider_runtime.request_timeout_seconds or 300)),
+            )
+        except Exception as exc:
+            return {"status": "unavailable", "message": _preview_text(_redact_sensitive_text(str(exc)), max_chars=500)}
+        if response.status_code < 400:
+            return {"status": "available", "message": "验证通过"}
+        return {
+            "status": "unavailable",
+            "message": _preview_text(_redact_sensitive_text(_upstream_http_error_message(response)), max_chars=500),
+        }
+
 
     @app.post("/api/admin/provider-smoke/{provider_id}")
     async def admin_provider_smoke(provider_id: str, request: Request) -> dict[str, Any]:
@@ -347,7 +935,17 @@ def create_app(
     async def proxy_webai2api_admin(request: Request, admin_path: str = "") -> Response:
         require_local_admin(request)
         cfg = current_config()
-        return await _proxy_to_sidecar(client, request, _sidecar_root_from_base_url(cfg.upstream.base_url), "admin", admin_path)
+        sidecar_authorization = f"Bearer {cfg.upstream.api_key}" if cfg.upstream.api_key else None
+        gateway_authorization = f"Bearer {cfg.server.api_key}" if cfg.server.api_key else None
+        return await _proxy_to_sidecar(
+            client,
+            request,
+            _sidecar_root_from_base_url(cfg.upstream.base_url),
+            "admin",
+            admin_path,
+            sidecar_authorization=sidecar_authorization,
+            gateway_authorization=gateway_authorization,
+        )
 
     @app.get("/v1/models")
     def models(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None, alias="x-api-key")) -> JSONResponse:
@@ -394,23 +992,93 @@ def create_app(
             bridge_context=bridge_context,
         )
         response = await run_in_threadpool(post_upstream, client, cfg, payload)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            return _openai_upstream_http_error_response(
+                app,
+                endpoint="/v1/chat/completions",
+                body=body,
+                route="upstream",
+                model=model,
+                stream=bool(body.get("stream")),
+                bridge=bridge,
+                response=response,
+                bridge_context=bridge_context,
+            )
         if bool(body.get("stream")):
             if bridge:
                 content, _finish_reason = parse_sse_text(response.text)
-                sse_body = build_tool_call_sse(
-                    content,
+                stream_data = _openai_response_from_stream_buffer(content, finish_reason=_finish_reason, model=model)
+
+                def retry_upstream_stream(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
+                    retry_response = post_upstream(client, cfg, retry_payload)
+                    if retry_response.status_code >= 400:
+                        message = _upstream_http_error_message(retry_response)
+                        _record_completion_error_diagnostic(
+                            app,
+                            endpoint="/v1/chat/completions",
+                            route="upstream",
+                            model=model,
+                            body=body,
+                            stream=True,
+                            bridge=bridge,
+                            status_code=retry_response.status_code,
+                            error_kind="upstream_http_error",
+                            error=RuntimeError(message),
+                            bridge_context=bridge_context,
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail=_preview_text(_redact_sensitive_text(message), max_chars=800),
+                        )
+                    retry_data = retry_response.json()
+                    return retry_data if isinstance(retry_data, dict) else None
+
+                parsed, bridge_result = await run_in_threadpool(
+                    _parse_bridge_chat_data,
+                    stream_data,
+                    app=app,
+                    payload=payload,
+                    bridge=bridge,
                     allowed_tools=allowed_tools,
-                    model=cfg.upstream.model,
                     bridge_context=bridge_context,
+                    model=model,
+                    retry_chat=retry_upstream_stream,
                 )
+                tool_calls = _response_tool_calls(parsed)
+                if tool_calls:
+                    sse_body = build_openai_tool_calls_sse(tool_calls, model=model)
+                else:
+                    text = _response_message_text(parsed)
+                    sse_body = build_tool_call_sse(
+                        text,
+                        allowed_tools=allowed_tools,
+                        model=model,
+                        bridge_context=bridge_context,
+                    )
                 return _openai_stream_response(
                     app,
                     body=body,
                     route="upstream",
-                    model=str(payload.get("model") or cfg.upstream.model),
+                    model=model,
                     bridge=bridge,
                     sse_body=sse_body,
+                    bridge_result=bridge_result,
+                )
+            stream_error = _upstream_sse_error_message(response.text)
+            if stream_error:
+                return _openai_completion_error_response(
+                    app,
+                    endpoint="/v1/chat/completions",
+                    body=body,
+                    route="upstream",
+                    model=str(payload.get("model") or cfg.upstream.model),
+                    stream=True,
+                    bridge=bridge,
+                    status_code=502,
+                    diagnostic_status_code=response.status_code,
+                    error_kind="upstream_stream_error",
+                    message=f"WebAI2API upstream stream error: {stream_error}",
+                    bridge_context=bridge_context,
                 )
             _record_completion_diagnostic(
                 app,
@@ -430,7 +1098,25 @@ def create_app(
             raise HTTPException(status_code=502, detail="Upstream response must be a JSON object")
         def retry_upstream(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
             retry_response = post_upstream(client, cfg, retry_payload)
-            retry_response.raise_for_status()
+            if retry_response.status_code >= 400:
+                message = _upstream_http_error_message(retry_response)
+                _record_completion_error_diagnostic(
+                    app,
+                    endpoint="/v1/chat/completions",
+                    route="upstream",
+                    model=model,
+                    body=body,
+                    stream=bool(body.get("stream")),
+                    bridge=bridge,
+                    status_code=retry_response.status_code,
+                    error_kind="upstream_http_error",
+                    error=RuntimeError(message),
+                    bridge_context=bridge_context,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=_preview_text(_redact_sensitive_text(message), max_chars=800),
+                )
             retry_data = retry_response.json()
             return retry_data if isinstance(retry_data, dict) else None
 
@@ -445,8 +1131,18 @@ def create_app(
             model=model,
             retry_chat=retry_upstream,
         )
-        return _openai_json_response(app, body=body, route="upstream", model=model, bridge=bridge, parsed=parsed, bridge_result=bridge_result)
+        return _openai_json_response(
+            app,
+            body=body,
+            route="upstream",
+            model=model,
+            bridge=bridge,
+            parsed=parsed,
+            bridge_result=bridge_result,
+            bridge_context=bridge_context,
+        )
 
+    @app.post("/messages/count_tokens")
     @app.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens_route(
         request: Request,
@@ -457,6 +1153,7 @@ def create_app(
         body = await _json_body(request)
         return JSONResponse(anthropic_count_tokens(body))
 
+    @app.post("/messages")
     @app.post("/v1/messages")
     async def anthropic_messages(
         request: Request,
@@ -511,14 +1208,50 @@ def create_app(
                 parsed = preflight_data
             else:
                 response = await run_in_threadpool(post_upstream, client, cfg, payload)
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    message = _upstream_http_error_message(response)
+                    _record_completion_error_diagnostic(
+                        app,
+                        endpoint="/v1/messages",
+                        route="upstream",
+                        model=model,
+                        body=openai_body,
+                        stream=bool(body.get("stream")),
+                        bridge=bridge,
+                        status_code=response.status_code,
+                        error_kind="upstream_http_error",
+                        error=RuntimeError(message),
+                        bridge_context=bridge_context,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=_preview_text(_redact_sensitive_text(message), max_chars=800),
+                    )
                 data = response.json()
                 if not isinstance(data, dict):
                     raise HTTPException(status_code=502, detail="Upstream response must be a JSON object")
 
                 def retry_upstream(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
                     retry_response = post_upstream(client, cfg, retry_payload)
-                    retry_response.raise_for_status()
+                    if retry_response.status_code >= 400:
+                        message = _upstream_http_error_message(retry_response)
+                        _record_completion_error_diagnostic(
+                            app,
+                            endpoint="/v1/messages",
+                            route="upstream",
+                            model=model,
+                            body=openai_body,
+                            stream=bool(body.get("stream")),
+                            bridge=bridge,
+                            status_code=retry_response.status_code,
+                            error_kind="upstream_http_error",
+                            error=RuntimeError(message),
+                            bridge_context=bridge_context,
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail=_preview_text(_redact_sensitive_text(message), max_chars=800),
+                        )
                     retry_data = retry_response.json()
                     return retry_data if isinstance(retry_data, dict) else None
 
@@ -620,6 +1353,33 @@ def _run_provider_smoke_test(
     config: GatewayConfig,
     provider_id: str,
 ) -> dict[str, Any]:
+    try:
+        provider = get_provider(provider_id)
+    except ValueError:
+        provider = None
+    if provider is not None and provider.route != "direct":
+        model = _webai2api_provider_smoke_model(provider, client, config)
+        if not model:
+            return {
+                "provider": provider_id,
+                "authorized": True,
+                "ok": False,
+                "passed": 0,
+                "total": 1,
+                "results": [{"id": "models", "ok": False, "message": "WebAI2API 未返回该 provider 的可用文本模型"}],
+            }
+        results = _run_webai2api_provider_smoke(app, client, config, provider_id=provider_id, model=model)
+        passed = sum(1 for item in results if item.get("ok"))
+        return {
+            "provider": provider_id,
+            "authorized": True,
+            "model": model,
+            "ok": passed == len(results),
+            "passed": passed,
+            "total": len(results),
+            "results": results,
+        }
+
     credential = app.state.credential_store.get(provider_id)
     if not is_credential_authorized(provider_id, credential):
         return {
@@ -674,6 +1434,86 @@ def _run_deepseek_provider_smoke(app: FastAPI, client: httpx.Client, config: Gat
         model="deepseek-v4-pro",
         chat_func=_deepseek_web_chat_payload,
     )
+
+
+def _run_webai2api_provider_smoke(
+    app: FastAPI,
+    client: httpx.Client,
+    config: GatewayConfig,
+    *,
+    provider_id: str,
+    model: str,
+) -> list[dict[str, Any]]:
+    return _run_direct_provider_smoke(
+        app,
+        client,
+        config,
+        provider_id=provider_id,
+        model=model,
+        chat_func=_webai2api_upstream_chat_payload,
+    )
+
+
+def _webai2api_provider_smoke_model(provider: Any, client: httpx.Client, config: GatewayConfig) -> str:
+    if not bool(getattr(provider, "capabilities", {}).get("text")):
+        return ""
+    models_payload = _load_gateway_models(client, config)
+    models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
+    model_ids = {item.get("id") for item in models if isinstance(item, dict)}
+    for model_id in getattr(provider, "models", ()):
+        if model_id in model_ids:
+            return str(model_id)
+    adapter_ids = {str(adapter) for adapter in getattr(provider, "adapters", ())}
+    adapter_prefixes = tuple(f"{adapter}/" for adapter in adapter_ids)
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str):
+            continue
+        owner = str(item.get("owned_by") or "")
+        if owner in adapter_ids or model_id.startswith(adapter_prefixes):
+            return model_id
+    first = next((str(model_id) for model_id in getattr(provider, "models", ()) if str(model_id)), "")
+    return first
+
+
+def _webai2api_upstream_chat_payload(
+    app: FastAPI,
+    client: httpx.Client,
+    body: dict[str, Any],
+    config: GatewayConfig,
+) -> dict[str, Any]:
+    payload, bridge, allowed_tools, bridge_context = build_upstream_payload(body, config)
+    model = str(payload.get("model") or config.upstream.model)
+    preflight = _local_preflight_response(app, body, model, bridge_context)
+    if preflight is not None:
+        return json_loads_response_from_any(preflight)
+    response = post_upstream(client, config, payload)
+    if response.status_code >= 400:
+        raise RuntimeError(_upstream_http_error_message(response))
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("WebAI2API upstream response must be a JSON object")
+
+    def retry_chat(retry_payload: dict[str, Any]) -> dict[str, Any] | None:
+        retry_response = post_upstream(client, config, retry_payload)
+        if retry_response.status_code >= 400:
+            raise RuntimeError(_upstream_http_error_message(retry_response))
+        retry_data = retry_response.json()
+        return retry_data if isinstance(retry_data, dict) else None
+
+    parsed, _bridge_result = _parse_bridge_chat_data(
+        data,
+        app=app,
+        payload=payload,
+        bridge=bridge,
+        allowed_tools=allowed_tools,
+        bridge_context=bridge_context,
+        model=model,
+        retry_chat=retry_chat,
+    )
+    return parsed
 
 
 def _run_direct_provider_smoke(
@@ -928,6 +1768,21 @@ def _response_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
     return tool_calls if isinstance(tool_calls, list) else []
 
 
+def _openai_response_from_stream_buffer(content: str, *, finish_reason: str, model: str) -> dict[str, Any]:
+    return {
+        "id": "upstream-stream-buffer",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": finish_reason or "stop",
+                "message": {"role": "assistant", "content": content or ""},
+            }
+        ],
+        "model": model,
+    }
+
+
 def _latest_gateway_source_mtime() -> dict[str, Any]:
     tool_bridge_source = inspect.getsourcefile(parse_tool_response)
     source_files = [
@@ -981,7 +1836,16 @@ def _sidecar_root_from_base_url(base_url: str) -> str:
     return root.rstrip("/")
 
 
-async def _proxy_to_sidecar(client: httpx.Client, request: Request, root_url: str, prefix: str, path: str) -> Response:
+async def _proxy_to_sidecar(
+    client: httpx.Client,
+    request: Request,
+    root_url: str,
+    prefix: str,
+    path: str,
+    *,
+    sidecar_authorization: str | None = None,
+    gateway_authorization: str | None = None,
+) -> Response:
     suffix = f"{prefix}/{path}".rstrip("/")
     target = f"{root_url}/{suffix}"
     if request.url.query:
@@ -992,6 +1856,13 @@ async def _proxy_to_sidecar(client: httpx.Client, request: Request, root_url: st
         for key, value in request.headers.items()
         if key.lower() not in {"host", "content-length", "connection", "transfer-encoding"}
     }
+    if sidecar_authorization:
+        auth_key = next((key for key in headers if key.lower() == "authorization"), "authorization")
+        existing_authorization = headers.get(auth_key)
+        if not existing_authorization or existing_authorization == gateway_authorization:
+            if auth_key in headers:
+                headers.pop(auth_key, None)
+            headers["authorization"] = sidecar_authorization
     try:
         upstream_response = await run_in_threadpool(client.request, request.method, target, content=body, headers=headers)
     except httpx.HTTPError:
@@ -1183,6 +2054,156 @@ def _record_completion_error_diagnostic(
     )
 
 
+def _openai_completion_error_response(
+    app: FastAPI,
+    *,
+    endpoint: str,
+    body: dict[str, Any],
+    route: str,
+    model: str,
+    stream: bool,
+    bridge: bool,
+    status_code: int,
+    diagnostic_status_code: int,
+    error_kind: str,
+    message: str,
+    bridge_context: Any | None = None,
+) -> JSONResponse:
+    sanitized = _preview_text(_redact_sensitive_text(message), max_chars=800)
+    _record_completion_error_diagnostic(
+        app,
+        endpoint=endpoint,
+        route=route,
+        model=model,
+        body=body,
+        stream=stream,
+        bridge=bridge,
+        status_code=diagnostic_status_code,
+        error_kind=error_kind,
+        error=RuntimeError(sanitized),
+        bridge_context=bridge_context,
+    )
+    return JSONResponse(
+        {
+            "error": {
+                "message": sanitized,
+                "type": _openai_error_type(status_code),
+                "code": error_kind,
+                "param": None,
+            }
+        },
+        status_code=status_code,
+    )
+
+
+def _openai_upstream_http_error_response(
+    app: FastAPI,
+    *,
+    endpoint: str,
+    body: dict[str, Any],
+    route: str,
+    model: str,
+    stream: bool,
+    bridge: bool,
+    response: httpx.Response,
+    bridge_context: Any | None = None,
+) -> JSONResponse:
+    return _openai_completion_error_response(
+        app,
+        endpoint=endpoint,
+        body=body,
+        route=route,
+        model=model,
+        stream=stream,
+        bridge=bridge,
+        status_code=502,
+        diagnostic_status_code=response.status_code,
+        error_kind="upstream_http_error",
+        message=_upstream_http_error_message(response),
+        bridge_context=bridge_context,
+    )
+
+
+def _openai_error_type(status_code: int) -> str:
+    if status_code == 400:
+        return "invalid_request_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code == 503:
+        return "service_unavailable_error"
+    if status_code >= 500:
+        return "api_error"
+    return "invalid_request_error"
+
+
+def _upstream_http_error_message(response: httpx.Response) -> str:
+    preview = _extract_upstream_error_preview(response)
+    if not preview:
+        preview = response.reason_phrase or "empty response body"
+    return f"WebAI2API upstream returned HTTP {response.status_code}: {preview}"
+
+
+def _extract_upstream_error_preview(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        extracted = _extract_error_message_from_payload(data)
+        if extracted:
+            return _preview_text(_redact_sensitive_text(extracted), max_chars=700)
+        return _preview_text(_redact_sensitive_text(json.dumps(data, ensure_ascii=False)), max_chars=700)
+    text = _strip_html_for_error_preview(response.text or "")
+    return _preview_text(_redact_sensitive_text(text), max_chars=700)
+
+
+def _extract_error_message_from_payload(payload: dict[str, Any]) -> str:
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("detail") or error.get("code")
+        if isinstance(message, str):
+            return message
+        return json.dumps(error, ensure_ascii=False)
+    if isinstance(error, str):
+        return error
+    detail = payload.get("detail")
+    if isinstance(detail, str):
+        return detail
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message
+    return ""
+
+
+def _strip_html_for_error_preview(text: str) -> str:
+    stripped = re.sub(r"(?is)<(?:script|style)\b[^>]*>.*?</(?:script|style)>", " ", text or "")
+    stripped = re.sub(r"(?s)<[^>]+>", " ", stripped)
+    return stripped
+
+
+def _upstream_sse_error_message(text: str) -> str:
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data_text = line[5:].strip()
+        if not data_text or data_text == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data_text)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            message = _extract_error_message_from_payload(payload)
+            if message:
+                return message
+    return ""
+
+
 def _openai_json_response(
     app: FastAPI,
     *,
@@ -1193,6 +2214,7 @@ def _openai_json_response(
     parsed: dict[str, Any],
     bridge_result: Any,
     provider_diagnostic: Any = None,
+    bridge_context: Any | None = None,
 ) -> JSONResponse:
     _remember_openai_tool_calls(app, parsed)
     _record_completion_diagnostic(
@@ -1206,6 +2228,7 @@ def _openai_json_response(
         **_openai_message_response_fields(parsed, response_kind="json"),
         **_provider_diagnostic_fields(provider_diagnostic),
         **_tool_bridge_completion_fields(bridge_result),
+        **_tool_bridge_context_diagnostic_fields(bridge_context),
     )
     return JSONResponse(parsed, headers=bridge_error_headers(bridge_result))
 
@@ -1271,6 +2294,7 @@ def _openai_stream_response(
     bridge: bool,
     sse_body: str,
     provider_diagnostic: Any = None,
+    bridge_result: Any = None,
     content_type: str = "text/event-stream",
 ) -> Response:
     _record_completion_diagnostic(
@@ -1283,8 +2307,9 @@ def _openai_stream_response(
         bridge=bridge,
         **_openai_sse_response_fields(sse_body),
         **_provider_diagnostic_fields(provider_diagnostic),
+        **_tool_bridge_completion_fields(bridge_result),
     )
-    return Response(sse_body, media_type=content_type or "text/event-stream")
+    return Response(sse_body, media_type=content_type or "text/event-stream", headers=bridge_error_headers(bridge_result))
 
 
 def _provider_diagnostic_fields(diagnostic: Any) -> dict[str, Any]:
@@ -1747,10 +2772,10 @@ async def _json_body(request: Request) -> dict[str, Any]:
     return body
 
 
-def _append_web_models(data: dict[str, Any]) -> dict[str, Any]:
+def _append_web_models(data: dict[str, Any], *, include_webai2api_catalog: bool = False) -> dict[str, Any]:
     items = data.get("data") if isinstance(data.get("data"), list) else []
     seen = {item.get("id") for item in items if isinstance(item, dict)}
-    for item in catalog_model_payloads():
+    for item in catalog_model_payloads(include_webai2api=include_webai2api_catalog):
         model_id = item["id"]
         if model_id not in seen:
             items.append(item)
@@ -1847,7 +2872,49 @@ def _parse_bridge_chat_data(
             stage="initial",
             bridge_context=bridge_context,
         )
-    if bridge_result.error and bridge_result.error.repairable:
+    if _should_retry_required_tool_choice_recovery(bridge_result):
+        _record_tool_bridge_event(
+            app,
+            "tool_bridge_retry",
+            stage="required_tool_choice_recovery",
+            model=model,
+            errorKind=bridge_result.error.kind,
+            errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
+        )
+        recovery_data = retry_chat(
+            build_required_tool_choice_recovery_payload(
+                payload,
+                bridge_result,
+                allowed_tools=allowed_tools,
+                bridge_context=bridge_context,
+            )
+        )
+        if isinstance(recovery_data, dict):
+            parsed, bridge_result = parse_chat_response(
+                recovery_data,
+                bridge=bridge,
+                allowed_tools=allowed_tools,
+                model=model,
+                bridge_context=bridge_context,
+                return_bridge_result=True,
+            )
+            parsed, bridge_result, retry_state = _apply_controller_decision(
+                parsed,
+                bridge_result,
+                bridge_context=bridge_context,
+                model=model,
+                retry_state=retry_state,
+            )
+            if bridge:
+                _record_bridge_parse_event(
+                    app,
+                    bridge_result,
+                    model=model,
+                    allowed_tools=allowed_tools,
+                    stage="required_tool_choice_recovery",
+                    bridge_context=bridge_context,
+                )
+    if bridge_result.error and bridge_result.error.repairable and not _should_retry_required_tool_choice_recovery(bridge_result):
         _record_tool_bridge_event(
             app,
             "tool_bridge_retry",
@@ -1856,7 +2923,7 @@ def _parse_bridge_chat_data(
             errorKind=bridge_result.error.kind,
             errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
         )
-        repair_data = retry_chat(build_repair_payload(payload, bridge_result))
+        repair_data = retry_chat(build_repair_payload(payload, bridge_result, allowed_tools=allowed_tools))
         if isinstance(repair_data, dict):
             parsed, bridge_result = parse_chat_response(
                 repair_data,
@@ -1963,6 +3030,47 @@ def _parse_bridge_chat_data(
                         stage="off_task_question_recovery",
                         bridge_context=bridge_context,
                     )
+        elif _should_retry_missing_required_tool_input_recovery(bridge_result):
+            _record_tool_bridge_event(
+                app,
+                "tool_bridge_retry",
+                stage="missing_required_tool_input_recovery",
+                model=model,
+                errorKind=bridge_result.error.kind,
+                errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
+            )
+            recovery_data = retry_chat(
+                build_missing_required_tool_input_recovery_payload(
+                    payload,
+                    bridge_result,
+                    allowed_tools=allowed_tools,
+                )
+            )
+            if isinstance(recovery_data, dict):
+                parsed, bridge_result = parse_chat_response(
+                    recovery_data,
+                    bridge=bridge,
+                    allowed_tools=allowed_tools,
+                    model=model,
+                    bridge_context=bridge_context,
+                    return_bridge_result=True,
+                )
+                parsed, bridge_result, retry_state = _apply_controller_decision(
+                    parsed,
+                    bridge_result,
+                    bridge_context=bridge_context,
+                    model=model,
+                    retry_state=retry_state,
+                )
+                if bridge:
+                    _record_bridge_parse_event(
+                        app,
+                        bridge_result,
+                        model=model,
+                        allowed_tools=allowed_tools,
+                        stage="missing_required_tool_input_recovery",
+                        bridge_context=bridge_context,
+                    )
         elif _should_retry_tool_refusal_recovery(bridge_result):
             _record_tool_bridge_event(
                 app,
@@ -2039,7 +3147,7 @@ def _parse_bridge_chat_data(
                     errorKind=bridge_result.error.kind,
                     errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
                 )
-                repair_data = retry_chat(build_repair_payload(payload, bridge_result))
+                repair_data = retry_chat(build_repair_payload(payload, bridge_result, allowed_tools=allowed_tools))
                 if isinstance(repair_data, dict):
                     parsed, bridge_result = parse_chat_response(
                         repair_data,
@@ -2139,7 +3247,89 @@ def _parse_bridge_chat_data(
                                 stage="incomplete_off_task_question_recovery",
                                 bridge_context=bridge_context,
                             )
+                elif _should_retry_missing_required_tool_input_recovery(bridge_result):
+                    _record_tool_bridge_event(
+                        app,
+                        "tool_bridge_retry",
+                        stage="incomplete_missing_required_tool_input_recovery",
+                        model=model,
+                        errorKind=bridge_result.error.kind,
+                        errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
+                    )
+                    recovery_data = retry_chat(
+                        build_missing_required_tool_input_recovery_payload(
+                            payload,
+                            bridge_result,
+                            allowed_tools=allowed_tools,
+                        )
+                    )
+                    if isinstance(recovery_data, dict):
+                        parsed, bridge_result = parse_chat_response(
+                            recovery_data,
+                            bridge=bridge,
+                            allowed_tools=allowed_tools,
+                            model=model,
+                            bridge_context=bridge_context,
+                            return_bridge_result=True,
+                        )
+                        parsed, bridge_result, retry_state = _apply_controller_decision(
+                            parsed,
+                            bridge_result,
+                            bridge_context=bridge_context,
+                            model=model,
+                            retry_state=retry_state,
+                        )
+                        if bridge:
+                            _record_bridge_parse_event(
+                                app,
+                                bridge_result,
+                                model=model,
+                                allowed_tools=allowed_tools,
+                                stage="incomplete_missing_required_tool_input_recovery",
+                                bridge_context=bridge_context,
+                            )
     if bridge:
+        if _should_retry_no_progress_escalation(bridge_result):
+            _record_tool_bridge_event(
+                app,
+                "tool_bridge_retry",
+                stage="no_progress_escalation",
+                model=model,
+                errorKind=bridge_result.error.kind,
+                errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
+            )
+            escalation_data = retry_chat(
+                build_tool_refusal_recovery_payload(
+                    payload,
+                    bridge_result,
+                    allowed_tools=allowed_tools,
+                    escalation=True,
+                )
+            )
+            if isinstance(escalation_data, dict):
+                parsed, bridge_result = parse_chat_response(
+                    escalation_data,
+                    bridge=bridge,
+                    allowed_tools=allowed_tools,
+                    model=model,
+                    bridge_context=bridge_context,
+                    return_bridge_result=True,
+                )
+                parsed, bridge_result, retry_state = _apply_controller_decision(
+                    parsed,
+                    bridge_result,
+                    bridge_context=bridge_context,
+                    model=model,
+                    retry_state=retry_state,
+                )
+                _record_bridge_parse_event(
+                    app,
+                    bridge_result,
+                    model=model,
+                    allowed_tools=allowed_tools,
+                    stage="no_progress_escalation",
+                    bridge_context=bridge_context,
+                )
         _record_bridge_rejection_event(
             app,
             bridge_result,
@@ -2317,8 +3507,33 @@ def _should_retry_tool_refusal_recovery(bridge_result: Any) -> bool:
             "write_after_failed_path_without_discovery",
             "unsafe_local_shell_command",
             "repeat_discovery_call_without_progress",
+            "repeat_read_call_without_progress",
+            "repeat_unchanged_read_without_progress",
             "repeat_shell_housekeeping_without_progress",
             "repeat_same_skill_without_progress",
+        }
+    )
+
+
+def _should_retry_required_tool_choice_recovery(bridge_result: Any) -> bool:
+    error = getattr(bridge_result, "error", None)
+    return bool(error and getattr(error, "kind", "") == "tool_choice_violation")
+
+
+def _should_retry_missing_required_tool_input_recovery(bridge_result: Any) -> bool:
+    error = getattr(bridge_result, "error", None)
+    return bool(error and getattr(error, "kind", "") == "missing_required_tool_input")
+
+
+def _should_retry_no_progress_escalation(bridge_result: Any) -> bool:
+    error = getattr(bridge_result, "error", None)
+    return bool(
+        error
+        and getattr(error, "kind", "")
+        in {
+            "repeat_read_call_without_progress",
+            "repeat_unchanged_read_without_progress",
+            "repeat_shell_housekeeping_without_progress",
         }
     )
 
@@ -2429,7 +3644,16 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             bridge=bridge,
             sse_body=build_tool_call_sse(content, allowed_tools=allowed_tools, model=model, bridge_context=bridge_context),
         )
-    return _openai_json_response(app, body=body, route="deepseek-web", model=model, bridge=bridge, parsed=parsed, bridge_result=bridge_result)
+    return _openai_json_response(
+        app,
+        body=body,
+        route="deepseek-web",
+        model=model,
+        bridge=bridge,
+        parsed=parsed,
+        bridge_result=bridge_result,
+        bridge_context=bridge_context,
+    )
 
 
 def _deepseek_web_chat_payload(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> dict[str, Any]:
@@ -2566,6 +3790,7 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
         parsed=parsed,
         bridge_result=bridge_result,
         provider_diagnostic=getattr(web_client, "last_diagnostic", None),
+        bridge_context=bridge_context,
     )
 
 
@@ -2709,6 +3934,7 @@ def _qwen_coder_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], c
         parsed=parsed,
         bridge_result=bridge_result,
         provider_diagnostic=getattr(web_client, "last_diagnostic", None),
+        bridge_context=bridge_context,
     )
 
 

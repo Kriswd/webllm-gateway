@@ -19,6 +19,7 @@ from webai_gateway.openai_api import build_tool_call_sse, parse_chat_response
 from webai_gateway.tool_bridge import (
     build_context,
     parse_tool_response,
+    prepare_openai_messages,
     sanitize_leaked_tool_protocol_output,
     should_bridge_tools,
     to_openai_tool_calls,
@@ -853,6 +854,31 @@ def test_ds2api_parity_forced_tool_choice_filters_visible_tools() -> None:
     assert context.allowed_names == {"Read"}
 
 
+def test_ds2api_parity_required_tool_choice_is_injected_into_prompt() -> None:
+    context = build_context(
+        [_openai_tool("Read")],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+        tool_choice="required",
+    )
+
+    prepared = prepare_openai_messages([{"role": "user", "content": "Read README.md"}], context)
+
+    assert "For this response, you MUST call at least one tool from the allowed list." in prepared[0]["content"]
+
+
+def test_ds2api_parity_forced_tool_choice_is_injected_into_prompt() -> None:
+    context = build_context(
+        [_openai_tool("Read"), _openai_tool("Write")],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+        tool_choice={"type": "function", "function": {"name": "Read"}},
+    )
+
+    prepared = prepare_openai_messages([{"role": "user", "content": "Read README.md"}], context)
+
+    assert "For this response, you MUST call exactly this tool name: Read" in prepared[0]["content"]
+    assert "Do not call any other tool." in prepared[0]["content"]
+
+
 def test_ds2api_parity_allowed_tools_filter_visible_tools() -> None:
     context = build_context(
         [_openai_tool("Read"), _openai_tool("Write")],
@@ -874,6 +900,7 @@ def test_ds2api_parity_required_tool_choice_flags_plain_text_violation() -> None
 
     assert result.error is not None
     assert result.error.kind == "tool_choice_violation"
+    assert result.error.repairable is True
 
 
 def test_ds2api_parity_sse_tool_arguments_are_schema_normalized() -> None:
@@ -995,6 +1022,7 @@ def test_ds2api_parity_sanitizes_leaked_output_protocol() -> None:
         ),
         ("A<| end_of_sentence |><| Assistant |>B<| end_of_thinking |>C<| end_of_toolresults |>D", "ABCD"),
         ("A<think>B</think>C<| begin_of_sentence |>D", "ABCD"),
+        ("\ue200genui\ue202Ay-D\ue201\n\nRight now in Beijing it is sunny.", "Right now in Beijing it is sunny."),
         ("Answer prefix<think>internal reasoning that never closes", "Answer prefix"),
         (
             'before\n<|DSML|tool_calls><|DSML|invoke name="Bash"><|DSML|parameter name="command">pwd</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>\nafter',

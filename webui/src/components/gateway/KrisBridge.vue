@@ -8,12 +8,15 @@ import {
   CheckCircleOutlined,
   ClockCircleOutlined,
   CopyOutlined,
+  EditOutlined,
+  ExperimentOutlined,
   LinkOutlined,
   LoginOutlined,
   ReloadOutlined,
   RocketOutlined,
   SettingOutlined,
   ToolOutlined,
+  UserSwitchOutlined,
 } from '@ant-design/icons-vue';
 
 const settingsStore = useSettingsStore();
@@ -25,6 +28,7 @@ const loadError = ref('');
 const actionError = ref('');
 const actionLogs = ref([]);
 const actionKind = ref('');
+const accountActionId = ref('');
 const selectedProviderId = ref('');
 const selectedWorkerName = ref('');
 const modelSearch = ref('');
@@ -32,6 +36,14 @@ const modelScope = ref('selected');
 const tokenVisible = ref(false);
 const cdpUrl = ref('http://127.0.0.1:9222');
 const workerOptions = ref([]);
+const accountEditOpen = ref(false);
+const accountEditSaving = ref(false);
+const accountEditForm = ref({
+  id: '',
+  displayName: '',
+  planType: 'unknown',
+  note: '',
+});
 
 const localExampleBaseUrl = 'http://127.0.0.1:8610/v1';
 
@@ -46,6 +58,7 @@ const onboarding = ref({
   summary: {
     providers: 0,
     models: 0,
+    authorizedProviders: 0,
     authorizedDirectProviders: 0,
     webAI2APIProviders: 0,
   },
@@ -78,6 +91,17 @@ const selectedProvider = computed(() => {
   return providers.value.find((item) => item.id === selectedProviderId.value) || providers.value[0] || null;
 });
 
+const selectedProviderAccounts = computed(() => {
+  return Array.isArray(selectedProvider.value?.accounts) ? selectedProvider.value.accounts : [];
+});
+
+const currentAccount = computed(() => {
+  return selectedProviderAccounts.value.find((account) => account.id === selectedProvider.value?.currentAccountId)
+    || selectedProviderAccounts.value.find((account) => account.current)
+    || selectedProviderAccounts.value[0]
+    || null;
+});
+
 const selectedProviderWorkers = computed(() => {
   const provider = selectedProvider.value;
   if (!provider) return [];
@@ -99,7 +123,7 @@ const filteredModels = computed(() => {
     const modelOwnerId = onboarding.value.models?.find((item) => item.id === modelId)?.owned_by;
     const hasKnownHiddenOwner = !owner && providers.value.some((provider) => provider.id === modelOwnerId);
     if (hasKnownHiddenOwner) return false;
-    const inScope = modelScope.value === 'all' || !selectedProvider.value || owner?.id === selectedProvider.value.id;
+    const inScope = modelScope.value === 'all' || !selectedProvider.value || providerVisibleModelIds(selectedProvider.value).includes(modelId);
     const matchesQuery = !query || modelId.toLowerCase().includes(query) || owner?.name?.toLowerCase().includes(query);
     return inScope && matchesQuery;
   });
@@ -118,6 +142,7 @@ const modelColumns = [
   { title: '模型 ID', dataIndex: 'id', key: 'id' },
   { title: '来源', key: 'provider', width: 180 },
   { title: '能力', key: 'capability', width: 180 },
+  { title: '账号可用性', key: 'availability', width: 180 },
   { title: '操作', key: 'action', width: 110 },
 ];
 
@@ -144,12 +169,17 @@ const progressStatus = computed(() => (actionError.value ? 'error' : 'process'))
 function isProviderReady(provider) {
   if (!provider) return false;
   if (provider.loginKind === 'direct') return Boolean(provider.credential?.authorized);
+  if (provider.webAI2APIAuth?.checked) return Boolean(provider.credential?.authorized);
   return true;
 }
 
+function isProviderAuthorized(provider) {
+  return Boolean(provider?.credential?.authorized);
+}
+
 function providerForModel(modelId) {
-  return providers.value.find((provider) => providerAvailableModels(provider).includes(modelId))
-    || providers.value.find((provider) => provider.id === onboarding.value.models?.find((model) => model.id === modelId)?.owned_by && providerAvailableModels(provider).includes(modelId))
+  return providers.value.find((provider) => providerVisibleModelIds(provider).includes(modelId))
+    || providers.value.find((provider) => provider.id === onboarding.value.models?.find((model) => model.id === modelId)?.owned_by && providerVisibleModelIds(provider).includes(modelId))
     || null;
 }
 
@@ -157,10 +187,69 @@ function providerAvailableModels(provider) {
   return Array.isArray(provider?.availableModels) ? provider.availableModels : [];
 }
 
+function providerVisibleModelIds(provider) {
+  if (!provider) return [];
+  const availabilityIds = Object.keys(provider.modelAvailability || {});
+  return availabilityIds.length ? availabilityIds : providerAvailableModels(provider);
+}
+
 function providerModelCount(provider) {
   if (!provider) return 0;
   if (Number.isFinite(provider.modelCount)) return provider.modelCount;
   return providerAvailableModels(provider).length;
+}
+
+function providerAccountCount(provider) {
+  return Array.isArray(provider?.accounts) ? provider.accounts.length : 0;
+}
+
+function accountPlanLabel(planType) {
+  const labels = {
+    free: 'FREE',
+    plus: 'PLUS',
+    pro: 'PRO',
+    team: 'TEAM',
+    unknown: '未知权益',
+  };
+  return labels[String(planType || 'unknown').toLowerCase()] || '未知权益';
+}
+
+function accountPlanColor(planType) {
+  const colors = {
+    free: 'default',
+    plus: 'green',
+    pro: 'gold',
+    team: 'blue',
+    unknown: 'default',
+  };
+  return colors[String(planType || 'unknown').toLowerCase()] || 'default';
+}
+
+function accountSourceLabel(account) {
+  if (account?.source === 'direct-profile') return '网关直连';
+  return `${account?.instanceName || 'WebAI2API'} / ${account?.workerName || 'worker'}`;
+}
+
+function modelAvailability(modelId) {
+  const provider = providerForModel(modelId);
+  return provider?.modelAvailability?.[modelId] || { status: 'pending' };
+}
+
+function modelAvailabilityTag(modelId) {
+  const availability = modelAvailability(modelId);
+  const status = availability.status || 'pending';
+  if (status === 'available') return { label: '已验证可用', color: 'success' };
+  if (status === 'unavailable') return { label: '验证失败', color: 'error' };
+  return { label: '待验证', color: 'default' };
+}
+
+function accountValidationSummary(account) {
+  const validation = account?.validation || {};
+  const values = Object.values(validation);
+  const available = values.filter((item) => item?.status === 'available').length;
+  const unavailable = values.filter((item) => item?.status === 'unavailable').length;
+  if (!values.length) return '尚未验证模型';
+  return `${available} 个可用，${unavailable} 个失败`;
 }
 
 function capabilityLabels(provider) {
@@ -171,6 +260,34 @@ function capabilityLabels(provider) {
   if (caps.image) labels.push({ label: '图片', color: 'green' });
   if (caps.video) labels.push({ label: '视频', color: 'orange' });
   return labels;
+}
+
+function modelCapabilityLabels(model) {
+  if (!model) return [];
+  const labels = [];
+  const modelId = String(model.id || '');
+  const type = String(model.type || '').toLowerCase();
+  const imagePolicy = String(model.image_policy || model.imagePolicy || '').toLowerCase();
+
+  if (type === 'text') {
+    labels.push({ label: '文本', color: 'blue' });
+    if (imagePolicy === 'optional' || imagePolicy === 'required') {
+      labels.push({ label: '可附图', color: 'green' });
+    }
+    return labels;
+  }
+
+  if (type === 'image' || modelId.includes('image')) {
+    labels.push({ label: '图片', color: 'green' });
+    return labels;
+  }
+
+  if (type === 'video' || modelId.includes('sora') || modelId.includes('video')) {
+    labels.push({ label: '视频', color: 'orange' });
+    return labels;
+  }
+
+  return capabilityLabels(providerForModel(modelId));
 }
 
 function appendLog(text) {
@@ -402,6 +519,92 @@ async function runProviderSmoke() {
   }
 }
 
+async function selectAccount(account) {
+  const provider = selectedProvider.value;
+  if (!provider || !account || account.current) return;
+  accountActionId.value = account.id;
+  try {
+    const res = await fetch('/api/admin/accounts/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerId: provider.id, accountId: account.id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    message.success(`已切换到 ${account.displayName}`);
+    await loadOnboarding();
+  } catch (error) {
+    message.error(error.message || String(error));
+  } finally {
+    accountActionId.value = '';
+  }
+}
+
+async function validateAccount(account) {
+  const provider = selectedProvider.value;
+  if (!provider || !account) return;
+  accountActionId.value = `${account.id}:validate`;
+  try {
+    const res = await fetch('/api/admin/accounts/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        providerId: provider.id,
+        accountId: account.id,
+        modelIds: providerVisibleModelIds(provider),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    const values = Object.values(data.validation || {});
+    const okCount = values.filter((item) => item?.status === 'available').length;
+    message.success(`模型验证完成：${okCount}/${values.length} 可用`);
+    await loadOnboarding();
+  } catch (error) {
+    message.error(error.message || String(error));
+  } finally {
+    accountActionId.value = '';
+  }
+}
+
+function openAccountEditor(account) {
+  if (!account) return;
+  accountEditForm.value = {
+    id: account.id,
+    displayName: account.displayName || '',
+    planType: account.planType || 'unknown',
+    note: account.note || '',
+  };
+  accountEditOpen.value = true;
+}
+
+async function saveAccountEdit() {
+  const provider = selectedProvider.value;
+  if (!provider || !accountEditForm.value.id) return;
+  accountEditSaving.value = true;
+  try {
+    const res = await fetch(`/api/admin/accounts/${encodeURIComponent(accountEditForm.value.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        providerId: provider.id,
+        displayName: accountEditForm.value.displayName,
+        planType: accountEditForm.value.planType,
+        note: accountEditForm.value.note,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    accountEditOpen.value = false;
+    message.success('账号信息已更新');
+    await loadOnboarding();
+  } catch (error) {
+    message.error(error.message || String(error));
+  } finally {
+    accountEditSaving.value = false;
+  }
+}
+
 function openAdvanced(path) {
   window.location.href = path;
 }
@@ -462,7 +665,7 @@ onMounted(loadOnboarding);
           </div>
           <div class="stat-item">
             <span>已授权</span>
-            <strong>{{ onboarding.summary.authorizedDirectProviders }}</strong>
+            <strong>{{ onboarding.summary.authorizedProviders ?? onboarding.summary.authorizedDirectProviders }}</strong>
           </div>
         </div>
       </div>
@@ -498,10 +701,10 @@ onMounted(loadOnboarding);
             >
               <span class="provider-main">
                 <strong>{{ provider.name }}</strong>
-                <small>{{ providerModelCount(provider) }} 个已验证模型</small>
+                <small>{{ providerAccountCount(provider) }} 个账号 · {{ providerModelCount(provider) }} 个可用模型 ID</small>
               </span>
               <span class="provider-tags">
-                <a-tag v-if="provider.loginKind === 'direct' && provider.credential?.authorized" color="success">已授权</a-tag>
+                <a-tag v-if="isProviderAuthorized(provider)" color="success">已授权</a-tag>
                 <a-tag v-else-if="provider.loginKind === 'direct'" color="warning">未授权</a-tag>
                 <a-tag v-else color="blue">WebAI2API</a-tag>
               </span>
@@ -534,6 +737,79 @@ onMounted(loadOnboarding);
               <a-tag v-for="cap in capabilityLabels(selectedProvider)" :key="cap.label" :color="cap.color">
                 {{ cap.label }}
               </a-tag>
+            </div>
+
+            <div class="account-section">
+              <div class="section-title">
+                <div>
+                  <strong>授权账号</strong>
+                  <span>{{ currentAccount ? `当前使用：${currentAccount.displayName}` : '当前平台还没有检测到可用账号' }}</span>
+                </div>
+                <a-button
+                  size="small"
+                  :disabled="!currentAccount"
+                  :loading="accountActionId === `${currentAccount?.id}:validate`"
+                  @click="validateAccount(currentAccount)"
+                >
+                  <template #icon><ExperimentOutlined /></template>
+                  验证模型
+                </a-button>
+              </div>
+
+              <div v-if="selectedProviderAccounts.length" class="account-grid">
+                <article
+                  v-for="account in selectedProviderAccounts"
+                  :key="account.id"
+                  class="account-card"
+                  :class="{ current: account.current }"
+                >
+                  <div class="account-card-head">
+                    <div class="account-name">
+                      <strong>{{ account.displayName }}</strong>
+                      <small>{{ accountSourceLabel(account) }}</small>
+                    </div>
+                    <a-space :size="4" wrap>
+                      <a-tag :color="accountPlanColor(account.planType)">{{ accountPlanLabel(account.planType) }}</a-tag>
+                      <a-tag v-if="account.current" color="success">当前</a-tag>
+                      <a-tag v-else-if="account.authorized" color="blue">已授权</a-tag>
+                      <a-tag v-else color="warning">待登录</a-tag>
+                    </a-space>
+                  </div>
+
+                  <div class="account-meta">
+                    <span>{{ account.availableModelCount || 0 }} 个模型未失败</span>
+                    <span>{{ accountValidationSummary(account) }}</span>
+                    <span v-if="account.lastValidatedAt">最近验证 {{ new Date(account.lastValidatedAt).toLocaleString() }}</span>
+                  </div>
+
+                  <div class="account-actions">
+                    <a-button
+                      size="small"
+                      type="primary"
+                      ghost
+                      :disabled="account.current"
+                      :loading="accountActionId === account.id"
+                      @click="selectAccount(account)"
+                    >
+                      <template #icon><UserSwitchOutlined /></template>
+                      设为当前
+                    </a-button>
+                    <a-button
+                      size="small"
+                      :loading="accountActionId === `${account.id}:validate`"
+                      @click="validateAccount(account)"
+                    >
+                      <template #icon><ExperimentOutlined /></template>
+                      验证
+                    </a-button>
+                    <a-button size="small" @click="openAccountEditor(account)">
+                      <template #icon><EditOutlined /></template>
+                      编辑
+                    </a-button>
+                  </div>
+                </article>
+              </div>
+              <a-empty v-else image="simple" description="暂无已授权账号。登录完成并刷新后会显示在这里。" />
             </div>
 
             <a-alert
@@ -615,7 +891,7 @@ onMounted(loadOnboarding);
         <div class="panel-heading compact">
           <div>
             <h2>可用模型</h2>
-            <p>复制模型 ID 后，填到 KrisAI 或任何 OpenAI 兼容客户端。</p>
+            <p>当前账号验证失败的模型会标红；复制已验证或待验证模型 ID 后即可接入客户端。</p>
           </div>
           <a-segmented
             v-model:value="modelScope"
@@ -647,12 +923,22 @@ onMounted(loadOnboarding);
             <template v-else-if="column.key === 'capability'">
               <a-space :size="4" wrap>
                 <a-tag
-                  v-for="cap in capabilityLabels(providerForModel(record.id))"
+                  v-for="cap in modelCapabilityLabels(record)"
                   :key="cap.label"
                   :color="cap.color"
                 >
                   {{ cap.label }}
                 </a-tag>
+              </a-space>
+            </template>
+            <template v-else-if="column.key === 'availability'">
+              <a-space direction="vertical" :size="2">
+                <a-tag :color="modelAvailabilityTag(record.id).color">
+                  {{ modelAvailabilityTag(record.id).label }}
+                </a-tag>
+                <small v-if="modelAvailability(record.id).message" class="availability-message">
+                  {{ modelAvailability(record.id).message }}
+                </small>
               </a-space>
             </template>
             <template v-else-if="column.key === 'action'">
@@ -707,6 +993,39 @@ onMounted(loadOnboarding);
         <pre class="code-block">{{ clientConfig }}</pre>
       </section>
     </a-spin>
+
+    <a-modal
+      v-model:open="accountEditOpen"
+      title="编辑账号信息"
+      :confirm-loading="accountEditSaving"
+      ok-text="保存"
+      cancel-text="取消"
+      @ok="saveAccountEdit"
+    >
+      <a-space direction="vertical" style="width: 100%;">
+        <div class="field-block">
+          <label>账号显示名</label>
+          <a-input v-model:value="accountEditForm.displayName" placeholder="例如 GPT Plus 主账号" />
+        </div>
+        <div class="field-block">
+          <label>账号类型</label>
+          <a-select
+            v-model:value="accountEditForm.planType"
+            :options="[
+              { label: '未知权益', value: 'unknown' },
+              { label: 'Free', value: 'free' },
+              { label: 'Plus', value: 'plus' },
+              { label: 'Pro', value: 'pro' },
+              { label: 'Team', value: 'team' },
+            ]"
+          />
+        </div>
+        <div class="field-block">
+          <label>备注</label>
+          <a-textarea v-model:value="accountEditForm.note" :rows="3" placeholder="仅保存在 Gateway 本地 metadata，不保存凭证正文" />
+        </div>
+      </a-space>
+    </a-modal>
 
     <a-modal v-model:open="progressVisible" :title="progressTitle" :footer="null" width="620px">
       <a-alert
@@ -927,6 +1246,95 @@ onMounted(loadOnboarding);
   gap: 6px;
 }
 
+.account-section {
+  border-top: 1px solid #eef2f7;
+  display: grid;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.section-title {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.section-title strong,
+.section-title span {
+  display: block;
+}
+
+.section-title span {
+  color: #64748b;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.account-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.account-card {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.account-card:hover,
+.account-card.current {
+  border-color: #1677ff;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+  transform: translateY(-1px);
+}
+
+.account-card.current {
+  background: #f8fbff;
+}
+
+.account-card-head {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.account-name {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.account-name strong,
+.account-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-name small,
+.account-meta {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.account-meta {
+  display: grid;
+  gap: 4px;
+}
+
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .field-block {
   display: grid;
   gap: 8px;
@@ -945,6 +1353,13 @@ onMounted(loadOnboarding);
 .model-toolbar {
   margin-bottom: 12px;
   max-width: 420px;
+}
+
+.availability-message {
+  color: #64748b;
+  display: block;
+  max-width: 260px;
+  overflow-wrap: anywhere;
 }
 
 .config-grid {

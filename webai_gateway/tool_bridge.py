@@ -9,7 +9,7 @@ import shlex
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from webai_gateway.config import ToolBridgeConfig
 from webai_gateway.prompt_compaction import looks_like_current_request_control_text
@@ -73,6 +73,10 @@ _LEAKED_THINK_TAG_RE = re.compile(r"</?\s*think\s*>", re.IGNORECASE)
 _LEAKED_META_MARKER_RE = re.compile(
     r"<[|｜]\s*(?:assistant|tool|begin[_▁]of[_▁]sentence|end[_▁]of[_▁]sentence|"
     r"end[_▁]of[_▁]thinking|end[_▁]of[_▁]toolresults|end[_▁]of[_▁]instructions)\s*[|｜]>",
+    re.IGNORECASE,
+)
+_LEAKED_GENUI_MARKER_RE = re.compile(
+    r"[\ue000-\uf8ff]genui[\ue000-\uf8ff][A-Za-z0-9_-]{0,80}[\ue000-\uf8ff]\s*",
     re.IGNORECASE,
 )
 _LEAKED_AGENT_XML_BLOCK_RE = re.compile(
@@ -192,6 +196,17 @@ _TOOL_ENV_DENIAL_RE = re.compile(
     r"(?:(?:您|你)的)?\s*(?:项目|代码库|本地|任何)?\s*(?:文件系统|文件|代码库|项目文件|工具|操作工具|命令|git命令|终端|shell|bash)|"
     r"(?:系统|环境).{0,24}(?:限制|禁止).{0,24}(?:文件系统|工具|操作工具|命令|git|bash))",
     re.IGNORECASE,
+)
+_WEB_ACCESS_DENIAL_RE = re.compile(
+    r"("
+    r"(?:as\s+(?:a\s+)?(?:stateless\s+)?ai\s+assistant[,，]?\s*)?"
+    r"(?:(?:i|we)\s+(?:cannot|can't|am\s+unable\s+to|are\s+unable\s+to)|"
+    r"(?:do\s+not|don't)\s+have\s+access\s+to|no\s+access\s+to)"
+    r".{0,120}(?:real[-\s]?time|live|current|today'?s|latest|internet|web|online|news|external\s+sources?|data)"
+    r"|(?:无法|不能|不可|没有权限|无权限|不能够|无法直接|不能直接)"
+    r".{0,80}(?:实时|今天|最新|互联网|联网|网络|网页|新闻源|新闻资讯|外部(?:信息|来源|数据)|数据)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
 )
 _DEFERRED_TOOL_ACTION_RE = re.compile(
     r"("
@@ -499,7 +514,7 @@ _SHELL_READONLY_GIT_HOUSEKEEPING_MARKERS = (
     " status",
 )
 _SHELL_FILE_DISCOVERY_HOUSEKEEPING_RE = re.compile(
-    r"(?:^|[;&|]\s*)(?:find|fd|ls|dir|get-childitem)\b|(?:^|[;&|]\s*)rg\s+--files\b",
+    r"(?:^|[;&|]\s*)(?:awk|cat|dir|fd|find|gc|get-content|get-childitem|grep|head|ls|rg|sed|select-string|tail|type)\b",
     re.IGNORECASE,
 )
 _LOCAL_AGENT_TOOL_NAMES = frozenset(
@@ -519,6 +534,7 @@ _LOCAL_AGENT_TOOL_NAMES = frozenset(
         "write",
     }
 )
+_DELEGATION_TOOL_NAMES = frozenset({"agent", "subagent", "subagenttask", "task", "explore", "explorer"})
 _PROMPT_BRIDGE_BLOCKED_TOOL_NAMES = frozenset(
     {
         "terminal",
@@ -1399,24 +1415,25 @@ def prepare_openai_messages(messages: list[dict[str, Any]], context: ToolBridgeC
     if not context.enabled:
         return [message for message in messages if isinstance(message, dict)]
     prompt = build_tool_prompt(context.tools, context.options)
+    policy_prompt = _tool_choice_policy_prompt(context)
+    if policy_prompt:
+        prompt = f"{prompt.rstrip()}\n{policy_prompt}".strip()
     call_names = _assistant_tool_call_names(messages)
     converted = [_convert_message(message, call_names=call_names, options=context.options) for message in messages if isinstance(message, dict)]
+    task_messages = _messages_for_current_human_task(messages)
     if not _allows_ds2api_style_progress_passthrough(context):
-        task_messages = _messages_for_current_human_task(messages)
         loop_guard = _tool_loop_guard_message(task_messages)
         if loop_guard:
             converted.append({"role": "user", "content": loop_guard})
         repeat_skill_guard = _repeat_skill_guard_message(task_messages)
         if repeat_skill_guard:
             converted.append({"role": "user", "content": repeat_skill_guard})
-    task_messages = _messages_for_current_human_task(messages)
     failed_path_guard = _failed_path_tool_result_guard_message(task_messages, context)
     if failed_path_guard:
         converted.append({"role": "user", "content": failed_path_guard})
-    if not _allows_ds2api_style_progress_passthrough(context):
-        unchanged_read_guard = _unchanged_read_tool_result_guard_message(task_messages, context)
-        if unchanged_read_guard:
-            converted.append({"role": "user", "content": unchanged_read_guard})
+    unchanged_read_guard = _unchanged_read_tool_result_guard_message(task_messages, context)
+    if unchanged_read_guard:
+        converted.append({"role": "user", "content": unchanged_read_guard})
     boundary_guard = _new_task_boundary_guard_message(messages, context)
     if boundary_guard:
         converted.append({"role": "user", "content": boundary_guard})
@@ -1426,9 +1443,28 @@ def prepare_openai_messages(messages: list[dict[str, Any]], context: ToolBridgeC
     return [{"role": "system", "content": prompt}, *converted]
 
 
+def _tool_choice_policy_prompt(context: ToolBridgeContext) -> str:
+    policy = context.tool_choice_policy
+    mode = str(policy.mode or "").strip().lower()
+    if mode == "required":
+        return "\n7) For this response, you MUST call at least one tool from the allowed list."
+    if mode == "forced":
+        forced_name = str(policy.forced_name or "").strip()
+        if not forced_name and len(context.tools) == 1:
+            forced_name = context.tools[0].name
+        if forced_name:
+            return (
+                f"\n7) For this response, you MUST call exactly this tool name: {forced_name}\n"
+                "8) Do not call any other tool."
+            )
+    return ""
+
+
 def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: ToolBridgeConfig | None = None) -> str:
     cfg = options or ToolBridgeConfig()
     specs = [_coerce_spec(item) for item in tools]
+    if _configured_tool_profile(cfg) == "all":
+        return _build_ds2api_tool_prompt(specs, cfg)
     functions = [
         {
             "name": spec.name,
@@ -1448,6 +1484,7 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
         else ""
     )
     read_cache_guard_rule = _read_tool_cache_guard_rule() if _has_read_like_prompt_tool(specs) else ""
+    bash_shell_dialect_guard_rule = _bash_shell_dialect_guard_rule() if _has_bash_like_prompt_tool(specs) else ""
     return (
         "You are using WebAI Gateway's strict tool bridge. You are allowed to request the downstream client to execute listed tools; "
         "do not confuse this with executing tools inside the web model runtime yourself.\n\n"
@@ -1464,6 +1501,7 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
         "- If a Tool result says is_error: true, do not treat it as successful data. Choose a different allowed tool/input if recovery is possible; otherwise explain the failure briefly.\n"
         f"{code_change_rule}"
         f"{read_cache_guard_rule}"
+        f"{bash_shell_dialect_guard_rule}"
         "- For Glob/file-discovery tools, avoid repository-wide recursive patterns such as **/*, **/*.ext, or **/package.json unless the input also scopes the search to a narrow path. Prefer Read for known files, LS/list tools for directory overviews, or scoped patterns like src/**/*.py.\n"
         "- For public GitHub repository or source-code URLs, prefer machine-readable endpoints such as https://api.github.com/repos/<owner>/<repo>, the GitHub contents API, or raw.githubusercontent.com files instead of interactive HTML pages.\n\n"
         "Required tool-call format:\n"
@@ -1480,10 +1518,125 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
     )
 
 
+def _build_ds2api_tool_prompt(specs: list[ToolSpec], options: ToolBridgeConfig) -> str:
+    tool_schemas = _ds2api_tool_schema_blocks(specs, compact=False)
+    if not tool_schemas:
+        return ""
+    prompt = _compose_ds2api_tool_prompt(specs, tool_schemas)
+    max_chars = max(2000, int(options.tool_prompt_max_chars or 12000))
+    if len(prompt) <= max_chars:
+        return prompt
+    compact_prompt = _compose_ds2api_tool_prompt(
+        specs,
+        _ds2api_tool_schema_blocks(specs, compact=True),
+        compacted=True,
+    )
+    return compact_prompt if len(compact_prompt) <= max_chars else compact_prompt[:max_chars]
+
+
+def _ds2api_tool_schema_blocks(specs: list[ToolSpec], *, compact: bool) -> list[str]:
+    blocks: list[str] = []
+    names: list[str] = []
+    for spec in specs:
+        name = (spec.name or "").strip()
+        if not name:
+            continue
+        names.append(name)
+        description = spec.description or "No description available"
+        if compact:
+            description = "Compacted to fit prompt budget"
+            schema: dict[str, Any] = {"type": "object"}
+        else:
+            schema = spec.input_schema if isinstance(spec.input_schema, dict) else {"type": "object"}
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        blocks.append(f"Tool: {name}\nDescription: {description}\nParameters: {schema_text}")
+    return blocks
+
+
+def _compose_ds2api_tool_prompt(
+    specs: list[ToolSpec],
+    tool_schemas: list[str],
+    *,
+    compacted: bool = False,
+) -> str:
+    names = [spec.name for spec in specs if (spec.name or "").strip()]
+    prompt = (
+        "You have access to these tools:\n\n"
+        + "\n\n".join(tool_schemas)
+        + "\n\n"
+        + _build_ds2api_tool_call_instructions(names)
+    )
+    if compacted:
+        prompt = (
+            "Tool prompt manifest was compacted to fit the web model prompt budget. "
+            "All real tool names remain listed; use the request schemas as authoritative.\n\n"
+            f"Available tool names: {', '.join(_unique_tool_names(names))}\n\n"
+            + prompt
+        )
+    if _has_read_like_prompt_tool(specs):
+        prompt += (
+            "\n\nRead-tool cache guard: If a Read/read_file-style tool result says the file is unchanged, "
+            "already available in history, should be referenced from previous context, or otherwise provides no file body, "
+            "treat that result as missing content. Do not repeatedly call the same read request for that missing body. "
+            "Request a full-content read if the tool supports it, or tell the user that the file contents need to be provided again."
+        )
+    if _has_bash_like_prompt_tool(specs):
+        prompt += "\n\n" + _bash_shell_dialect_guard_rule().strip()
+    return prompt
+
+
+def _build_ds2api_tool_call_instructions(tool_names: list[str]) -> str:
+    return (
+        "TOOL CALL FORMAT - FOLLOW EXACTLY:\n\n"
+        "<|DSML|tool_calls>\n"
+        "  <|DSML|invoke name=\"TOOL_NAME_HERE\">\n"
+        "    <|DSML|parameter name=\"PARAMETER_NAME\"><![CDATA[PARAMETER_VALUE]]></|DSML|parameter>\n"
+        "  </|DSML|invoke>\n"
+        "</|DSML|tool_calls>\n\n"
+        "RULES:\n"
+        "1) Use the <|DSML|tool_calls> wrapper format.\n"
+        "2) Put one or more <|DSML|invoke> entries under a single <|DSML|tool_calls> root.\n"
+        "3) Put the tool name in the invoke name attribute: <|DSML|invoke name=\"TOOL_NAME\">.\n"
+        "4) All string values must use <![CDATA[...]]>, even short ones. This includes code, scripts, file contents, prompts, paths, names, and queries.\n"
+        "5) Every top-level argument must be a <|DSML|parameter name=\"ARG_NAME\">...</|DSML|parameter> node.\n"
+        "6) Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.\n"
+        "7) Numbers, booleans, and null stay plain text.\n"
+        "8) Use only the parameter names in the tool schema. Do not invent fields.\n"
+        "9) Do NOT wrap XML in markdown fences. Do NOT output explanations, role markers, or internal monologue.\n"
+        "10) If you call a tool, the first non-whitespace characters of that tool block must be exactly <|DSML|tool_calls>.\n"
+        "11) Never omit the opening <|DSML|tool_calls> tag, even if you already plan to close with </|DSML|tool_calls>.\n"
+        "12) Compatibility note: the runtime also accepts the legacy XML tags <tool_calls> / <invoke> / <parameter>, but prefer the DSML-prefixed form above.\n\n"
+        "PARAMETER SHAPES:\n"
+        "- string => <|DSML|parameter name=\"x\"><![CDATA[value]]></|DSML|parameter>\n"
+        "- object => <|DSML|parameter name=\"x\"><field>...</field></|DSML|parameter>\n"
+        "- array => <|DSML|parameter name=\"x\"><item>...</item><item>...</item></|DSML|parameter>\n"
+        "- number/bool/null => <|DSML|parameter name=\"x\">plain_text</|DSML|parameter>\n\n"
+        "[WRONG - Do NOT do these]\n\n"
+        "Wrong 1 - mixed text after XML:\n"
+        "  <|DSML|tool_calls>...</|DSML|tool_calls> I hope this helps.\n"
+        "Wrong 2 - Markdown code fences:\n"
+        "  ```xml\n"
+        "  <|DSML|tool_calls>...</|DSML|tool_calls>\n"
+        "  ```\n"
+        "Wrong 3 - missing opening wrapper:\n"
+        "  <|DSML|invoke name=\"TOOL_NAME\">...</|DSML|invoke>\n"
+        "  </|DSML|tool_calls>\n\n"
+        "Remember: The ONLY valid way to use tools is the <|DSML|tool_calls>...</|DSML|tool_calls> block at the end of your response.\n\n"
+        + _build_ds2api_style_tool_examples_from_names(tool_names)
+    )
+
+
 def _has_read_like_prompt_tool(specs: list[ToolSpec]) -> bool:
     for spec in specs:
         compact = _compact_tool_name(spec.name)
         if compact in {"read", "readfile", "fileread"}:
+            return True
+    return False
+
+
+def _has_bash_like_prompt_tool(specs: list[ToolSpec]) -> bool:
+    for spec in specs:
+        if _is_bash_tool_name(spec.name):
             return True
     return False
 
@@ -1497,21 +1650,43 @@ def _read_tool_cache_guard_rule() -> str:
     )
 
 
+def _bash_shell_dialect_guard_rule() -> str:
+    return (
+        "- Bash shell dialect guard: Bash tool commands are executed by a Bash-compatible shell, not by PowerShell or cmd.exe. "
+        "Do not use PowerShell/cmd syntax or executables such as pwsh, powershell, if exist (...) else (...), dir /s, copy, or del unless a prior tool result proves that shell exists. "
+        "Use Bash/POSIX-compatible checks such as [ -d <path> ], test -d <path>, git -C <path> status, and find/rg for discovery. "
+        "If a Bash tool result says command not found, syntax error, or destination already exists, stop. Do not retry the same failed Bash command; inspect the current state and choose a different Bash-compatible command or explain the blocker.\n"
+    )
+
+
 def _build_ds2api_style_tool_examples(specs: list[ToolSpec]) -> str:
+    return _build_ds2api_style_tool_examples_from_specs(specs, header="Correct DSML examples")
+
+
+def _build_ds2api_style_tool_examples_from_names(tool_names: list[str]) -> str:
+    return _build_ds2api_style_tool_examples_from_specs(
+        [ToolSpec(name=name, description="", input_schema={}, read_only=False) for name in _unique_tool_names(tool_names)],
+        header="[CORRECT EXAMPLES]",
+    )
+
+
+def _build_ds2api_style_tool_examples_from_specs(specs: list[ToolSpec], *, header: str) -> str:
     examples: list[str] = []
-    basic = _first_ds2api_style_example(specs)
-    if basic:
-        examples.append("Example A - Single tool:\n" + basic)
-    pair = [_ds2api_style_example_for_tool(spec) for spec in specs[:2]]
-    pair = [item for item in pair if item]
-    if len(pair) >= 2:
-        examples.append("Example B - Two tools in parallel:\n" + _render_ds2api_style_tool_block(pair[:2]))
+    basic_examples = [_ds2api_style_example_for_tool(spec) for spec in specs]
+    basic_examples = [item for item in basic_examples if item]
+    if basic_examples:
+        examples.append("Example A - Single tool:\n" + _render_ds2api_style_tool_block([basic_examples[0]]))
+    if len(basic_examples) >= 2:
+        examples.append("Example B - Two tools in parallel:\n" + _render_ds2api_style_tool_block(basic_examples[:2]))
+    nested = next((item for item in (_ds2api_style_nested_example_for_tool(spec) for spec in specs) if item), None)
+    if nested:
+        examples.append("Example C - Tool with nested XML parameters:\n" + _render_ds2api_style_tool_block([nested]))
     script = next((item for item in (_ds2api_style_script_example_for_tool(spec) for spec in specs) if item), "")
     if script:
-        examples.append("Example C - Tool with long script using CDATA:\n" + script)
+        examples.append("Example D - Tool with long script using CDATA (RELIABLE FOR CODE/SCRIPTS):\n" + script)
     if not examples:
         return ""
-    return "\nCorrect DSML examples:\n\n" + "\n\n".join(examples) + "\n\n"
+    return f"{header}\n\n" + "\n\n".join(examples) + "\n\n"
 
 
 def _first_ds2api_style_example(specs: list[ToolSpec]) -> str:
@@ -1532,22 +1707,101 @@ def _ds2api_style_example_for_tool(spec: ToolSpec) -> tuple[str, list[tuple[str,
         return (spec.name, [(_first_schema_property_name(spec, ("file_path", "path")) or "file_path", "README.md")])
     if compact in {"glob", "grep", "searchfiles", "listfiles", "ls", "listdir", "lsp"} or "search" in compact:
         key = _first_schema_property_name(spec, ("pattern", "query", "path")) or "query"
-        value = "**/*.py" if key == "pattern" else "tool call parser"
+        value = "**/*.go" if key == "pattern" else ("." if key == "path" else "tool call parser")
         return (spec.name, [(key, value)])
-    if compact in {"edit", "write", "multiedit", "applypatch"}:
-        return (spec.name, [(_first_schema_property_name(spec, ("file_path", "path")) or "file_path", "README.md")])
-    return (spec.name, [])
+    if compact == "write":
+        return (
+            spec.name,
+            [
+                (_first_schema_property_name(spec, ("file_path", "path")) or "file_path", "notes.txt"),
+                (_first_schema_property_name(spec, ("content",)) or "content", "Hello world"),
+            ],
+        )
+    if compact == "writetofile":
+        return (
+            spec.name,
+            [
+                (_first_schema_property_name(spec, ("path", "file_path")) or "path", "notes.txt"),
+                (_first_schema_property_name(spec, ("content",)) or "content", "Hello world"),
+            ],
+        )
+    if compact == "edit":
+        return (
+            spec.name,
+            [
+                (_first_schema_property_name(spec, ("file_path", "path")) or "file_path", "README.md"),
+                (_first_schema_property_name(spec, ("old_string", "oldString", "old")) or "old_string", "foo"),
+                (_first_schema_property_name(spec, ("new_string", "newString", "new")) or "new_string", "bar"),
+            ],
+        )
+    if compact == "multiedit":
+        return None
+    return None
+
+
+def _ds2api_style_nested_example_for_tool(spec: ToolSpec) -> tuple[str, list[tuple[str, str]]] | None:
+    compact = _compact_tool_name(spec.name)
+    if compact == "multiedit":
+        return (
+            spec.name,
+            [
+                (_first_schema_property_name(spec, ("file_path", "path")) or "file_path", "README.md"),
+                ("edits", "<item><old_string><![CDATA[foo]]></old_string><new_string><![CDATA[bar]]></new_string></item>"),
+            ],
+        )
+    if compact in {"task", "agent", "subagent"}:
+        return (
+            spec.name,
+            [
+                (_first_schema_property_name(spec, ("description",)) or "description", "Investigate flaky tests"),
+                (_first_schema_property_name(spec, ("prompt",)) or "prompt", "Run targeted tests and summarize failures"),
+            ],
+        )
+    if compact == "askfollowupquestion":
+        return (
+            spec.name,
+            [
+                ("question", "Which approach do you prefer?"),
+                ("follow_up", "<item><text><![CDATA[Option A]]></text></item><item><text><![CDATA[Option B]]></text></item>"),
+            ],
+        )
+    return None
 
 
 def _ds2api_style_script_example_for_tool(spec: ToolSpec) -> str:
     compact = _compact_tool_name(spec.name)
-    if compact not in {"bash", "executecommand", "execcommand", "exec", "execute", "shell", "terminal", "command", "runcommand"}:
-        return ""
     script = "cat > /tmp/test_escape.sh <<'EOF'\n#!/bin/bash\necho 'single \"double\"'\necho \"literal dollar: $HOME\"\nEOF\nbash /tmp/test_escape.sh"
-    params = [(_shell_command_key(spec), script)]
-    if _schema_has_property(spec, "description"):
-        params.append(("description", "Test shell escaping"))
-    return _render_ds2api_style_tool_block([(spec.name, params)])
+    script_content = "#!/bin/bash\necho 'single \"double\"'\necho \"literal dollar: $HOME\""
+    if compact in {"bash", "executecommand", "execcommand", "exec", "execute", "shell", "terminal", "command", "runcommand"}:
+        params = [(_shell_command_key(spec), script)]
+        if _schema_has_property(spec, "description"):
+            params.append(("description", "Test shell escaping"))
+        return _render_ds2api_style_tool_block([(spec.name, params)])
+    if compact == "write":
+        return _render_ds2api_style_tool_block(
+            [
+                (
+                    spec.name,
+                    [
+                        (_first_schema_property_name(spec, ("file_path", "path")) or "file_path", "test_escape.sh"),
+                        (_first_schema_property_name(spec, ("content",)) or "content", script_content),
+                    ],
+                )
+            ]
+        )
+    if compact == "writetofile":
+        return _render_ds2api_style_tool_block(
+            [
+                (
+                    spec.name,
+                    [
+                        (_first_schema_property_name(spec, ("path", "file_path")) or "path", "test_escape.sh"),
+                        (_first_schema_property_name(spec, ("content",)) or "content", script_content),
+                    ],
+                )
+            ]
+        )
+    return ""
 
 
 def _render_ds2api_style_tool_block(examples: list[tuple[str, list[tuple[str, str]]]]) -> str:
@@ -1555,12 +1809,28 @@ def _render_ds2api_style_tool_block(examples: list[tuple[str, list[tuple[str, st
     for name, params in examples:
         lines.append(f'  <|DSML|invoke name="{html.escape(name, quote=True)}">')
         for key, value in params:
-            lines.append(
-                f'    <|DSML|parameter name="{html.escape(key, quote=True)}"><![CDATA[{value}]]></|DSML|parameter>'
-            )
+            rendered = value if _looks_like_ds2api_nested_example_value(value) else _dsml_cdata(value)
+            lines.append(f'    <|DSML|parameter name="{html.escape(key, quote=True)}">{rendered}</|DSML|parameter>')
         lines.append("  </|DSML|invoke>")
     lines.append("</|DSML|tool_calls>")
     return "\n".join(lines)
+
+
+def _looks_like_ds2api_nested_example_value(value: str) -> bool:
+    stripped = (value or "").lstrip()
+    return stripped.startswith("<item>") or stripped.startswith("<field>")
+
+
+def _unique_tool_names(tool_names: list[str]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in tool_names:
+        name = str(raw_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
 
 
 def _first_schema_property_name(spec: ToolSpec, names: tuple[str, ...]) -> str:
@@ -2262,7 +2532,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
             error = BridgeError(
                 "tool_choice_violation",
                 "tool_choice requires at least one valid tool call.",
-                repairable=False,
+                repairable=True,
             )
         phase_names = {phase.name for phase in phases}
         if error is not None and "parse/normalize" not in phase_names:
@@ -2307,7 +2577,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
             candidates.append(item)
     used_dsml_tool_calls = False
     if not candidates:
-        dsml_candidates = _extract_dsml_tool_call_candidates(raw)
+        dsml_candidates = _extract_dsml_tool_call_candidates(raw, context)
         if dsml_candidates:
             candidates.extend(dsml_candidates)
             used_dsml_tool_calls = True
@@ -2381,12 +2651,20 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
         if shell_candidates:
             candidates.extend(shell_candidates)
             used_unwrapped_shell = True
+    used_forced_marker_recovery = False
+    if not candidates:
+        forced_marker_candidate = _forced_single_tool_marker_candidate(raw, context)
+        if forced_marker_candidate:
+            candidates.append(forced_marker_candidate)
+            used_forced_marker_recovery = True
     if not candidates:
         record_phase("extract", "ok", "plain_text/no_candidate")
         warning = "tool_result_claim_without_tool_call" if _TOOL_RESULT_CLAIM_RE.search(raw) else None
-        if _allows_ds2api_style_agent_guard_passthrough(context):
-            return finish(content=raw, tool_calls=[], warning=warning, raw_content=raw)
         fenced_shell_commands = _extract_fenced_shell_command_lines(raw)
+        if _allows_ds2api_style_agent_guard_passthrough(
+            context
+        ) and not _plain_text_requires_tool_recovery_before_ds2api_passthrough(raw, context, fenced_shell_commands):
+            return finish(content=raw, tool_calls=[], warning=warning, raw_content=raw)
         if echoed_tool_history:
             return finish(
                 content=raw,
@@ -2632,6 +2910,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
         or used_bare_function_call
         or used_provider_search
         or used_unwrapped_shell
+        or used_forced_marker_recovery
     ):
         return finish(content="", tool_calls=normalized, raw_content=raw)
     clean = _FENCED_TOOL_RE.sub("", raw)
@@ -2838,6 +3117,7 @@ def sanitize_leaked_tool_protocol_output(text: str) -> str:
     out = _strip_dangling_think_suffix(out)
     out = _LEAKED_THINK_TAG_RE.sub("", out)
     out = _LEAKED_META_MARKER_RE.sub("", out)
+    out = _LEAKED_GENUI_MARKER_RE.sub("", out)
     out = _strip_leaked_tool_call_wrapper_blocks(out)
     out = _sanitize_leaked_agent_xml_blocks(out)
     return out
@@ -2907,7 +3187,7 @@ def _has_dsml_tool_call_syntax(text: str) -> bool:
     return bool(_extract_dsml_tool_call_blocks(text))
 
 
-def _extract_dsml_tool_call_candidates(text: str) -> list[dict[str, Any]]:
+def _extract_dsml_tool_call_candidates(text: str, context: ToolBridgeContext | None = None) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for block in _extract_dsml_tool_call_blocks(text):
         normalized_block = _normalize_dsml_tool_tags(block)
@@ -2920,6 +3200,8 @@ def _extract_dsml_tool_call_candidates(text: str) -> list[dict[str, Any]]:
             for _start, _end, attrs, body in _find_xml_element_blocks(candidate_block, "invoke"):
                 invoke_attrs = _legacy_attrs(attrs)
                 name = str(invoke_attrs.get("name") or invoke_attrs.get("tool") or invoke_attrs.get("function") or "").strip()
+                if not name:
+                    name = _single_allowed_tool_name_for_malformed_dsml(context)
                 if not name:
                     continue
                 input_value = _xml_invoke_input(body)
@@ -2938,6 +3220,103 @@ def _extract_dsml_tool_call_candidates(text: str) -> list[dict[str, Any]]:
                 candidates.extend(block_candidates)
                 break
     return candidates
+
+
+def _single_allowed_tool_name_for_malformed_dsml(context: ToolBridgeContext | None) -> str:
+    if context is None:
+        return ""
+    names = [tool.name for tool in context.tools if tool.name in context.allowed_names]
+    if len(names) != 1:
+        return ""
+    policy = getattr(context, "tool_choice_policy", None)
+    is_required = getattr(policy, "is_required", None)
+    if callable(is_required) and not is_required():
+        return ""
+    return names[0]
+
+
+def _forced_single_tool_marker_candidate(raw: str, context: ToolBridgeContext) -> dict[str, Any] | None:
+    name = _single_allowed_tool_name_for_malformed_dsml(context)
+    if not name or not _looks_like_malformed_single_tool_marker(raw):
+        return None
+    spec = _tool_by_name(context.tools, name)
+    schema = spec.input_schema if spec and isinstance(spec.input_schema, dict) else {}
+    inferred = _infer_single_tool_input_from_task(schema, context.task_text)
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if isinstance(required, list) and required and not inferred:
+        return None
+    return {"name": name, "input": inferred}
+
+
+def _looks_like_malformed_single_tool_marker(raw: str) -> bool:
+    lowered = (raw or "").lower()
+    if "<" not in lowered:
+        return False
+    if not any(marker in lowered for marker in ("tool_calls", "tool-calls", "invoke", "parameter")):
+        return False
+    return "dsml" in lowered or "ml|" in lowered or "|ml" in lowered or "<|" in lowered
+
+
+def _infer_single_tool_input_from_task(schema: dict[str, Any], task_text: str) -> dict[str, Any]:
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    keys = [str(key) for key in required if isinstance(key, str)]
+    if not keys and len(properties) == 1:
+        keys = [str(next(iter(properties)))]
+    inferred: dict[str, Any] = {}
+    for key in keys[:8]:
+        value = _infer_single_tool_value_from_task(key, properties.get(key), task_text)
+        if value is not None:
+            inferred[key] = value
+    return inferred
+
+
+def _infer_single_tool_value_from_task(key: str, schema: Any, task_text: str) -> Any | None:
+    named = _named_tool_argument_from_task(key, task_text)
+    if named:
+        return named
+    compact = _compact_tool_name(key)
+    if compact in {"city", "location", "place"}:
+        place = _place_argument_from_task(task_text)
+        if place:
+            return place
+    schema_type = ""
+    if isinstance(schema, dict):
+        raw_type = schema.get("type")
+        schema_type = str(raw_type[0] if isinstance(raw_type, list) and raw_type else raw_type or "").lower()
+    if schema_type in {"integer", "number"}:
+        number_match = re.search(r"-?\d+(?:\.\d+)?", task_text or "")
+        if number_match:
+            return float(number_match.group(0)) if "." in number_match.group(0) else int(number_match.group(0))
+    if schema_type == "boolean":
+        lowered = (task_text or "").lower()
+        if "true" in lowered:
+            return True
+        if "false" in lowered:
+            return False
+    return None
+
+
+def _named_tool_argument_from_task(key: str, task_text: str) -> str:
+    if not key or not task_text:
+        return ""
+    pattern = re.compile(
+        rf"(?i)\b{re.escape(key)}\b\s*(?:=|:|is|with|为|是)?\s*([A-Za-z][A-Za-z0-9_. -]{{0,60}})"
+    )
+    match = pattern.search(task_text)
+    if not match:
+        return ""
+    value = re.split(r"[.;,!?，。；！？\n]", match.group(1).strip(), maxsplit=1)[0].strip()
+    return value[:80]
+
+
+def _place_argument_from_task(task_text: str) -> str:
+    for match in re.finditer(r"\b([A-Z][a-zA-Z]{2,40}(?:\s+[A-Z][a-zA-Z]{2,40}){0,3})\b", task_text or ""):
+        value = match.group(1).strip()
+        if value.lower() in {"call", "tool", "weather", "city", "do", "not", "answer"}:
+            continue
+        return value
+    return ""
 
 
 def _extract_dsml_tool_call_blocks(text: str) -> list[str]:
@@ -3215,9 +3594,11 @@ def _dsml_local_tag_from_body(body: str) -> tuple[str, int] | None:
                 continue
             prefix = lowered[: match.start()]
             noise = prefix.replace("dsml", "").replace("|", "").replace("-", "").replace("_", "").strip()
+            if noise == "ml":
+                noise = ""
             if noise:
                 continue
-            if dsml_only and "dsml" not in prefix:
+            if dsml_only and "dsml" not in prefix and "ml" not in prefix:
                 continue
             return tag, match.end()
     return None
@@ -4078,7 +4459,7 @@ def _current_human_task_start_index(messages: list[Any]) -> int:
             continue
         if fallback < 0:
             fallback = index
-        if not _looks_like_continuation_task(text):
+        if not _looks_like_task_continuation_followup(text):
             return index
     return fallback
 
@@ -4193,10 +4574,10 @@ def _effective_human_task_text(messages: Any) -> str:
     local_project_context = _recent_local_project_context_anchor(messages, latest)
     if local_project_context:
         return f"{local_project_context}\nLatest user request: {latest.strip()}".strip()
-    if not (_looks_like_continuation_task(latest) or _looks_like_search_followup_task(latest)):
+    if not _looks_like_task_continuation_followup(latest):
         return latest
     for text in texts[1:]:
-        if text.strip() and not (_looks_like_continuation_task(text) or _looks_like_search_followup_task(text)):
+        if text.strip() and not _looks_like_task_continuation_followup(text):
             return f"{text.strip()}\n{latest.strip()}".strip()
     return latest
 
@@ -4573,6 +4954,65 @@ def _looks_like_continuation_task(text: str) -> bool:
     return any(value.startswith(prefix) for prefix in prefixes)
 
 
+def _looks_like_task_continuation_followup(text: str) -> bool:
+    return (
+        _looks_like_continuation_task(text)
+        or _looks_like_search_followup_task(text)
+        or _looks_like_direct_action_followup_task(text)
+    )
+
+
+def _looks_like_direct_action_followup_task(text: str) -> bool:
+    value = re.sub(r"\s+", " ", (text or "").strip().lower())
+    value = value.strip(" \t\r\n\u3002\uff0c,!.!?\uff01\uff1f")
+    if not value or len(value) > 48 or _WINDOWS_DRIVE_PATH_RE.search(value):
+        return False
+    if "/" in value or "\\" in value or re.search(r"\.[a-z0-9]{1,12}\b", value):
+        return False
+    exact_markers = {
+        "\u4f60\u76f4\u63a5\u4fee\u6539",
+        "\u76f4\u63a5\u4fee\u6539",
+        "\u76f4\u63a5\u6539",
+        "\u52a8\u624b\u6539",
+        "\u5f00\u59cb\u6539",
+        "\u7ee7\u7eed\u6539",
+        "\u53bb\u6539",
+        "\u7167\u8fd9\u4e2a\u6539",
+        "\u6309\u8fd9\u4e2a\u6539",
+        "\u5c31\u8fd9\u4e48\u6539",
+        "\u843d\u5730\u5427",
+        "\u5f00\u59cb\u6267\u884c",
+        "\u76f4\u63a5\u6267\u884c",
+        "\u5f00\u59cb\u505a",
+        "\u76f4\u63a5\u505a",
+        "\u505a\u5427",
+        "\u52a8\u624b\u505a",
+        "\u5f00\u59cb",
+        "\u52a8\u624b",
+        "do it",
+        "just do it",
+        "go ahead",
+        "proceed",
+        "make the change",
+        "apply it",
+        "implement it",
+        "change it",
+        "modify it",
+        "start implementing",
+    }
+    if value in exact_markers:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:\u4f60|\u8bf7|\u9ebb\u70e6\u4f60|\u90a3\u5c31|\u53ef\u4ee5)?"
+            r"(?:\u76f4\u63a5|\u7ee7\u7eed|\u5f00\u59cb|\u52a8\u624b)?"
+            r"(?:\u4fee\u6539|\u6539|\u6267\u884c|\u505a|\u843d\u5730)"
+            r"(?:\u5427|\u554a|\u4e00\u4e0b|\u5c31\u884c|\u597d\u4e86)?",
+            value,
+        )
+    )
+
+
 def _looks_like_referential_followup_task(value: str) -> bool:
     if len(value) > 260:
         return False
@@ -4897,6 +5337,8 @@ def _is_allowed_tool_denial(text: str, context: ToolBridgeContext) -> bool:
     for match in _CJK_TOOL_DENIAL_RE.finditer(raw):
         if match.group("name").strip().lower() in allowed_lower:
             return True
+    if _WEB_ACCESS_DENIAL_RE.search(raw) and _select_provider_search_tool(context) is not None:
+        return True
     if not _TOOL_ENV_DENIAL_RE.search(raw):
         return False
     lowered = raw.lower()
@@ -5395,15 +5837,17 @@ def build_repair_messages(messages: list[dict[str, Any]], bad_text: str, error: 
             {"role": "assistant", "content": (bad_text or "")[:4000]},
             {"role": "user", "content": repair_instruction},
         ]
-    if error_kind == "repeat_read_call_without_progress":
+    if error_kind in {"repeat_read_call_without_progress", "repeat_unchanged_read_without_progress"}:
         repair_instruction = (
-            "Previous tool JSON repeated a Read call that already returned evidence in this conversation.\n"
+            "Previous tool JSON repeated a Read/read-cache call that already returned evidence in this conversation.\n"
             f"Error code: {error_kind}.\n"
             f"Error: {reason}.\n"
             "Do not request the same Read input again unless a file-changing tool has run since then. "
-            "Use the earlier Read result already in the conversation. If more evidence is required, request exactly "
-            "one materially different file, range, or allowed tool/input. If the evidence is enough, provide a "
-            "substantive final answer with no DSML tool block."
+            "If the latest Read result says unchanged/already in history/no file body, use the earlier Read result "
+            "already in the conversation. If a later recovery message temporarily marks Read or Glob unavailable, "
+            "obey that availability override even if the original tool manifest listed them. If the evidence is enough, "
+            "request an allowed progress tool such as Edit/MultiEdit/Write or provide a substantive final answer with no DSML tool block. "
+            "Only request another evidence tool when it is materially different and still allowed for this recovery turn."
         )
         return [
             *messages,
@@ -5417,9 +5861,33 @@ def build_repair_messages(messages: list[dict[str, Any]], bad_text: str, error: 
             f"Error: {reason}.\n"
             "Do not request another equivalent Bash/shell git status, git diff, git log, file listing, or file discovery "
             "command unless a file-changing tool has run since then. Use the earlier result already in the conversation. "
-            "If more evidence is required, request exactly one materially different allowed tool/input. Prefer Read/Grep/Glob "
-            "for inspection or Edit/Write for a real change. If the evidence is enough, provide a substantive final answer "
-            "with no DSML tool block."
+            "If a recovery message temporarily marks Bash, Read, Grep, Glob, LS, or LSP unavailable, obey that override even "
+            "if the original tool manifest listed them. If more evidence is required, request exactly one materially different "
+            "still-allowed tool/input. Prefer Edit/MultiEdit/Write for a real change when the evidence is enough. If the evidence "
+            "is enough for a final answer, provide a substantive final answer with no DSML tool block."
+        )
+        return [
+            *messages,
+            {"role": "assistant", "content": (bad_text or "")[:4000]},
+            {"role": "user", "content": repair_instruction},
+        ]
+    if error_kind == "missing_required_tool_input":
+        repair_instruction = (
+            "Previous tool JSON selected a real allowed tool but omitted required input fields.\n"
+            f"Error code: {error_kind}.\n"
+            f"Error: {reason}.\n"
+            "Do not output a partial tool call. Rewrite exactly one valid DSML tool block with a complete input object. "
+            "For Edit, the input must include file_path, old_string, and new_string; old_string must exactly match text "
+            "from an earlier Read/tool_result. If you do not have the exact old_string, answer without JSON and state "
+            "which exact evidence is missing. No natural language outside DSML when requesting a tool.\n"
+            "Required Edit shape:\n"
+            "<|DSML|tool_calls>\n"
+            "  <|DSML|invoke name=\"Edit\">\n"
+            "    <|DSML|parameter name=\"file_path\"><![CDATA[path/to/file]]></|DSML|parameter>\n"
+            "    <|DSML|parameter name=\"old_string\"><![CDATA[old text]]></|DSML|parameter>\n"
+            "    <|DSML|parameter name=\"new_string\"><![CDATA[new text]]></|DSML|parameter>\n"
+            "  </|DSML|invoke>\n"
+            "</|DSML|tool_calls>"
         )
         return [
             *messages,
@@ -5536,7 +6004,7 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
             normalized = _repair_common_tool_input_shape(normalized, canonical_name, specs_by_name)
             normalized = _normalize_ask_user_question_input(normalized, canonical_name)
             required_error = _missing_required_tool_input_error(normalized, canonical_name, specs_by_name)
-            if required_error:
+            if required_error and not _allows_ds2api_style_tool_passthrough(context):
                 return [], required_error
             off_task_scope_question_error = _off_task_scope_escalation_question_error(
                 normalized,
@@ -5675,11 +6143,39 @@ def _allows_ds2api_style_tool_passthrough(context: ToolBridgeContext) -> bool:
 
 
 def _allows_ds2api_style_progress_passthrough(context: ToolBridgeContext) -> bool:
-    return _resolved_tool_profile_for_task(context.options, context.task_text) == "all"
+    return _configured_tool_profile(context.options) == "all"
 
 
 def _allows_ds2api_style_agent_guard_passthrough(context: ToolBridgeContext) -> bool:
-    return _resolved_tool_profile_for_task(context.options, context.task_text) == "all"
+    return _allows_ds2api_style_progress_passthrough(context)
+
+
+def _plain_text_requires_tool_recovery_before_ds2api_passthrough(
+    raw: str,
+    context: ToolBridgeContext,
+    fenced_shell_commands: Sequence[str],
+) -> bool:
+    if not (raw or "").strip() or not context.allowed_names:
+        return False
+    if _is_allowed_tool_denial(raw, context):
+        return True
+    if _is_deferred_named_tool_action_without_call(raw, context):
+        return True
+    if _is_deferred_local_file_inspection_without_call(raw, context):
+        return True
+    if _is_unverified_code_change_completion(raw, context):
+        return True
+    if _is_unexecuted_verification_command_after_write(raw, context):
+        return True
+    if _is_prose_shell_command_intent_without_call(raw, context):
+        return True
+    if fenced_shell_commands and (context.has_tool_loop or _looks_like_local_agent_task(context.task_text)):
+        return True
+    if context.allowed_names and _DEFERRED_TOOL_ACTION_RE.search(raw):
+        return True
+    if context.allowed_names and _has_code_change_tool(context) and _DEFERRED_CODE_CHANGE_ACTION_RE.search(raw):
+        return not _allows_plain_review_or_plan_text(context)
+    return False
 
 
 def _allows_ds2api_style_rejected_markup_passthrough(context: ToolBridgeContext, raw: str) -> bool:
@@ -6101,10 +6597,10 @@ def _repeat_shell_housekeeping_without_progress_error(
     return BridgeError(
         "repeat_shell_housekeeping_without_progress",
         (
-            f"The model repeated shell housekeeping ({current}) in an active tool loop without any "
-            "intervening file change. Use the earlier shell result already in the conversation, choose "
-            "a materially different allowed tool/input such as Read, Glob, Grep, Edit, or Write, or "
-            "provide a substantive final answer if the evidence is enough."
+            f"The model repeated shell discovery/housekeeping ({current}) in an active tool loop without any "
+            "intervening file change. Use the earlier shell/search result already in the conversation, choose "
+            "an allowed progress tool such as Edit, MultiEdit, or Write when ready, or provide a substantive "
+            "final answer if the evidence is enough."
         ),
         repairable=True,
     )
@@ -6222,6 +6718,10 @@ def _repair_common_tool_input_shape(
 
     if "prompt" in required and "prompt" not in updated and _schema_property_accepts_string(properties.get("prompt")):
         prompt = _pop_first_string_alias(updated, ("focus", "query", "task", "instruction", "instructions", "text"))
+        if not prompt and _compact_tool_name(canonical_name) in _DELEGATION_TOOL_NAMES:
+            description = updated.get("description")
+            if isinstance(description, str) and description.strip():
+                prompt = description.strip()
         if prompt:
             updated["prompt"] = _shorten(_first_meaningful_line(prompt), 4000)
             changed = True
@@ -6688,7 +7188,7 @@ def _safe_replacement_for_delegation_tool(call: ToolCallDraft, tools: list[ToolS
         return None
     requested = _compact_tool_name(call.name)
     alias_groups = (
-        {"agent", "subagent", "subagenttask", "task", "explore", "explorer"},
+        _DELEGATION_TOOL_NAMES,
         {"todowrite", "todo", "updatetodo", "todo_write"},
     )
     alias_group = next((group for group in alias_groups if requested in group), None)

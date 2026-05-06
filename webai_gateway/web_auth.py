@@ -428,11 +428,13 @@ def get_provider(provider_id: str) -> WebAuthProvider:
     return provider
 
 
-def catalog_model_payloads() -> list[dict[str, Any]]:
+def catalog_model_payloads(*, include_webai2api: bool = True) -> list[dict[str, Any]]:
     seen: set[str] = set()
     payloads: list[dict[str, Any]] = []
     for provider in PROVIDERS.values():
         if not provider.advertise_models:
+            continue
+        if not include_webai2api and provider.route != "direct":
             continue
         for model_id in provider.models:
             if model_id in seen:

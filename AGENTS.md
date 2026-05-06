@@ -8,6 +8,8 @@ WebAI Gateway 是一个独立的网页登录模型 API 网关。它位于 KrisAI
 
 当前适配层的核心原则是尽可能 100% 复刻 `ds2api` 的协议行为、错误形态、模型目录、请求历史、工具调用往返和网页登录体验；任何偏差都必须抽象为通用 provider/model capability 或 Gateway 配置，并用 parity/oracle 测试证明。
 
+每次修改适配器、工具桥、provider、请求历史压缩、错误恢复、模型目录或网页登录流程前，都必须主动对标当前锁定的 `ds2api` oracle 版本和相关源码；完成后必须补充 parity/oracle 或等价回归测试来证明仍然复刻 `ds2api` 成功做法。禁止在没有 ds2api 对照和测试证据的情况下把一次性观察写成长期行为。
+
 当前核心产品价值是让网页大模型能够在 Claude Code 中承担编程模型角色，也能够被小龙虾、Hermes 等 OpenAI / Anthropic 兼容客户端直接使用，并实现稳定、可验证、标准化的工具调用。
 
 ## 最高优先级边界

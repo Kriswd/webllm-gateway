@@ -174,7 +174,7 @@ def build_ds2api_runner(workdir: Path) -> Path:
     (workdir / "main.go").write_text(DS2API_RUNNER_SOURCE, encoding="utf-8")
     exe = workdir / ("ds2api-oracle-runner.exe" if os.name == "nt" else "ds2api-oracle-runner")
     subprocess.run(
-        ["go", "build", "-mod=mod", "-o", str(exe), "."],
+        [_go_executable(), "build", "-mod=mod", "-o", str(exe), "."],
         cwd=workdir,
         check=True,
         capture_output=True,
@@ -182,6 +182,25 @@ def build_ds2api_runner(workdir: Path) -> Path:
         env=_go_test_env(workdir),
     )
     return exe
+
+
+def _go_executable(*, extra_candidates: list[Path] | None = None) -> str:
+    found = shutil.which("go")
+    if found:
+        return found
+    candidates = list(extra_candidates or [])
+    goroot = os.environ.get("GOROOT")
+    if goroot:
+        candidates.append(Path(goroot) / "bin" / ("go.exe" if os.name == "nt" else "go"))
+    if os.name == "nt":
+        for root in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LocalAppData")):
+            if root:
+                candidates.append(Path(root) / "Go" / "bin" / "go.exe")
+        candidates.append(Path("C:/Program Files/Go/bin/go.exe"))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    raise FileNotFoundError("Go executable not found; install Go or set GOROOT/PATH before running ds2api oracle tests.")
 
 
 def run_ds2api_runner(

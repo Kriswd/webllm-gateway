@@ -26,9 +26,11 @@ from webai_gateway.config import (
 from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.openai_api import (
     EMPTY_ASSISTANT_RESPONSE_TEXT,
+    build_repair_payload,
     build_tool_call_sse,
     build_tool_refusal_recovery_payload,
     parse_chat_response,
+    post_upstream,
     tool_bridge_rejected_response_text,
 )
 from webai_gateway.deepseek_web import DeepSeekWebClient, is_deepseek_web_model, normalize_deepseek_model
@@ -95,6 +97,33 @@ def _client(handler) -> TestClient:
 
 def _headers() -> dict[str, str]:
     return {"Authorization": "Bearer local-dev-key"}
+
+
+def test_post_upstream_uses_provider_runtime_timeout() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.timeout: float | int | None = None
+
+        def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            headers: dict[str, str],
+            timeout: float | int | None = None,
+        ) -> httpx.Response:
+            self.timeout = timeout
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+    config = GatewayConfig(
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="gpt-pro"),
+        provider_runtime=ProviderRuntimeConfig(request_timeout_seconds=300),
+    )
+    client = RecordingClient()
+
+    post_upstream(client, config, {"model": "gpt-pro"})
+
+    assert client.timeout == 300
 
 
 def _controller_context_with_tools(
@@ -354,6 +383,23 @@ def test_sanitize_leaked_tool_protocol_output_matches_ds2api_agent_xml_cleanup()
     text = "Done.<attempt_completion><result>Some final answer</result></attempt_completion>"
 
     assert sanitize_leaked_tool_protocol_output(text) == "Done.Some final answer"
+
+
+def test_parse_chat_response_sanitizes_leaked_protocol_without_tool_context() -> None:
+    data = _openai_response("Here is the answer.\n\n\ue200genui\ue202uKIs\ue201")
+
+    parsed, result = parse_chat_response(
+        data,
+        bridge=False,
+        allowed_tools=set(),
+        model="chatgpt_text/gpt-instant",
+        return_bridge_result=True,
+    )
+
+    content = parsed["choices"][0]["message"]["content"]
+    assert content == "Here is the answer.\n\n"
+    assert "\ue200" not in content
+    assert result.content == content
 
 
 def test_tool_controller_stops_after_repair_budget() -> None:
@@ -914,8 +960,6 @@ def test_models_returns_configured_model_when_upstream_models_unavailable() -> N
     assert "deepseek-v4-pro[1m]" not in model_ids
     assert "deepseek-web/deepseek-chat" not in model_ids
     assert "deepseek" not in model_ids
-    assert "gpt-instant" in model_ids
-    assert "gemini-3-pro" in model_ids
     assert "qwen-web/qwen3.6-max-preview" in model_ids
     assert "qwen-web/qwen3.6-plus" in model_ids
     assert "qwen-web/qwen3-max" in model_ids
@@ -923,8 +967,8 @@ def test_models_returns_configured_model_when_upstream_models_unavailable() -> N
     qwen_preview = next(item for item in body["data"] if item["id"] == "qwen-web/qwen3.6-max-preview")
     assert qwen_preview["capabilities"]["tool_bridge"] is True
     assert qwen_preview["capabilities"]["supports_native_tools"] is False
-    assert "seed" in model_ids
-    assert "sora-2" in model_ids
+    assert "gpt-instant" not in model_ids
+    assert "sora-2" not in model_ids
 
 
 def test_deepseek_web_catalog_prefers_v4_pro_models() -> None:
@@ -1094,7 +1138,12 @@ def test_preserves_webai2api_catalog_model_when_forwarding() -> None:
         seen["body"] = json.loads(request.content.decode("utf-8"))
         return httpx.Response(200, json=_openai_response("webai2api reply"), request=request)
 
-    client = _client(handler)
+    client = TestClient(
+        create_app(
+            config=replace(_config(), upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant")),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
 
     response = client.post(
         "/v1/chat/completions",
@@ -1104,6 +1153,91 @@ def test_preserves_webai2api_catalog_model_when_forwarding() -> None:
 
     assert response.status_code == 200
     assert seen["body"]["model"] == "gpt-instant"
+    assert seen["body"]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.parametrize("model", ["gpt-instant", "chatgpt_text/gpt-instant"])
+def test_webai2api_chatgpt_text_payload_uses_model_prompt_budget_compaction(model: str) -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        content = (
+            '<|DSML|tool_calls><|DSML|invoke name="Read">'
+            '<|DSML|parameter name="file_path"><![CDATA[README.md]]></|DSML|parameter>'
+            "</|DSML|invoke></|DSML|tool_calls>"
+        )
+        return httpx.Response(200, json=_openai_response(content), request=request)
+
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": "system bootstrap\n" + ("large system and tool context\n" * 900),
+        }
+    ]
+    for index in range(60):
+        messages.extend(
+            [
+                {
+                    "role": "user",
+                    "content": f"old request {index}\nANCIENT_BULK_SENTINEL\n" + ("old observation\n" * 80),
+                },
+                {"role": "assistant", "content": "Assistant requested tool calls:\nRead(path=old.py)"},
+                {"role": "tool", "content": "old tool result\n" + ("legacy content\n" * 80)},
+            ]
+        )
+    messages.append({"role": "user", "content": "Read README now. LATEST_GPT_INSTANT_SENTINEL"})
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                provider_runtime=ProviderRuntimeConfig(prompt_max_chars=48000),
+                tool_bridge=ToolBridgeConfig(activation_policy="always", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": model,
+            "messages": messages,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "description": "Read a local file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen["body"]["model"] == model
+    assert len(seen["body"]["messages"]) == 1
+    assert seen["body"]["messages"][0]["role"] == "user"
+    prompt = str(seen["body"]["messages"][0]["content"])
+    assert len(prompt) <= 12000
+    assert "# DS2API_HISTORY.txt" in prompt
+    assert "[Layered history compaction]" in prompt
+    assert "TOOL CALL FORMAT - FOLLOW EXACTLY" in prompt
+    assert "<|DSML|tool_calls>" in prompt
+    assert "LATEST_GPT_INSTANT_SENTINEL" in prompt
+    assert "ANCIENT_BULK_SENTINEL" not in prompt
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "Read"
 
 
 def test_injects_tools_and_returns_openai_tool_calls() -> None:
@@ -1203,6 +1337,486 @@ def test_auto_tool_profile_preserves_explicit_required_tool_choice() -> None:
     tool_call = choice["message"]["tool_calls"][0]
     assert tool_call["function"]["name"] == "read_file"
     assert json.loads(tool_call["function"]["arguments"]) == {"path": "README.md"}
+
+
+def test_webai2api_upstream_required_tool_choice_retries_plain_text_without_native_tools() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+        if "REQUIRED TOOL CHOICE RECOVERY" in joined:
+            content = (
+                '<|DSML|tool_calls><|DSML|invoke name="get_weather">'
+                '<|DSML|parameter name="city"><![CDATA[Beijing]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            )
+            return httpx.Response(200, json=_openai_response(content), request=request)
+        return httpx.Response(200, json=_openai_response("Beijing is sunny."), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "chatgpt_text/gpt-instant",
+            "messages": [{"role": "user", "content": "Call get_weather for Beijing."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "required",
+        },
+    )
+    events = client.get("/api/admin/tool-bridge-events").json()["events"]
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert all("tools" not in payload and "tool_choice" not in payload for payload in seen_payloads)
+    assert seen_payloads[0]["model"] == "chatgpt_text/gpt-instant"
+    initial_prompt = "\n".join(
+        str(message.get("content", "")) for message in seen_payloads[0]["messages"] if message.get("role") == "system"
+    )
+    initial_user = "\n".join(
+        str(message.get("content", "")) for message in seen_payloads[0]["messages"] if message.get("role") == "user"
+    )
+    assert "For this response, you MUST call at least one tool from the allowed list." in initial_prompt
+    assert "WebAI Gateway current turn tool-choice policy" in initial_user
+    assert "This current turn requires a Gateway tool call" in initial_user
+    assert seen_payloads[1]["stream"] is False
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "REQUIRED TOOL CHOICE RECOVERY" in retry_prompt
+    assert "Allowed tools for this required-tool retry: get_weather" in retry_prompt
+    assert "Do not browse, search, cite web results" in retry_prompt
+    assert "<|DSML|tool_calls>" in retry_prompt
+    assert {event.get("stage") for event in events if event.get("kind") == "tool_bridge_retry"} >= {
+        "required_tool_choice_recovery"
+    }
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "get_weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Beijing"}
+
+
+def test_webai2api_upstream_required_tool_choice_failure_returns_sanitized_diagnostic() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        return httpx.Response(200, json=_openai_response("No tool needed. bearer secret-token"), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "gemini_text/gemini-3.1-pro",
+            "messages": [{"role": "user", "content": "Call get_weather for Beijing."}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
+            ],
+            "tool_choice": "required",
+        },
+    )
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert all("tools" not in payload and "tool_choice" not in payload for payload in seen_payloads)
+    assert response.headers["x-webai-tool-bridge-error"] == "tool_choice_violation"
+    assert "secret-token" not in response.text
+    event = diagnostics[-1]
+    assert event["kind"] == "completion_response"
+    assert event["toolBridgeError"] == "tool_choice_violation"
+    assert event["toolBridgeAllowedTools"] == ["get_weather"]
+    assert "secret-token" not in json.dumps(event, ensure_ascii=False)
+
+
+def test_webai2api_upstream_repairs_agent_description_only_tool_call() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        content = (
+            "```tool_json\n"
+            '{"calls":[{"id":"call_1","name":"Agent",'
+            '"input":{"description":"修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验"}}]}'
+            "\n```"
+        )
+        return httpx.Response(200, json=_openai_response(content), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="always", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "chatgpt_text/gpt-instant",
+            "messages": [{"role": "user", "content": "修改 auto_curator.py。"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Agent",
+                        "description": "Launch a subagent.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["prompt", "description"],
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    assert "tools" not in seen_payloads[0]
+    assert "tool_choice" not in seen_payloads[0]
+    assert "x-webai-tool-bridge-error" not in response.headers
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "Agent"
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        "description": "修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验",
+        "prompt": "修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验",
+    }
+
+
+def test_webai2api_upstream_stream_repairs_agent_description_only_tool_call() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def stream_text(text: str) -> str:
+        return (
+            'data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            f'data: {json.dumps({"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":text},"finish_reason":None}]}, ensure_ascii=False)}\n\n'
+            'data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        content = (
+            "```tool_json\n"
+            '{"calls":[{"id":"call_1","name":"Agent",'
+            '"input":{"description":"修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验"}}]}'
+            "\n```"
+        )
+        return httpx.Response(200, text=stream_text(content), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="always", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "chatgpt_text/gpt-instant",
+            "stream": True,
+            "messages": [{"role": "user", "content": "修改 auto_curator.py。"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Agent",
+                        "description": "Launch a subagent.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["prompt", "description"],
+                        },
+                    },
+                }
+            ],
+        },
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    assert seen_payloads[0]["stream"] is True
+    assert "tools" not in seen_payloads[0]
+    assert "tool_choice" not in seen_payloads[0]
+    assert '"tool_calls"' in body
+    assert '"name":"Agent"' in body
+    chunks = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
+    tool_call_delta = next(
+        chunk["choices"][0]["delta"]["tool_calls"][0]
+        for chunk in chunks
+        if chunk["choices"][0]["delta"].get("tool_calls")
+    )
+    assert json.loads(tool_call_delta["function"]["arguments"]) == {
+        "description": "修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验",
+        "prompt": "修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验",
+    }
+    assert '"finish_reason":"tool_calls"' in body
+
+
+def test_webai2api_upstream_required_stream_retries_to_standard_tool_call_sse() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def stream_text(text: str) -> str:
+        return (
+            'data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            f'data: {json.dumps({"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":text},"finish_reason":None}]}, ensure_ascii=False)}\n\n'
+            'data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+        if "REQUIRED TOOL CHOICE RECOVERY" in joined:
+            content = (
+                '<|DSML|tool_calls><|DSML|invoke name="get_weather">'
+                '<|DSML|parameter name="city"><![CDATA[Beijing]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            )
+            return httpx.Response(200, json=_openai_response(content), request=request)
+        return httpx.Response(200, text=stream_text("I can answer directly."), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "gpt-instant",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Call get_weather for Beijing."}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+            "tool_choice": "required",
+        },
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert seen_payloads[0]["stream"] is True
+    assert seen_payloads[1]["stream"] is False
+    assert all("tools" not in payload and "tool_choice" not in payload for payload in seen_payloads)
+    assert '"tool_calls"' in body
+    assert '"name":"get_weather"' in body
+    assert '"finish_reason":"tool_calls"' in body
+    assert "I can answer directly" not in body
+
+
+def test_webai2api_upstream_anthropic_required_tool_choice_retries_plain_text() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+        if "REQUIRED TOOL CHOICE RECOVERY" in joined:
+            content = (
+                '<|DSML|tool_calls><|DSML|invoke name="get_weather">'
+                '<|DSML|parameter name="city"><![CDATA[Beijing]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            )
+            return httpx.Response(200, json=_openai_response(content), request=request)
+        return httpx.Response(200, json=_openai_response("Beijing is sunny."), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "chatgpt_text/gpt-instant",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Call get_weather for Beijing."}],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert all("tools" not in payload and "tool_choice" not in payload for payload in seen_payloads)
+    assert response.json()["stop_reason"] == "tool_use"
+    tool_use = response.json()["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["id"].startswith("toolu_")
+    assert tool_use["name"] == "get_weather"
+    assert tool_use["input"] == {"city": "Beijing"}
+
+
+def test_tool_bridge_forced_single_tool_infers_missing_dsml_invoke_name() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    )
+
+    result = parse_tool_response(
+        "<|DSML|tool_calls><|DSML|invoke>"
+        '<|DSML|parameter name="city"><![CDATA[Beijing]]></|DSML|parameter>'
+        "</|DSML|invoke></|DSML|tool_calls>",
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.name, call.input) for call in result.tool_calls] == [("get_weather", {"city": "Beijing"})]
+
+
+def test_tool_bridge_forced_single_tool_accepts_ml_alias_from_webai2api_text_model() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    )
+
+    result = parse_tool_response(
+        "<|ML|tool_calls><|ML|invoke>"
+        '<ML|parameter name="city"><![CDATA[Beijing]]></|ML|parameter>'
+        "</|ML|invoke></|DSML|tool_calls>",
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.name, call.input) for call in result.tool_calls] == [("get_weather", {"city": "Beijing"})]
+
+
+def test_tool_bridge_forced_single_tool_recovers_marker_only_with_task_argument() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    )
+    context = replace(context, task_text="Call get_weather with city Beijing. Do not answer directly.")
+
+    result = parse_tool_response("<|ML|tool_calls>", context)
+
+    assert result.error is None
+    assert [(call.name, call.input) for call in result.tool_calls] == [("get_weather", {"city": "Beijing"})]
 
 
 def test_strict_tool_bridge_accepts_calls_array_and_strips_content() -> None:
@@ -1432,6 +2046,66 @@ def test_strict_tool_bridge_repairs_allowed_tool_denial_text() -> None:
     assert body["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
 
 
+def test_strict_tool_bridge_repairs_realtime_web_denial_when_search_tool_available() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json=_openai_response(
+                    "由于我是一个无状态的 AI 助手，无法直接访问实时的互联网新闻源或今天的最新数据。"
+                    "因此，我无法提供今天的 AI 热点周报。"
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '```tool_json\n{"calls":[{"id":"toolu_search","name":"WebSearch","input":{"query":"今天 AI 热点新闻 周报"}}]}\n```'
+            ),
+            request=request,
+        )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(exposure_policy="all"),
+    )
+    client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "web-model",
+            "messages": [{"role": "user", "content": "帮我写今天的 AI 热点周报，需要实时新闻源。"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "WebSearch",
+                        "description": "Search the web for current information",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(requests) == 2
+    repair_text = "\n".join(str(m.get("content", "")) for m in requests[1]["messages"])
+    assert "The listed tools are available through the downstream client" in repair_text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "WebSearch"
+    assert json.loads(tool_call["function"]["arguments"]) == {"query": "今天 AI 热点新闻 周报"}
+
+
 def test_openai_tool_controller_exposes_bash_like_ds2api_for_local_agent_task() -> None:
     requests: list[dict[str, Any]] = []
 
@@ -1478,7 +2152,8 @@ def test_openai_tool_controller_exposes_bash_like_ds2api_for_local_agent_task() 
     assert response.status_code == 200
     assert len(requests) == 1
     prompt = "\n".join(str(message.get("content", "")) for message in requests[0]["messages"] if message.get("role") == "system")
-    assert '"name": "Bash"' in prompt
+    assert "Tool: Bash" in prompt
+    assert "TOOL CALL FORMAT - FOLLOW EXACTLY" in prompt
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     tool_call = choice["message"]["tool_calls"][0]
@@ -2183,6 +2858,62 @@ def test_parse_chat_response_flags_no_bridge_local_tool_denial_when_context_has_
     )
 
     assert parsed["choices"][0]["message"]["content"]
+    assert result.error is not None
+    assert result.error.kind == "tool_denial_without_call"
+    assert result.error.repairable is True
+
+
+def test_parse_chat_response_flags_no_bridge_realtime_web_denial_when_search_tool_available() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "WebSearch",
+                    "description": "Search the web for current information",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="agent"),
+    )
+
+    parsed, result = parse_chat_response(
+        _openai_response("我是无状态的 AI 助手，无法访问实时互联网新闻源或今天的最新数据。"),
+        bridge=False,
+        allowed_tools=set(),
+        model="qwen-web/qwen3.6-max-preview",
+        bridge_context=context,
+        return_bridge_result=True,
+    )
+
+    assert parsed["choices"][0]["message"]["content"]
+    assert result.error is not None
+    assert result.error.kind == "tool_denial_without_call"
+    assert result.error.repairable is True
+
+
+def test_tool_bridge_all_profile_flags_realtime_web_denial_when_search_tool_available() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "WebSearch",
+                    "description": "Search the web for current information",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    result = parse_tool_response(
+        "As a stateless AI assistant, I cannot access real-time internet news sources or today's latest data.",
+        context,
+    )
+
+    assert result.tool_calls == []
     assert result.error is not None
     assert result.error.kind == "tool_denial_without_call"
     assert result.error.repairable is True
@@ -3439,6 +4170,49 @@ Assistant requested tool calls:
     ]
 
 
+def test_tool_bridge_synthesizes_agent_prompt_from_description() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Agent",
+                    "description": "Launch a subagent.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["prompt", "description"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", max_calls_per_turn=4),
+    )
+
+    result = parse_tool_response(
+        "```tool_json\n"
+        '{"calls":[{"id":"call_1","name":"Agent",'
+        '"input":{"description":"修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验"}}]}'
+        "\n```",
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        (
+            "call_1",
+            "Agent",
+            {
+                "description": "修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验",
+                "prompt": "修改 auto_curator.py: 锁定 LLM 温度并增加 JSON 输出校验",
+            },
+        )
+    ]
+
+
 def test_tool_bridge_rejects_echoed_tool_history_summary_without_tool_json() -> None:
     context = build_context(
         [
@@ -3998,6 +4772,39 @@ def test_anthropic_count_tokens_returns_estimate_for_claude_code() -> None:
     assert body["input_tokens"] > 0
 
 
+def test_anthropic_messages_root_alias_accepts_clients_without_v1_prefix() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json=_openai_response("alias ok"), request=request)
+
+    client = _client(handler)
+
+    response = client.post(
+        "/messages",
+        headers={"x-api-key": "local-dev-key", "anthropic-version": "2023-06-01"},
+        json={"model": "web-model", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 32},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"][0]["text"] == "alias ok"
+    assert seen["body"]["model"] == "web-model"
+
+
+def test_anthropic_count_tokens_root_alias_accepts_clients_without_v1_prefix() -> None:
+    client = _client(lambda request: httpx.Response(500, request=request))
+
+    response = client.post(
+        "/messages/count_tokens",
+        headers={"x-api-key": "local-dev-key", "anthropic-version": "2023-06-01"},
+        json={"model": "web-model", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] > 0
+
+
 def test_tool_bridge_full_exposure_allows_runtime_and_mcp_tools() -> None:
     seen: dict[str, Any] = {}
 
@@ -4035,9 +4842,9 @@ def test_tool_bridge_full_exposure_allows_runtime_and_mcp_tools() -> None:
 
     assert response.status_code == 200
     prompt = "\n".join(str(message.get("content", "")) for message in seen["body"]["messages"] if message.get("role") == "system")
-    assert '"name": "Bash"' in prompt
-    assert '"name": "Edit"' in prompt
-    assert '"name": "mcp__repo__search"' in prompt
+    assert "Tool: Bash" in prompt
+    assert "Tool: Edit" in prompt
+    assert "Tool: mcp__repo__search" in prompt
     body = response.json()
     assert body["stop_reason"] == "tool_use"
     assert [block["name"] for block in body["content"]] == ["Bash", "mcp__repo__search"]
@@ -5325,6 +6132,76 @@ def test_tool_bridge_rejects_repeated_shell_housekeeping_without_progress_in_age
     assert result.error.repairable is True
 
 
+def test_tool_bridge_all_profile_passes_repeated_shell_discovery_like_ds2api() -> None:
+    messages = [
+        {"role": "user", "content": "Fix auto_curator.py and bilibili_api_extractor.py using the local files."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": json.dumps({"command": 'grep -n "temperature" .claude/skills/scripts/auto_curator.py'}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "42:temperature = 0.7"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": json.dumps({"command": 'cat -n .claude/skills/scripts/auto_curator.py | grep -A 20 "json"'}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "88:json_validation = False"},
+    ]
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            },
+            {"type": "function", "function": {"name": "Read", "description": "Read files", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Grep", "description": "Search files", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Glob", "description": "Find files", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Edit", "description": "Edit files", "parameters": {"type": "object"}}},
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+    context = prefer_local_tools_for_local_agent_task(context, messages)
+
+    result = parse_tool_response(
+        "<|DSML|tool_calls>\n"
+        '  <|DSML|invoke name="Bash">\n'
+        '    <|DSML|parameter name="command"><![CDATA[grep -n "json_validation" .claude/skills/scripts/auto_curator.py]]></|DSML|parameter>\n'
+        "  </|DSML|invoke>\n"
+        "</|DSML|tool_calls>",
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.name, call.input) for call in result.tool_calls] == [
+        ("Bash", {"command": 'grep -n "json_validation" .claude/skills/scripts/auto_curator.py'})
+    ]
+
+
 def test_tool_bridge_normalizes_cmd_cd_drive_switch_for_bash() -> None:
     context = build_context(
         [
@@ -5388,7 +6265,7 @@ def test_tool_bridge_all_exposure_does_not_truncate_or_invent_toolsearch() -> No
 
     assert response.status_code == 200
     prompt = "\n".join(str(message.get("content", "")) for message in seen["body"]["messages"] if message.get("role") == "system")
-    assert '"name": "Tool39"' in prompt
+    assert "Tool: Tool39" in prompt
     assert "ToolSearch" not in prompt
     assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_39", "name": "Tool39", "input": {"value": 39}}]
 
@@ -6189,7 +7066,7 @@ def test_tool_bridge_all_profile_passes_repeated_unchanged_read_like_ds2api() ->
     ]
 
 
-def test_tool_bridge_resolved_all_profile_passes_repeated_unchanged_read_like_ds2api() -> None:
+def test_tool_bridge_configured_all_profile_passes_repeated_unchanged_read_like_ds2api() -> None:
     context = build_context(
         [
             {
@@ -6198,7 +7075,7 @@ def test_tool_bridge_resolved_all_profile_passes_repeated_unchanged_read_like_ds
             }
             for name in ["Read", "Glob", "Grep", "Edit", "Write"]
         ],
-        ToolBridgeConfig(exposure_policy="all", max_tools_in_prompt=32),
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all", max_tools_in_prompt=32),
     )
     context = replace(
         context,
@@ -6899,7 +7776,7 @@ def test_tool_bridge_rejects_repeated_skill_name_alias_without_progress() -> Non
     assert result.error.repairable is True
 
 
-def test_tool_bridge_resolved_all_profile_passes_repeated_skill_like_ds2api() -> None:
+def test_tool_bridge_configured_all_profile_passes_repeated_skill_like_ds2api() -> None:
     context = build_context(
         [
             {
@@ -6912,7 +7789,7 @@ def test_tool_bridge_resolved_all_profile_passes_repeated_skill_like_ds2api() ->
             }
             for name in ["Skill", "Read", "Glob", "Grep", "Edit", "Write"]
         ],
-        ToolBridgeConfig(exposure_policy="all", max_tools_in_prompt=32),
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all", max_tools_in_prompt=32),
     )
     context = replace(
         context,
@@ -8484,6 +9361,71 @@ def test_tool_bridge_repairs_read_path_alias_to_required_file_path() -> None:
     assert result.tool_calls[0].input == {"file_path": "E:/ProjectX/mindcraft/CLAUDE.md"}
 
 
+def test_tool_bridge_agent_profile_rejects_missing_required_tool_input() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "description": "Edit a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="agent"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_bad_edit","name":"Edit","input":{"file_path":"auto_curator.py"}}]}\n```',
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is not None
+    assert result.error.kind == "missing_required_tool_input"
+
+
+def test_tool_bridge_all_profile_passes_missing_required_input_like_ds2api() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "description": "Edit a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_bad_edit","name":"Edit","input":{"file_path":"auto_curator.py"}}]}\n```',
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.name, call.input) for call in result.tool_calls] == [("Edit", {"file_path": "auto_curator.py"})]
+
+
 def test_tool_bridge_parses_xml_tool_call_function_equals_parameters() -> None:
     context = build_context(
         [
@@ -8641,7 +9583,7 @@ def test_startup_bat_exists() -> None:
     assert (root / "start_webai_gateway.bat").exists()
 
 
-def test_root_serves_webai2api_native_spa_when_available(tmp_path: Path) -> None:
+def test_root_serves_gateway_console_when_webai2api_native_spa_is_available(tmp_path: Path) -> None:
     native_dist = tmp_path / "webui" / "dist"
     native_dist.mkdir(parents=True)
     (native_dist / "index.html").write_text(
@@ -8653,8 +9595,8 @@ def test_root_serves_webai2api_native_spa_when_available(tmp_path: Path) -> None
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "WebAI2API" in response.text
-    assert "WebAI Gateway 鎺у埗鍙?" not in response.text
+    assert "WebAI Gateway 控制台" in response.text
+    assert "<title>WebAI2API</title>" not in response.text
 
 
 def test_assets_serve_webai2api_native_files(tmp_path: Path) -> None:
@@ -8698,6 +9640,62 @@ def test_admin_routes_proxy_to_webai2api_sidecar_root(tmp_path: Path) -> None:
     assert seen["method"] == "GET"
     assert seen["url"] == "http://upstream.test/admin/status?fresh=1"
     assert seen["authorization"] == "Bearer webai2api-token"
+
+
+def test_admin_routes_inject_webai2api_sidecar_token_when_gateway_console_has_no_token(tmp_path: Path) -> None:
+    native_dist = tmp_path / "webui" / "dist"
+    native_dist.mkdir(parents=True)
+    (native_dist / "index.html").write_text("<html>native</html>", encoding="utf-8")
+    config = GatewayConfig(
+        server=ServerConfig(api_key="gateway-local-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", api_key="sidecar-admin-key", model="web-model"),
+    )
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "running"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=config,
+            native_ui_dir=native_dist,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/admin/status")
+
+    assert response.status_code == 200
+    assert seen["authorization"] == "Bearer sidecar-admin-key"
+
+
+def test_admin_routes_replace_gateway_token_with_webai2api_sidecar_token(tmp_path: Path) -> None:
+    native_dist = tmp_path / "webui" / "dist"
+    native_dist.mkdir(parents=True)
+    (native_dist / "index.html").write_text("<html>native</html>", encoding="utf-8")
+    config = GatewayConfig(
+        server=ServerConfig(api_key="gateway-local-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", api_key="sidecar-admin-key", model="web-model"),
+    )
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "running"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=config,
+            native_ui_dir=native_dist,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/admin/status", headers={"Authorization": "Bearer gateway-local-key"})
+
+    assert response.status_code == 200
+    assert seen["authorization"] == "Bearer sidecar-admin-key"
 
 
 def test_admin_proxy_reports_sidecar_unavailable_without_crashing(tmp_path: Path) -> None:
@@ -8748,7 +9746,8 @@ def test_v1_routes_remain_gateway_owned_when_admin_proxy_exists(tmp_path: Path) 
     assert seen_paths == ["/v1/models"]
     model_ids = {item["id"] for item in response.json()["data"]}
     assert "sidecar-model" in model_ids
-    assert "gpt-instant" in model_ids
+    assert "qwen-web/qwen3.6-plus" in model_ids
+    assert "gpt-instant" not in model_ids
 
 
 def test_onboarding_returns_gateway_providers_and_models(tmp_path: Path) -> None:
@@ -8786,13 +9785,14 @@ def test_onboarding_returns_gateway_providers_and_models(tmp_path: Path) -> None
     assert body["gateway"]["defaultModel"] == "web-model"
     assert body["summary"]["providers"] >= 10
     assert body["summary"]["models"] >= 3
+    assert body["summary"]["authorizedProviders"] == 1
     assert body["summary"]["authorizedDirectProviders"] == 1
     assert body["summary"]["webAI2APIProviders"] >= 1
     assert {item["id"] for item in body["models"]} >= {
         "sidecar-model",
-        "gpt-instant",
         "qwen-web/qwen3.6-plus",
     }
+    assert "gpt-instant" not in {item["id"] for item in body["models"]}
     assert "deepseek-v4-pro" in {item["id"] for item in body["models"]}
     assert "deepseek-v4-pro[1m]" not in {item["id"] for item in body["models"]}
     assert "deepseek-web/deepseek-chat" not in {item["id"] for item in body["models"]}
@@ -8803,6 +9803,422 @@ def test_onboarding_returns_gateway_providers_and_models(tmp_path: Path) -> None
     assert "ds2api" in deepseek["availabilityMessage"]
     assert "session-secret" not in response.text
     assert "bearer-secret" not in response.text
+
+
+def test_onboarding_groups_webai2api_adapter_aliases_with_provider(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"},
+                    {
+                        "id": "chatgpt_text/gpt-instant",
+                        "object": "model",
+                        "owned_by": "chatgpt_text",
+                        "type": "text",
+                    },
+                    {
+                        "id": "chatgpt_text/gpt-thinking",
+                        "object": "model",
+                        "owned_by": "chatgpt_text",
+                        "type": "text",
+                    },
+                    {
+                        "id": "chatgpt_text/gpt-pro",
+                        "object": "model",
+                        "owned_by": "chatgpt_text",
+                        "type": "text",
+                    },
+                    {"id": "unrelated-model", "object": "model", "owned_by": "internal_server"},
+                ],
+            },
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/onboarding")
+
+    assert response.status_code == 200
+    providers = {item["id"]: item for item in response.json()["providers"]}
+    chatgpt = providers["chatgpt"]
+    assert chatgpt["availableModels"] == [
+        "gpt-instant",
+        "chatgpt_text/gpt-instant",
+        "chatgpt_text/gpt-thinking",
+        "chatgpt_text/gpt-pro",
+    ]
+    assert chatgpt["modelCount"] == 4
+    assert "unrelated-model" not in chatgpt["availableModels"]
+
+
+def test_onboarding_marks_webai2api_chatgpt_authorized_from_worker_cookies(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [{"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"}],
+                },
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "browser_default",
+                        "workers": [{"name": "default", "type": "chatgpt_text", "mergeTypes": []}],
+                    }
+                ],
+                request=request,
+            )
+        if request.url.path == "/v1/cookies":
+            assert request.url.params.get("name") == "browser_default"
+            assert request.url.params.get("domain") == "chatgpt.com"
+            return httpx.Response(
+                200,
+                json={
+                    "cookies": [
+                        {"name": "oai-did", "value": "visitor-cookie"},
+                        {"name": "__Secure-next-auth.session-token.0", "value": "session-secret"},
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/onboarding")
+
+    assert response.status_code == 200
+    chatgpt = next(item for item in response.json()["providers"] if item["id"] == "chatgpt")
+    assert chatgpt["credential"]["authorized"] is True
+    assert chatgpt["credential"]["fields"]["cookie"] is True
+    assert chatgpt["webAI2APIAuth"] == {
+        "checked": True,
+        "authorized": True,
+        "cookieCount": 2,
+        "instances": ["browser_default"],
+    }
+    assert response.json()["summary"]["authorizedProviders"] == 1
+    assert "session-secret" not in response.text
+    assert "visitor-cookie" not in response.text
+
+
+def test_onboarding_exposes_multiple_webai2api_accounts_without_cookie_values(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"},
+                        {"id": "chatgpt_text/gpt-thinking", "object": "model", "owned_by": "chatgpt_text", "type": "text"},
+                        {"id": "chatgpt_text/gpt-pro", "object": "model", "owned_by": "chatgpt_text", "type": "text"},
+                    ],
+                },
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "chatgpt_free_profile",
+                        "userDataMark": "free-profile",
+                        "workers": [{"name": "free", "type": "chatgpt_text", "mergeTypes": []}],
+                    },
+                    {
+                        "name": "chatgpt_plus_profile",
+                        "userDataMark": "plus-profile",
+                        "workers": [{"name": "plus", "type": "chatgpt_text", "mergeTypes": ["sora"]}],
+                    },
+                ],
+                request=request,
+            )
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(
+                200,
+                json={"cookies": [{"name": "__Secure-next-auth.session-token", "value": "session-secret"}]},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/onboarding")
+
+    assert response.status_code == 200
+    chatgpt = next(item for item in response.json()["providers"] if item["id"] == "chatgpt")
+    assert chatgpt["credential"]["authorized"] is True
+    assert chatgpt["currentAccountId"].startswith("webai2api:chatgpt:")
+    assert [account["workerName"] for account in chatgpt["accounts"]] == ["free", "plus"]
+    assert all(account["authorized"] is True for account in chatgpt["accounts"])
+    assert all(account["source"] == "webai2api-worker" for account in chatgpt["accounts"])
+    assert chatgpt["accounts"][1]["displayName"] == "plus-profile / plus"
+    assert set(chatgpt["modelAvailability"]) == {"gpt-instant", "chatgpt_text/gpt-thinking", "chatgpt_text/gpt-pro"}
+    assert all(item["status"] == "pending" for item in chatgpt["modelAvailability"].values())
+    assert "session-secret" not in response.text
+
+
+def test_selecting_webai2api_account_syncs_worker_pool_without_touching_other_providers(tmp_path: Path) -> None:
+    posted_instances: list[Any] = []
+    restart_payloads: list[Any] = []
+
+    original_instances = [
+        {
+            "name": "chatgpt_free_profile",
+            "workers": [{"name": "free", "type": "chatgpt_text", "mergeTypes": []}],
+        },
+        {
+            "name": "chatgpt_plus_profile",
+            "workers": [
+                {"name": "plus", "type": "chatgpt_text", "mergeTypes": []},
+                {"name": "gemini", "type": "gemini_text", "mergeTypes": []},
+            ],
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"object": "list", "data": [{"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"}]},
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            return httpx.Response(200, json=original_instances, request=request)
+        if request.url.path == "/admin/config/instances" and request.method == "POST":
+            posted_instances.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(
+                200,
+                json={"cookies": [{"name": "__Secure-next-auth.session-token", "value": "ok"}]},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    accounts = client.get("/api/admin/accounts", params={"providerId": "chatgpt"}).json()["accounts"]
+    plus_account = next(account for account in accounts if account["workerName"] == "plus")
+    response = client.post(
+        "/api/admin/accounts/select",
+        json={"providerId": "chatgpt", "accountId": plus_account["id"]},
+    )
+
+    assert response.status_code == 200
+    assert posted_instances
+    assert restart_payloads == [{"loginMode": False}]
+    synced = posted_instances[-1]
+    workers_by_instance = {item["name"]: item["workers"] for item in synced}
+    assert workers_by_instance["chatgpt_free_profile"] == []
+    assert workers_by_instance["chatgpt_plus_profile"] == [
+        {"name": "plus", "type": "chatgpt_text", "mergeTypes": []},
+        {"name": "gemini", "type": "gemini_text", "mergeTypes": []},
+    ]
+    refreshed = client.get("/api/admin/onboarding").json()
+    chatgpt = next(item for item in refreshed["providers"] if item["id"] == "chatgpt")
+    assert chatgpt["currentAccountId"] == plus_account["id"]
+
+
+def test_selecting_webai2api_account_refuses_to_overwrite_user_edited_worker_config(tmp_path: Path) -> None:
+    get_count = 0
+    posted_instances: list[Any] = []
+    original_instances = [
+        {"name": "free_profile", "workers": [{"name": "free", "type": "chatgpt_text", "mergeTypes": []}]},
+        {"name": "plus_profile", "workers": [{"name": "plus", "type": "chatgpt_text", "mergeTypes": []}]},
+    ]
+    user_edited_instances = [
+        {"name": "free_profile", "workers": [{"name": "free-renamed", "type": "chatgpt_text", "mergeTypes": []}]},
+        {"name": "plus_profile", "workers": [{"name": "plus", "type": "chatgpt_text", "mergeTypes": []}]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "gpt-instant", "object": "model"}]}, request=request)
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            get_count += 1
+            return httpx.Response(200, json=original_instances if get_count <= 2 else user_edited_instances, request=request)
+        if request.url.path == "/admin/config/instances" and request.method == "POST":
+            posted_instances.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/admin/restart":
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(200, json={"cookies": [{"name": "__Secure-next-auth.session-token", "value": "ok"}]}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+    accounts = client.get("/api/admin/accounts", params={"providerId": "chatgpt"}).json()["accounts"]
+    plus_account = next(account for account in accounts if account["workerName"] == "plus")
+    free_account = next(account for account in accounts if account["workerName"] == "free")
+    assert client.post("/api/admin/accounts/select", json={"providerId": "chatgpt", "accountId": plus_account["id"]}).status_code == 200
+
+    response = client.post("/api/admin/accounts/select", json={"providerId": "chatgpt", "accountId": free_account["id"]})
+
+    assert response.status_code == 409
+    assert "工作池配置已被手动修改" in response.text
+    assert len(posted_instances) == 1
+
+
+def test_direct_provider_legacy_credential_is_exposed_as_default_account(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {"bearer": "ds-bearer-secret", "userAgent": "Chrome Test"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek-web"}]},
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/accounts", params={"providerId": "deepseek-web"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["currentAccountId"] == "direct:deepseek-web:default"
+    assert body["accounts"] == [
+        {
+            "id": "direct:deepseek-web:default",
+            "providerId": "deepseek-web",
+            "source": "direct-profile",
+            "displayName": "默认账号",
+            "planType": "unknown",
+            "authorized": True,
+            "current": True,
+            "instanceName": None,
+            "workerName": None,
+            "workerType": None,
+            "availableModelCount": 1,
+            "lastValidatedAt": None,
+            "validation": {},
+        }
+    ]
+    assert "ds-bearer-secret" not in response.text
+
+
+def test_account_model_validation_caches_results_and_redacts_errors(tmp_path: Path) -> None:
+    chat_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"},
+                        {"id": "chatgpt_text/gpt-pro", "object": "model", "owned_by": "chatgpt_text", "type": "text"},
+                    ],
+                },
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances":
+            return httpx.Response(
+                200,
+                json=[{"name": "plus_profile", "workers": [{"name": "plus", "type": "chatgpt_text", "mergeTypes": []}]}],
+                request=request,
+            )
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(200, json={"cookies": [{"name": "__Secure-next-auth.session-token", "value": "ok"}]}, request=request)
+        if request.url.path == "/v1/chat/completions":
+            payload = json.loads(request.content.decode("utf-8"))
+            model = payload["model"]
+            chat_calls.append(model)
+            if model == "chatgpt_text/gpt-pro":
+                return httpx.Response(
+                    403,
+                    json={"error": {"message": "not allowed cookie=session-secret bearer=secret-token"}},
+                    request=request,
+                )
+            return httpx.Response(200, json=_openai_response("ok"), request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=replace(_config(), upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant")),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+    account_id = client.get("/api/admin/accounts", params={"providerId": "chatgpt"}).json()["accounts"][0]["id"]
+
+    first = client.post(
+        "/api/admin/accounts/validate",
+        json={"providerId": "chatgpt", "accountId": account_id, "modelIds": ["gpt-instant", "chatgpt_text/gpt-pro"]},
+    )
+    second = client.post(
+        "/api/admin/accounts/validate",
+        json={"providerId": "chatgpt", "accountId": account_id, "modelIds": ["gpt-instant", "chatgpt_text/gpt-pro"]},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert chat_calls == ["gpt-instant", "chatgpt_text/gpt-pro"]
+    validation = second.json()["validation"]
+    assert validation["gpt-instant"]["status"] == "available"
+    assert validation["chatgpt_text/gpt-pro"]["status"] == "unavailable"
+    assert "session-secret" not in second.text
+    assert "secret-token" not in second.text
+    assert "[redacted]" in second.text
 
 
 def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
@@ -8842,9 +10258,8 @@ def test_admin_root_serves_management_ui() -> None:
 
     assert response.status_code == 200
     assert 'lang="zh-CN"' in response.text
-    assert "<title>WebAI2API</title>" in response.text
-    assert "/assets/index.js" in response.text
-    assert "WebAI Gateway 鎺у埗鍙?" not in response.text
+    assert "WebAI Gateway 控制台" in response.text
+    assert "<title>WebAI2API</title>" not in response.text
 
 
 def test_admin_static_script_uses_chinese_ui_messages() -> None:
@@ -9138,6 +10553,79 @@ def test_admin_provider_smoke_reports_qwen_tool_loop_without_secrets(tmp_path: P
     assert tool_use["detail"]["name"] == "get_weather"
     assert tool_use["detail"]["input"] == {"city": "Beijing"}
     assert "session-secret" not in response.text
+
+
+def test_admin_provider_smoke_runs_webai2api_provider_through_generic_tool_bridge(tmp_path: Path) -> None:
+    seen_chat_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-instant", "object": "model", "owned_by": "internal_server"},
+                        {"id": "chatgpt_text/gpt-instant", "object": "model", "owned_by": "chatgpt_text"},
+                    ],
+                },
+                request=request,
+            )
+        if request.method == "POST" and request.url.path == "/v1/chat/completions":
+            payload = json.loads(request.content.decode("utf-8"))
+            seen_chat_payloads.append(payload)
+            joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if "PROVIDER_SMOKE_OK" in joined:
+                return httpx.Response(200, json=_openai_response("PROVIDER_SMOKE_OK"), request=request)
+            if "role\":\"tool" in json.dumps(payload, ensure_ascii=False) or "tool_call_id" in json.dumps(payload, ensure_ascii=False):
+                return httpx.Response(200, json=_openai_response("Beijing is sunny, 22C."), request=request)
+            if "REQUIRED TOOL CHOICE RECOVERY" in joined:
+                content = (
+                    '<|DSML|tool_calls><|DSML|invoke name="get_weather">'
+                    '<|DSML|parameter name="city"><![CDATA[Beijing]]></|DSML|parameter>'
+                    "</|DSML|invoke></|DSML|tool_calls>"
+                )
+                return httpx.Response(200, json=_openai_response(content), request=request)
+            if "get_weather" in joined:
+                return httpx.Response(200, json=_openai_response("The weather is available without tools."), request=request)
+            return httpx.Response(200, json=_openai_response("unexpected smoke prompt"), request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post("/api/admin/provider-smoke/chatgpt")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "chatgpt"
+    assert body["authorized"] is True
+    assert body["model"] == "gpt-instant"
+    assert body["ok"] is True
+    assert body["passed"] == 5
+    assert {item["id"] for item in body["results"]} == {
+        "models",
+        "openai_text",
+        "openai_tool_use",
+        "anthropic_tool_use",
+        "anthropic_tool_result",
+    }
+    assert len(seen_chat_payloads) >= 6
+    assert all("tools" not in payload and "tool_choice" not in payload for payload in seen_chat_payloads)
+    assert any(
+        "REQUIRED TOOL CHOICE RECOVERY"
+        in "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+        for payload in seen_chat_payloads
+    )
 
 
 def test_admin_provider_smoke_returns_step_failures_without_secrets(tmp_path: Path) -> None:
@@ -10320,6 +11808,80 @@ def test_tool_prompt_read_like_tool_includes_ds2api_cache_guard() -> None:
     assert "Do not repeatedly call the same read request" in prompt
 
 
+def test_tool_prompt_all_profile_uses_ds2api_schema_and_examples() -> None:
+    prompt = build_tool_prompt(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Agent",
+                    "description": "Launch a subagent",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["prompt", "description"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "description": "Edit files",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                },
+            },
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    assert "You have access to these tools:" in prompt
+    assert "Tool: Agent" in prompt
+    assert "TOOL CALL FORMAT - FOLLOW EXACTLY" in prompt
+    assert "Available tools (allowed names only)" not in prompt
+    assert '<|DSML|invoke name="Edit">' in prompt
+    assert '<|DSML|parameter name="old_string"><![CDATA[foo]]></|DSML|parameter>' in prompt
+    assert '<|DSML|parameter name="new_string"><![CDATA[bar]]></|DSML|parameter>' in prompt
+    assert '<|DSML|invoke name="Agent">\n  </|DSML|invoke>' not in prompt
+
+
+def test_tool_prompt_bash_tool_includes_shell_dialect_guard() -> None:
+    prompt = build_tool_prompt(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    assert "Bash shell dialect guard" in prompt
+    assert "Bash-compatible shell" in prompt
+    assert "pwsh" in prompt
+    assert "if exist" in prompt
+    assert "git -C <path> status" in prompt
+    assert "Do not retry the same failed Bash command" in prompt
+
+
 def test_tool_prompt_non_read_tool_omits_ds2api_cache_guard() -> None:
     prompt = build_tool_prompt(
         [
@@ -10352,6 +11914,271 @@ def test_preserved_task_state_keeps_recent_plain_tool_call_before_latest_request
     assert "# WebAI Gateway preserved task state" in snapshot
     assert "Recent tool calls:" in snapshot
     assert "Read(path=fetch_wechat.py)" in snapshot
+
+
+def test_preserved_task_state_keeps_recent_successful_read_result_excerpt() -> None:
+    snapshot = build_preserved_task_state_snapshot(
+        [
+            ("assistant", "Assistant requested tool calls:\nRead(file_path=auto_curator.py)"),
+            ("tool", "def configure():\n    AUTO_CURATOR_TEMPERATURE_SENTINEL = 0.7\n"),
+            ("assistant", "Assistant requested tool calls:\nRead(file_path=auto_curator.py)"),
+            ("tool", "File unchanged since last read; content already available in history."),
+            ("user", "Continue editing auto_curator.py."),
+        ],
+        max_chars=1400,
+    )
+
+    assert "Read result excerpts:" in snapshot
+    assert "auto_curator.py" in snapshot
+    assert "AUTO_CURATOR_TEMPERATURE_SENTINEL" in snapshot
+    assert "File unchanged since last read" in snapshot
+
+
+def test_preserved_task_state_high_budget_keeps_multiple_recent_read_excerpts() -> None:
+    entries: list[tuple[str, str]] = []
+    for index in range(5):
+        entries.extend(
+            [
+                ("assistant", f"Assistant requested tool calls:\nRead(file_path=file_{index}.py)"),
+                ("tool", f"def marker_{index}():\n    return 'READ_EXCERPT_SENTINEL_{index}'\n"),
+            ]
+        )
+    entries.append(("user", "Continue from the files already read."))
+
+    snapshot = build_preserved_task_state_snapshot(entries, max_chars=6000)
+
+    assert snapshot.count("READ_EXCERPT_SENTINEL_") == 5
+    assert "file_0.py" in snapshot
+    assert "file_4.py" in snapshot
+
+
+def test_preserved_task_state_flags_no_progress_read_glob_loop() -> None:
+    entries: list[tuple[str, str]] = [("user", "Continue implementing the code changes.")]
+    for _ in range(4):
+        entries.extend(
+            [
+                ("assistant", "Assistant requested tool calls:\nRead(file_path=auto_curator.py)"),
+                ("tool", "temperature=0.7\njson_validation = False\n"),
+                ("assistant", "Assistant requested tool calls:\nGlob(pattern=**/auto_curator.py)"),
+                ("tool", ".claude/skills/scripts/auto_curator.py"),
+            ]
+        )
+    entries.append(("user", "继续，别重复搜读。"))
+
+    snapshot = build_preserved_task_state_snapshot(entries, max_chars=2400)
+
+    assert "No-progress tool loop signals:" in snapshot
+    assert "Read(file_path=auto_curator.py)" in snapshot
+    assert "Glob(pattern=**/auto_curator.py)" in snapshot
+    assert "Do not request the same input again" in snapshot
+
+
+def test_qwen_web_compaction_injects_no_progress_loop_ledger() -> None:
+    huge_system = (
+        "system bootstrap\n"
+        + ("tool schema detail\n" * 500)
+        + "You are using WebAI Gateway's strict tool bridge.\n"
+        + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": huge_system},
+        {"role": "user", "content": "Modify auto_curator.py and bilibili_api_extractor.py."},
+    ]
+    for index in range(5):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_read_auto_{index}",
+                            "type": "function",
+                            "function": {"name": "Read", "arguments": json.dumps({"file_path": "auto_curator.py"})},
+                        },
+                        {
+                            "id": f"call_glob_bili_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": "Glob",
+                                "arguments": json.dumps({"pattern": "**/bilibili_api_extractor.py"}),
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_read_auto_{index}",
+                    "name": "Read",
+                    "content": "temperature=0.7\njson_validation = False\n",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_glob_bili_{index}",
+                    "name": "Glob",
+                    "content": ".claude/skills/scripts/bilibili_api_extractor.py",
+                },
+            ]
+        )
+    messages.append({"role": "user", "content": "Continue and make progress now."})
+
+    prompt, files = qwen_messages_to_prompt_and_files(messages, max_prompt_chars=3200)
+
+    assert files == []
+    assert "No-progress tool loop signals:" in prompt
+    assert "Read(file_path=auto_curator.py)" in prompt
+    assert "Glob(pattern=**/bilibili_api_extractor.py)" in prompt
+
+
+def test_qwen_web_compaction_preserves_recent_read_result_excerpt_for_continue() -> None:
+    huge_system = (
+        "system bootstrap\n"
+        + ("tool schema detail\n" * 500)
+        + "You are using WebAI Gateway's strict tool bridge.\n"
+        + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+    read_content = (
+        "def configure_llm():\n"
+        "    AUTO_CURATOR_TEMPERATURE_SENTINEL = 0.7\n"
+        "    return {'json_validation': False}\n"
+        + ("# filler line\n" * 120)
+    )
+
+    prompt, files = qwen_messages_to_prompt_and_files(
+        [
+            {"role": "system", "content": huge_system},
+            {"role": "user", "content": "Inspect auto_curator.py and then continue the implementation."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_read_auto",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": json.dumps({"file_path": "auto_curator.py"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_read_auto", "name": "Read", "content": read_content},
+            {"role": "user", "content": "Continue. Lock LLM temperature and add JSON output validation."},
+        ],
+        max_prompt_chars=2600,
+    )
+
+    assert files == []
+    assert len(prompt) <= 2600
+    assert "# WebAI Gateway preserved task state" in prompt
+    assert "Read result excerpts:" in prompt
+    assert "AUTO_CURATOR_TEMPERATURE_SENTINEL" in prompt
+    assert "Continue. Lock LLM temperature and add JSON output validation." in prompt
+
+
+def test_qwen_web_compaction_preserves_gateway_wrapped_read_cache_for_unchanged_loop() -> None:
+    huge_system = (
+        "system bootstrap\n"
+        + ("tool schema detail\n" * 900)
+        + "You are using WebAI Gateway's strict tool bridge.\n"
+        + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+    auto_content = (
+        "Tool result for Read (call id: call_auto_1, is_error: false):\n"
+        "def configure_llm():\n"
+        "    AUTO_CURATOR_TEMPERATURE_SENTINEL = 0.7\n"
+        "    return {'json_validation': False}\n"
+        + ("# auto filler\n" * 40)
+    )
+    bili_content = (
+        "Tool result for Read (call id: call_bili_1, is_error: false):\n"
+        "class BilibiliApiExtractor:\n"
+        "    BILIBILI_RETRY_SENTINEL = 'needs-backoff'\n"
+        "    def retry(self):\n"
+        "        return 1\n"
+        + ("# bili filler\n" * 40)
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": huge_system},
+        {"role": "user", "content": "Continue modifying auto_curator.py and bilibili_api_extractor.py."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_auto_1",
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "arguments": json.dumps({"file_path": ".claude/skills/scripts/auto_curator.py"}),
+                    },
+                },
+                {
+                    "id": "call_bili_1",
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "arguments": json.dumps({"file_path": ".claude/skills/scripts/bilibili_api_extractor.py"}),
+                    },
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_auto_1", "name": "Read", "content": auto_content},
+        {"role": "tool", "tool_call_id": "call_bili_1", "name": "Read", "content": bili_content},
+    ]
+    for index in range(4):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_auto_repeat_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps({"file_path": ".claude/skills/scripts/auto_curator.py"}),
+                            },
+                        },
+                        {
+                            "id": f"call_bili_repeat_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps(
+                                    {"file_path": ".claude/skills/scripts/bilibili_api_extractor.py"}
+                                ),
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_auto_repeat_{index}",
+                    "name": "Read",
+                    "content": "File unchanged since last read; content already available in history.",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_bili_repeat_{index}",
+                    "name": "Read",
+                    "content": "File unchanged since last read; content already available in history.",
+                },
+            ]
+        )
+    messages.append({"role": "user", "content": "Continue. Use the files already read and make progress."})
+
+    prompt, files = qwen_messages_to_prompt_and_files(messages, max_prompt_chars=5200)
+
+    assert files == []
+    assert len(prompt) <= 5200
+    assert "Read result excerpts:" in prompt
+    assert "Cache rule:" in prompt
+    assert "AUTO_CURATOR_TEMPERATURE_SENTINEL" in prompt
+    assert "BILIBILI_RETRY_SENTINEL" in prompt
+    assert "also matches auto_curator.py" in prompt
+    assert "Do not Read/Glob the same path only to recover content" in prompt
 
 
 def test_qwen_messages_prepend_stateless_web_api_guard() -> None:
@@ -10461,6 +12288,43 @@ def test_qwen_messages_tool_observation_does_not_replace_current_request() -> No
     assert "audit current project code and list improvements" in current_block
     assert "Tool result for Glob" not in current_block
     assert "Use this tool result to continue the task" not in current_block
+
+
+def test_qwen_messages_compaction_ignores_error_recovery_final_as_current_request() -> None:
+    huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
+    tool_protocol = (
+        "You are using WebAI Gateway's strict tool bridge.\n"
+        "Available tools: Glob, Read, Edit.\n"
+        "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
+    )
+    original_task = "Fix the Mindcraft local agent task and update the requested project files."
+    recovery_explanation = (
+        "Based on DS2API_HISTORY.txt, the latest user request is a system-generated error "
+        "correction instruction. It says the previous answer went off task into agent or "
+        "environment configuration advice and asks to continue the original local-agent task. "
+        "However, the original task is missing, so I cannot know whether more evidence is "
+        "needed or whether I should output exactly one valid DSML tool block."
+    )
+
+    prompt, files = qwen_messages_to_prompt_and_files(
+        [
+            {"role": "system", "content": huge_system_prefix + "\n\n" + tool_protocol},
+            {"role": "user", "content": original_task},
+            {"role": "assistant", "content": "Assistant requested tool calls: Glob({\"pattern\":\"**/*.py\"})"},
+            {"role": "tool", "content": "config/settings.py\napp/main.py"},
+            {"role": "assistant", "content": recovery_explanation},
+            {"role": "user", "content": recovery_explanation},
+        ],
+        max_prompt_chars=1800,
+    )
+
+    assert files == []
+    marker = "=== CURRENT USER REQUEST (highest priority) ==="
+    assert marker in prompt
+    current_block = prompt[prompt.rfind(marker) :]
+    assert original_task in current_block
+    assert "system-generated error correction" not in current_block
+    assert "original task is missing" not in current_block
 
 
 def test_qwen_messages_compaction_keeps_prior_url_for_referential_followup() -> None:
@@ -14036,6 +15900,93 @@ def test_tool_bridge_treats_chinese_continue_execute_as_continuation() -> None:
     assert context.task_text == "落地 Mindcraft 项目安全改进。\n继续执行"
 
 
+def test_tool_bridge_treats_chinese_direct_modify_as_task_continuation() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in ["Skill", "Read", "Edit", "Bash"]
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all", max_tools_in_prompt=32),
+    )
+    prior_task = "配置 Claude Code 自动跳过权限确认，直接修改当前项目的 .claude/settings.json。"
+    context = prefer_local_tools_for_local_agent_task(
+        context,
+        [
+            {"role": "user", "content": prior_task},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_skill",
+                        "name": "Skill",
+                        "input": {"skill": "using-superpowers"},
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_skill", "content": "Skill loaded"}]},
+            {"role": "user", "content": "你直接修改"},
+        ],
+    )
+
+    assert prior_task in context.task_text
+    assert "你直接修改" in context.task_text
+    assert context.task_text != "你直接修改"
+
+
+def test_tool_bridge_all_profile_retries_deferred_named_tool_after_direct_modify_followup() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in ["Skill", "Read", "Edit", "Bash"]
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all", max_tools_in_prompt=32),
+    )
+    context = prefer_local_tools_for_local_agent_task(
+        context,
+        [
+            {"role": "user", "content": "配置 Claude Code 自动跳过权限确认，直接修改当前项目的 .claude/settings.json。"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_skill",
+                        "name": "Skill",
+                        "input": {"skill": "using-superpowers"},
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_skill", "content": "Skill loaded"}]},
+            {"role": "user", "content": "动手改啊"},
+        ],
+    )
+
+    result = parse_tool_response(
+        "我将使用 update-config Skill 来修改当前项目的 .claude/settings.json，添加常见 Bash 命令到 allowlist。",
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is not None
+    assert result.error.kind in {"deferred_named_tool_action_without_call", "deferred_code_change_without_call"}
+    assert result.error.repairable is True
+
+
 def test_tool_bridge_allows_complete_review_summary_without_tool_call() -> None:
     context = build_context(
         [
@@ -15092,7 +17043,7 @@ def test_qwen_web_messages_render_native_tool_calls_in_prompt_history() -> None:
     assert "Assistant: <|DSML|tool_calls>" in prompt
     assert '<|DSML|invoke name="Bash">' in prompt
     assert '<|DSML|parameter name="command"><![CDATA[git describe --tags --always]]>' in prompt
-    assert "Tool: v1.2.3" in prompt
+    assert "Tool: [name=Bash tool_call_id=call_bash]\nv1.2.3" in prompt
 
 
 def test_qwen_web_compaction_ignores_system_reminder_as_current_request() -> None:
@@ -15988,7 +17939,7 @@ def test_qwen_web_auto_activation_uses_websearch_for_external_project_search_fol
     assert "tools" not in payload
     assert "tool_choice" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "TOOL CALL FORMAT - FOLLOW EXACTLY" in prompt
     assert "nexu-openai-proxy" in prompt
     assert search_followup in prompt
     assert "Active local project context" not in prompt
@@ -16053,7 +18004,7 @@ def test_qwen_web_search_followup_prefers_downstream_tool_over_native_search(tmp
     payload = seen["payload"]
     assert payload.get("_webai_native_web_search") is False
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "TOOL CALL FORMAT - FOLLOW EXACTLY" in prompt
     assert "foo-lib" in prompt
     assert response.json()["content"] == [
         {
@@ -16197,7 +18148,7 @@ def test_qwen_web_new_project_info_task_resets_prior_tool_loop_state(tmp_path: P
     assert response.status_code == 200
     payload = seen["payload"]
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "TOOL CALL FORMAT - FOLLOW EXACTLY" in prompt
     assert "New user task boundary" in prompt
     diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
     started = next(event for event in diagnostics if event["kind"] == "completion_request_started")
@@ -16459,6 +18410,876 @@ def test_qwen_web_all_profile_retries_no_task_final_after_tool_loop(tmp_path: Pa
     assert "status_only_final_without_task_answer" in retry_prompt
     assert "审查当前项目的代码" in retry_prompt
     assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
+
+
+def test_qwen_web_all_profile_preserves_task_after_direct_modify_followup(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class DeferredModifyThenToolQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response(
+                    "我将使用 update-config Skill 来修改当前项目的 .claude/settings.json，添加常见 Bash 命令到 allowlist。"
+                )
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"toolu_read_settings","name":"Read","input":{"file_path":".claude/settings.json"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=DeferredModifyThenToolQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    prior_task = "配置 Claude Code 自动跳过权限确认，直接修改当前项目的 .claude/settings.json。"
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": prior_task},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_skill",
+                            "name": "Skill",
+                            "input": {"skill": "using-superpowers"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_skill", "content": "Skill loaded"}]},
+                {"role": "user", "content": "你直接修改"},
+            ],
+            "tools": [
+                {"name": "Skill", "description": "Load skill", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run command", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 32000,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert prior_task in str(seen_payloads[0].get("_webai_current_task_text") or "")
+    assert "你直接修改" in str(seen_payloads[0].get("_webai_current_task_text") or "")
+    initial_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[0]["messages"])
+    assert "New user task boundary" not in initial_prompt
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "deferred" in retry_prompt
+    assert prior_task in retry_prompt
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_read_settings",
+            "name": "Read",
+            "input": {"file_path": ".claude/settings.json"},
+        }
+    ]
+
+
+def test_qwen_web_all_profile_passes_repeated_read_loop_like_ds2api(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    repeated_read = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_repeat","name":"Read",'
+        '"input":{"file_path":"E:/ProjectX/auto-curator/bilibili_mcp_extractor.py"}}]}'
+        "\n```"
+    )
+    progress_call = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_grep_progress","name":"Grep",'
+        '"input":{"path":"E:/ProjectX/auto-curator","pattern":"extract"}}]}'
+        "\n```"
+    )
+
+    class RepeatingReadQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response(repeated_read)
+            return _openai_response(progress_call)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=RepeatingReadQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "Review this local project and implement the needed code changes."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_1",
+                            "name": "Read",
+                            "input": {"file_path": "E:/ProjectX/auto-curator/bilibili_mcp_extractor.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_1",
+                            "content": "def extract():\n    return 'old'\n",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_2",
+                            "name": "Read",
+                            "input": {"file_path": "E:/ProjectX/auto-curator/bilibili_mcp_extractor.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_2",
+                            "content": "def extract():\n    return 'old'\n",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Grep", "description": "Search files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    assert "x-webai-tool-bridge-error" not in response.headers
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_repeat",
+            "name": "Read",
+            "input": {"file_path": "E:/ProjectX/auto-curator/bilibili_mcp_extractor.py"},
+        }
+    ]
+
+
+def test_qwen_web_all_profile_passes_repeated_unchanged_read_like_ds2api(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    repeated_read = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_repeat","name":"Read",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py"}}]}'
+        "\n```"
+    )
+    progress_call = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_edit_auto","name":"Edit",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py",'
+        '"old_string":"json_validation = False","new_string":"json_validation = True"}}]}'
+        "\n```"
+    )
+
+    class QwenClientThatOnlyProgressesWhenReadIsHidden:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if len(seen_payloads) == 1:
+                return _openai_response(repeated_read)
+            if (
+                "TEMPORARY TOOL AVAILABILITY OVERRIDE" in joined
+                and "Temporarily unavailable tools: Glob, Read" in joined
+                and "Available tools for this recovery turn: Edit" in joined
+            ):
+                return _openai_response(progress_call)
+            return _openai_response(repeated_read)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=QwenClientThatOnlyProgressesWhenReadIsHidden,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "Continue. Use the files already read and make progress."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_1",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_1",
+                            "content": "temperature=0.7\njson_validation = False\n",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_2",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_2",
+                            "content": "File unchanged since last read; content already available in history.",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "x-webai-tool-bridge-error" not in response.headers
+    assert len(seen_payloads) == 1
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_repeat",
+            "name": "Read",
+            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+        }
+    ]
+
+
+def test_qwen_web_agent_profile_recovers_missing_required_edit_input_after_no_progress_repair(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    repeated_read = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_repeat","name":"Read",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py"}}]}'
+        "\n```"
+    )
+    bad_edit = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_bad_edit","name":"Edit",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py"}}]}'
+        "\n```"
+    )
+    good_edit = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_good_edit","name":"Edit",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py",'
+        '"old_string":"json_validation = False","new_string":"json_validation = True"}}]}'
+        "\n```"
+    )
+
+    class MissingRequiredEditRecoveryQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if len(seen_payloads) == 1:
+                return _openai_response(repeated_read)
+            if "MISSING REQUIRED TOOL INPUT RECOVERY" in joined:
+                return _openai_response(good_edit)
+            return _openai_response(bad_edit)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="agent"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=MissingRequiredEditRecoveryQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "Continue. Use the files already read and make progress."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_1",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_1",
+                            "content": "temperature=0.7\njson_validation = False\n",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_2",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_2",
+                            "content": "File content unchanged; use the earlier Read result already in the conversation.",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read files",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {
+                    "name": "Edit",
+                    "description": "Edit files",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                },
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 3
+    assert "x-webai-tool-bridge-error" not in response.headers
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[2]["messages"])
+    assert "MISSING REQUIRED TOOL INPUT RECOVERY" in retry_prompt
+    assert "old_string" in retry_prompt
+    assert "new_string" in retry_prompt
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_good_edit",
+            "name": "Edit",
+            "input": {
+                "file_path": ".claude/skills/scripts/auto_curator.py",
+                "old_string": "json_validation = False",
+                "new_string": "json_validation = True",
+            },
+        }
+    ]
+
+
+def test_qwen_web_all_profile_passes_shell_discovery_like_ds2api(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    repeated_shell = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_repeat_shell","name":"Bash",'
+        '"input":{"command":"grep -n \\"json_validation\\" .claude/skills/scripts/auto_curator.py"}}]}'
+        "\n```"
+    )
+    progress_call = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_edit_auto","name":"Edit",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py",'
+        '"old_string":"json_validation = False","new_string":"json_validation = True"}}]}'
+        "\n```"
+    )
+
+    class QwenClientThatOnlyProgressesWhenShellDiscoveryIsHidden:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if len(seen_payloads) == 1:
+                return _openai_response(repeated_shell)
+            if (
+                "TEMPORARY TOOL AVAILABILITY OVERRIDE" in joined
+                and "Temporarily unavailable tools: Bash, Glob, Grep, Read" in joined
+                and "Available tools for this recovery turn: Edit" in joined
+            ):
+                return _openai_response(progress_call)
+            return _openai_response(repeated_shell)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=QwenClientThatOnlyProgressesWhenShellDiscoveryIsHidden,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "Continue. Use the inspected files and make the requested code change."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_shell_1",
+                            "name": "Bash",
+                            "input": {"command": 'grep -n "temperature" .claude/skills/scripts/auto_curator.py'},
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_shell_1", "content": "42:temperature = 0.7"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_shell_2",
+                            "name": "Bash",
+                            "input": {"command": 'cat -n .claude/skills/scripts/auto_curator.py | grep -A 20 "json"'},
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_shell_2", "content": "88:json_validation = False"}]},
+            ],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Grep", "description": "Search files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "x-webai-tool-bridge-error" not in response.headers
+    assert len(seen_payloads) == 1
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_repeat_shell",
+            "name": "Bash",
+            "input": {"command": 'grep -n "json_validation" .claude/skills/scripts/auto_curator.py'},
+        }
+    ]
+
+
+def test_repair_payload_marks_read_and_glob_unavailable_for_read_cache_loop() -> None:
+    bridge_result = BridgeResult(
+        content="",
+        tool_calls=[],
+        raw_content='<|DSML|tool_calls><|DSML|invoke name="Read"></|DSML|invoke></|DSML|tool_calls>',
+        error=BridgeError(
+            "repeat_unchanged_read_without_progress",
+            "The model repeated a Read for a file whose latest tool result said the content was unchanged.",
+            repairable=True,
+        ),
+    )
+
+    repaired = build_repair_payload(
+        {
+            "messages": [
+                {"role": "system", "content": "Available tools: Read, Glob, Edit"},
+                {"role": "user", "content": "Continue the implementation."},
+            ]
+        },
+        bridge_result,
+        allowed_tools={"Read", "Glob", "Edit"},
+    )
+
+    joined = "\n".join(str(message.get("content", "")) for message in repaired["messages"])
+    assert "TEMPORARY TOOL AVAILABILITY OVERRIDE" in joined
+    assert "Temporarily unavailable tools: Glob, Read" in joined
+    assert "Available tools for this recovery turn: Edit" in joined
+
+
+def test_qwen_web_all_profile_passes_batch_repeated_unchanged_read_like_ds2api(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    repeated_read = (
+        "```tool_json\n"
+        '{"calls":['
+        '{"id":"call_auto","name":"Read","input":{"file_path":".claude/skills/scripts/auto_curator.py"}},'
+        '{"id":"call_bili","name":"Read","input":{"file_path":".claude/skills/scripts/bilibili_api_extractor.py"}}'
+        "]} "
+        "\n```"
+    )
+    progress_call = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_edit_auto","name":"Edit",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py",'
+        '"old_string":"json_validation = False","new_string":"json_validation = True"}}]}'
+        "\n```"
+    )
+
+    class RepeatingUnchangedReadQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response(repeated_read)
+            return _openai_response(progress_call)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=RepeatingUnchangedReadQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "继续修改 auto_curator.py，锁定 LLM 温度并增加 JSON 输出校验。"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_1",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_1",
+                            "content": "temperature=0.7\njson_validation = False\n",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_2",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_2",
+                            "content": "File unchanged since last read; content already available in history.",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_bili_1",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/bilibili_api_extractor.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_bili_1",
+                            "content": "retry_count = 1\nbackoff = False\n",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_bili_2",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/bilibili_api_extractor.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_bili_2",
+                            "content": "File unchanged since last read; content already available in history.",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    assert "x-webai-tool-bridge-error" not in response.headers
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_auto",
+            "name": "Read",
+            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+        },
+        {
+            "type": "tool_use",
+            "id": "toolu_call_bili",
+            "name": "Read",
+            "input": {"file_path": ".claude/skills/scripts/bilibili_api_extractor.py"},
+        },
+    ]
+
+
+def test_qwen_web_all_profile_does_not_escalate_unchanged_read_like_ds2api(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    repeated_read = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_repeat","name":"Read",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py"}}]}'
+        "\n```"
+    )
+    progress_call = (
+        "```tool_json\n"
+        '{"calls":[{"id":"call_edit_auto","name":"Edit",'
+        '"input":{"file_path":".claude/skills/scripts/auto_curator.py",'
+        '"old_string":"json_validation = False","new_string":"json_validation = True"}}]}'
+        "\n```"
+    )
+
+    class QwenClientThatNeedsNoProgressEscalation:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            joined = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if "STRICT NO-PROGRESS ESCALATION" in joined and "Available tools for this recovery turn: Edit" in joined:
+                return _openai_response(progress_call)
+            return _openai_response(repeated_read)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=QwenClientThatNeedsNoProgressEscalation,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [
+                {"role": "user", "content": "继续修改 auto_curator.py，使用已经读取过的内容推进代码变更。"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_1",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_1",
+                            "content": "temperature=0.7\njson_validation = False\n",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_2",
+                            "name": "Read",
+                            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_2",
+                            "content": "File unchanged since last read; content already available in history.",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+                {"name": "Grep", "description": "Search files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "x-webai-tool-bridge-error" not in response.headers
+    assert len(seen_payloads) == 1
+    assert response.json()["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_repeat",
+            "name": "Read",
+            "input": {"file_path": ".claude/skills/scripts/auto_curator.py"},
+        }
+    ]
 
 
 def test_qwen_web_tool_bridge_extracts_embedded_json_tool_call_after_prose(tmp_path: Path) -> None:
@@ -17386,6 +20207,106 @@ def test_request_diagnostics_records_request_start_with_tool_context() -> None:
     assert started["toolBridgeAllowedTools"] == ["Read"]
     assert started["toolBridgeExposurePolicy"] == "all"
     assert diagnostics[-1]["kind"] == "completion_response"
+
+
+def test_openai_upstream_http_error_returns_sanitized_openai_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = """
+        <html><title>500 Internal Privoxy Error</title>
+        <body>Could not load template file no-server-data. Authorization: Bearer secret-token</body></html>
+        """
+        return httpx.Response(
+            500,
+            content=body.encode("utf-8"),
+            headers={"content-type": "text/html"},
+            request=request,
+        )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="gpt-pro"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "gpt-pro",
+            "messages": [{"role": "user", "content": "请只回复 OK"}],
+        },
+    )
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "api_error"
+    assert error["code"] == "upstream_http_error"
+    assert "WebAI2API upstream returned HTTP 500" in error["message"]
+    assert "Internal Privoxy Error" in error["message"]
+    assert "secret-token" not in error["message"]
+    event = diagnostics[-1]
+    assert event["kind"] == "completion_error"
+    assert event["route"] == "upstream"
+    assert event["model"] == "gpt-pro"
+    assert event["statusCode"] == 500
+    assert event["errorKind"] == "upstream_http_error"
+    assert "secret-token" not in event["errorPreview"]
+
+
+def test_openai_upstream_stream_error_event_returns_sanitized_openai_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = (
+            'data: {"error":{"message":"生成任务失败: No generations found in stream. token=session-secret",'
+            '"type":"server_error","code":"GENERATION_FAILED"}}\n\n'
+            "data: [DONE]\n\n"
+        )
+        return httpx.Response(
+            200,
+            text=body,
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="gpt-pro"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "gpt-pro",
+            "stream": True,
+            "messages": [{"role": "user", "content": "请只回复 OK"}],
+        },
+    )
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "api_error"
+    assert error["code"] == "upstream_stream_error"
+    assert "No generations found in stream" in error["message"]
+    assert "session-secret" not in error["message"]
+    event = diagnostics[-1]
+    assert event["kind"] == "completion_error"
+    assert event["statusCode"] == 200
+    assert event["errorKind"] == "upstream_stream_error"
+    assert "session-secret" not in event["errorPreview"]
 
 
 def test_request_diagnostics_records_qwen_coder_provider_diagnostic(tmp_path: Path) -> None:

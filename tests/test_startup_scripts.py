@@ -10,5 +10,6 @@ def test_startup_bat_starts_webai2api_sidecar_without_bootstrap_mutation() -> No
     assert "WebAI2API sidecar" in script
     assert ":8500.*LISTENING" in script
     assert "pnpm','start" in script
+    assert "%%~fI" not in script
     assert "pnpm install" not in lowered
     assert "pnpm run init" not in lowered

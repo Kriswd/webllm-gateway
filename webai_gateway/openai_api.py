@@ -7,11 +7,17 @@ import time
 import uuid
 from dataclasses import replace
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from webai_gateway.config import GatewayConfig
 from webai_gateway.assistant_turn import build_assistant_turn
+from webai_gateway.prompt_compaction import (
+    STATELESS_WEB_API_GUARD,
+    compact_role_messages_as_ds2api_history,
+    message_entries_for_ds2api_prompt,
+)
 from webai_gateway.tool_bridge import (
     BridgeResult,
     ToolBridgeContext,
@@ -53,7 +59,10 @@ NATIVE_WEB_SEARCH_RETRY_INSTRUCTION = (
     "如果无法确认，请明确说明无法确认及原因。"
 )
 RESPONSE_LANGUAGE_POLICY_MARKER = "WebAI Gateway response language policy"
+WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER = "WebAI Gateway current turn tool-choice policy"
 RESPONSE_LANGUAGE_OFF_VALUES = {"", "off", "none", "false", "disabled"}
+WEBAI2API_CHATGPT_TEXT_PROMPT_MAX_CHARS = 12000
+WEBAI2API_CHATGPT_TEXT_MODELS = {"gpt-instant", "gpt-thinking", "gpt-pro"}
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _NATIVE_SEARCH_PLACEHOLDER_RE = re.compile(
     r"^\s*(?:好的[，,]?\s*)?"
@@ -130,20 +139,118 @@ def build_upstream_payload(
         payload["_webai_native_web_search"] = native_web_search
     if bridge:
         messages = body.get("messages") if isinstance(body.get("messages"), list) else []
-        payload["messages"] = _with_response_language_instruction(
+        prepared_messages = _with_response_language_instruction(
             prepare_openai_messages(messages, bridge_context),
             config.provider_runtime.response_language,
         )
+        if _should_inject_webai2api_current_tool_choice_policy(config, bridge_context):
+            prepared_messages = _with_webai2api_current_tool_choice_policy(prepared_messages, bridge_context)
+        payload["messages"] = prepared_messages
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
     else:
-        payload["messages"] = _with_response_language_instruction(
-            payload.get("messages"),
-            config.provider_runtime.response_language,
-        )
+        if _should_inject_response_language_instruction(config, native_web_search=native_web_search):
+            payload["messages"] = _with_response_language_instruction(
+                payload.get("messages"),
+                config.provider_runtime.response_language,
+            )
+        else:
+            payload["messages"] = [dict(message) for message in payload.get("messages", []) if isinstance(message, dict)]
         if native_web_search:
             payload["messages"] = _with_native_web_search_instruction(payload.get("messages"))
     return payload, bridge, allowed_tools, bridge_context
+
+
+def _should_inject_response_language_instruction(config: GatewayConfig, *, native_web_search: bool = False) -> bool:
+    if native_web_search:
+        return True
+    return not _looks_like_webai2api_sidecar_url(config.upstream.base_url)
+
+
+def _should_inject_webai2api_current_tool_choice_policy(
+    config: GatewayConfig,
+    bridge_context: ToolBridgeContext,
+) -> bool:
+    if not _looks_like_webai2api_sidecar_url(config.upstream.base_url):
+        return False
+    policy = getattr(bridge_context, "tool_choice_policy", None)
+    is_required = getattr(policy, "is_required", None)
+    return bool(bridge_context.enabled and callable(is_required) and is_required())
+
+
+def _with_webai2api_current_tool_choice_policy(
+    messages: Any,
+    bridge_context: ToolBridgeContext,
+) -> list[dict[str, Any]]:
+    normalized = [dict(message) for message in messages if isinstance(message, dict)]
+    instruction = _webai2api_current_tool_choice_policy_text(bridge_context)
+    if not instruction:
+        return normalized
+    for index in range(len(normalized) - 1, -1, -1):
+        if normalized[index].get("role") != "user":
+            continue
+        normalized[index] = _append_text_to_message_content(normalized[index], instruction)
+        return normalized
+    return [*normalized, {"role": "user", "content": instruction}]
+
+
+def _append_text_to_message_content(message: dict[str, Any], text: str) -> dict[str, Any]:
+    out = dict(message)
+    content = out.get("content")
+    if isinstance(content, str):
+        if WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER in content:
+            return out
+        out["content"] = f"{content.rstrip()}\n\n{text}".strip()
+        return out
+    if isinstance(content, list):
+        if any(
+            isinstance(item, dict)
+            and WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER in str(item.get("text") or item.get("content") or "")
+            for item in content
+        ):
+            return out
+        out["content"] = [*content, {"type": "text", "text": text}]
+        return out
+    existing = _as_text(content).strip()
+    out["content"] = f"{existing}\n\n{text}".strip() if existing else text
+    return out
+
+
+def _webai2api_current_tool_choice_policy_text(bridge_context: ToolBridgeContext) -> str:
+    policy = bridge_context.tool_choice_policy
+    mode = str(getattr(policy, "mode", "") or "").strip().lower()
+    allowed_names = sorted(str(name).strip() for name in bridge_context.allowed_names if str(name).strip())
+    allowed = ", ".join(allowed_names) or "(none)"
+    lines = [
+        f"[{WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER}]",
+        "This current turn requires a Gateway tool call. Do not answer directly, browse, search, cite web results, or output prose.",
+        f"Allowed tool names for this turn: {allowed}.",
+        "The assistant response must start with <|DSML|tool_calls> and contain exactly one Gateway DSML tool-call block.",
+    ]
+    if mode == "forced":
+        forced_name = str(getattr(policy, "forced_name", "") or "").strip()
+        if not forced_name and len(allowed_names) == 1:
+            forced_name = allowed_names[0]
+        if forced_name:
+            lines.append(f"Forced tool name: {forced_name}. Do not call any other tool.")
+    elif mode == "required":
+        lines.append("Use at least one allowed tool. If only one tool is listed, use that tool.")
+    example = _required_tool_choice_recovery_example(set(allowed_names), bridge_context)
+    if example:
+        lines.append("Required DSML shape for this turn:")
+        lines.append(example.strip())
+    return "\n".join(lines)
+
+
+def _looks_like_webai2api_sidecar_url(base_url: str) -> bool:
+    try:
+        parsed = urlparse(str(base_url or ""))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return False
+    return parsed.port == 8500
 
 
 def _should_fallback_to_safe_exposure(
@@ -284,41 +391,53 @@ def build_tool_refusal_recovery_payload(
     bridge_result: BridgeResult,
     *,
     allowed_tools: set[str],
+    escalation: bool = False,
 ) -> dict[str, Any]:
     recovered = dict(payload)
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
-    allowed = ", ".join(sorted(allowed_tools)) or "(none)"
     error_kind = bridge_result.error.kind if bridge_result.error else ""
+    disabled_tools, effective_allowed_tools = _recovery_tool_visibility(
+        allowed_tools,
+        error_kind=error_kind,
+        raw_content=bridge_result.raw_content,
+    )
+    allowed = ", ".join(sorted(effective_allowed_tools)) or "(none)"
     reason = bridge_result.error.message if bridge_result.error else "tool refusal without call"
-    reason = _sanitize_discovery_tool_guidance(reason, allowed_tools, error_kind=error_kind)
-    example = _tool_refusal_recovery_example(allowed_tools, error_kind=error_kind)
+    reason = _sanitize_discovery_tool_guidance(reason, effective_allowed_tools, error_kind=error_kind)
+    example = _tool_refusal_recovery_example(effective_allowed_tools, error_kind=error_kind)
     shell_instruction = (
         "Bash is allowed; request Bash only when the task explicitly needs git/gh/shell behavior.\n"
-        if "Bash" in allowed_tools
+        if "Bash" in effective_allowed_tools
         else "Bash/shell is not in the allowed tools list for this turn. Do not request Bash, shell, terminal, cmd, or powershell.\n"
     )
-    non_progress_instruction = (
-        "The rejection is a non-progress loop. Do not repeat the same discovery/read/skill/question input. "
-        "Use the earlier result already in the conversation. If more evidence is required, choose one materially "
-        "different Read/Grep/Glob input; if evidence is enough, return a substantive final answer with no JSON.\n"
-        if error_kind
-        in {
-            "repeat_discovery_call_without_progress",
-            "repeat_shell_housekeeping_without_progress",
-            "repeat_unchanged_read_without_progress",
-            "repeat_same_skill_without_progress",
-            "repeat_same_ask_user_without_progress",
-            "ask_user_question_budget_exceeded",
-            "optional_scope_question_without_need",
-        }
-        else ""
+    non_progress_instruction = _non_progress_recovery_instruction(error_kind, disabled_tools)
+    progress_tool_hint = (
+        "Prefer Edit/MultiEdit/Write to integrate code changes using the already gathered evidence before claiming completion.\n"
+        if disabled_tools
+        else "Prefer Read/Grep to inspect existing code or Edit/MultiEdit to integrate new code into existing entry points before claiming completion.\n"
     )
     retry_messages.append({"role": "assistant", "content": (bridge_result.raw_content or "")[:4000]})
+    retry_messages = _with_recovery_tool_override_message(
+        retry_messages,
+        bridge_result,
+        allowed_tools=allowed_tools,
+    )
+    escalation_instruction = ""
+    if escalation:
+        escalation_instruction = (
+            "STRICT NO-PROGRESS ESCALATION\n"
+            "The previous internal recovery was ignored and the model repeated a temporarily unavailable no-progress tool. "
+            "For this request, those tools are hard-disabled by the Gateway. Do not request Read, Glob, Grep, LS, LSP, Bash, shell, terminal, cmd, or powershell when they are listed as temporarily unavailable. "
+            "If Edit, MultiEdit, Write, or another progress tool is available and the task asks for code changes, use one progress tool now with the evidence already in the conversation. "
+            "If no progress tool is available, return a substantive final answer with no JSON.\n"
+            "严格无进展升级：上一次内部恢复已经被忽略。不要再次请求临时不可用的读取、搜索或 shell 工具；基于已有工具结果推进 Edit/MultiEdit/Write，或直接给出最终答复。\n"
+        )
     retry_messages.append(
         {
             "role": "user",
             "content": (
+                f"{escalation_instruction}"
                 "Your previous reply still refused to use tools, claimed you cannot access the filesystem/run commands, "
                 "offered manual steps instead of a tool request, or claimed code work was complete after an isolated file write. "
                 "That is incorrect for this Gateway tool bridge.\n"
@@ -331,9 +450,9 @@ def build_tool_refusal_recovery_payload(
                 f"{non_progress_instruction}"
                 "If the rejection says write_after_failed_read_without_discovery, do not Write the same missing path or a nearby missing path. "
                 "If it says write_after_failed_path_without_discovery, do not Write under the missing path. "
-                f"Use {_allowed_discovery_tool_phrase(allowed_tools)} to discover the repository structure first.\n"
+                f"Use {_allowed_discovery_tool_phrase(effective_allowed_tools)} to discover the repository structure first.\n"
                 "If the task requires local project work, output exactly one DSML <|DSML|tool_calls> block using one allowed tool. "
-                "Prefer Read/Grep to inspect existing code or Edit/MultiEdit to integrate new code into existing entry points before claiming completion.\n"
+                f"{progress_tool_hint}"
                 "If no listed tool can help, answer honestly without JSON. Never invent tool names.\n"
                 "Required format when using a tool:\n"
                 f"{example}\n"
@@ -343,7 +462,188 @@ def build_tool_refusal_recovery_payload(
     )
     recovered["messages"] = retry_messages
     recovered["stream"] = False
+    _filter_recovery_payload_tools(recovered, disabled_tools)
     return recovered
+
+
+def build_missing_required_tool_input_recovery_payload(
+    payload: dict[str, Any],
+    bridge_result: BridgeResult,
+    *,
+    allowed_tools: set[str],
+) -> dict[str, Any]:
+    recovered = dict(payload)
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
+    error_kind = bridge_result.error.kind if bridge_result.error else "missing_required_tool_input"
+    reason = bridge_result.error.message if bridge_result.error else "The tool input is missing required fields."
+    requested_compact = {_compact_recovery_tool_name(name) for name in _requested_tool_names_from_raw(bridge_result.raw_content)}
+    same_tool_allowed = {
+        name
+        for name in allowed_tools
+        if requested_compact and _compact_recovery_tool_name(name) in requested_compact
+    }
+    effective_allowed_tools = same_tool_allowed or {name for name in allowed_tools if name}
+    disabled_tools = {name for name in allowed_tools if name not in effective_allowed_tools}
+    allowed = ", ".join(sorted(effective_allowed_tools)) or "(none)"
+    example = _tool_refusal_recovery_example(effective_allowed_tools, error_kind=error_kind)
+    edit_instruction = ""
+    if any(_compact_recovery_tool_name(name) == "edit" for name in effective_allowed_tools):
+        edit_instruction = (
+            "For Edit, input must include file_path, old_string, and new_string. "
+            "old_string must be an exact string already present in a previous Read/tool_result. "
+            "If you do not have an exact old_string, do not emit a partial Edit call; answer without JSON and say what exact evidence is missing.\n"
+        )
+    retry_messages.append({"role": "assistant", "content": (bridge_result.raw_content or "")[:4000]})
+    retry_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "MISSING REQUIRED TOOL INPUT RECOVERY\n"
+                "Your previous tool call selected a real allowed tool but omitted required input fields. "
+                "This is an internal Gateway recovery turn; do not expose this diagnostic downstream.\n"
+                f"Gateway error code: {error_kind}.\n"
+                f"Gateway rejection reason: {reason}\n"
+                f"Allowed tools for this schema recovery turn: {allowed}.\n"
+                "Fix the same tool call with a complete input object. Do not switch back to read/search/shell tools unless no same tool is listed above. "
+                "Do not output prose around a tool call.\n"
+                f"{edit_instruction}"
+                "If using a tool, output exactly one DSML <|DSML|tool_calls> block with every required input field. "
+                "If no complete valid tool input can be produced from the conversation, answer honestly without JSON.\n"
+                "Required complete format:\n"
+                f"{example}"
+            ),
+        }
+    )
+    recovered["messages"] = retry_messages
+    recovered["stream"] = False
+    _filter_recovery_payload_tools(recovered, disabled_tools)
+    return recovered
+
+
+def build_required_tool_choice_recovery_payload(
+    payload: dict[str, Any],
+    bridge_result: BridgeResult,
+    *,
+    allowed_tools: set[str],
+    bridge_context: ToolBridgeContext | None = None,
+) -> dict[str, Any]:
+    recovered = dict(payload)
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
+    effective_allowed_tools = {str(name).strip() for name in allowed_tools if str(name).strip()}
+    allowed = ", ".join(sorted(effective_allowed_tools)) or "(none)"
+    reason = bridge_result.error.message if bridge_result.error else "tool_choice requires a tool call."
+    example = _required_tool_choice_recovery_example(effective_allowed_tools, bridge_context)
+    retry_messages.append({"role": "assistant", "content": (bridge_result.raw_content or "")[:4000]})
+    retry_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "REQUIRED TOOL CHOICE RECOVERY\n"
+                "The previous reply did not contain a valid Gateway tool call even though this request requires one. "
+                "This is an internal Gateway retry; do not expose this diagnostic downstream.\n"
+                "Use the tool schema already listed in the system prompt. Do not output prose, markdown fences, role labels, "
+                "provider-native browsing tags, or JSON outside DSML.\n"
+                "Do not browse, search, cite web results, or answer with factual content on this retry; the only valid "
+                "assistant response is one Gateway DSML tool call for the required tool.\n"
+                f"Gateway error code: tool_choice_violation.\n"
+                f"Gateway rejection reason: {reason}\n"
+                f"Allowed tools for this required-tool retry: {allowed}.\n"
+                "Output exactly one DSML block. The first non-whitespace characters must be <|DSML|tool_calls>. "
+                "Use only one of the allowed tool names above and include a complete object-shaped input using the schema. "
+                "If a tool was forced by tool_choice, that forced tool is the only allowed tool for this retry.\n"
+                "Required format:\n"
+                f"{example}"
+            ),
+        }
+    )
+    recovered["messages"] = retry_messages
+    recovered["stream"] = False
+    recovered.pop("tools", None)
+    recovered.pop("tool_choice", None)
+    return recovered
+
+
+def _required_tool_choice_recovery_example(
+    allowed_tools: set[str],
+    bridge_context: ToolBridgeContext | None,
+) -> str:
+    if bridge_context is None:
+        return _tool_refusal_recovery_example(allowed_tools, error_kind="tool_choice_violation")
+    allowed_lower = {name.lower() for name in allowed_tools}
+    specs = [
+        tool
+        for tool in getattr(bridge_context, "tools", [])
+        if getattr(tool, "name", "").lower() in allowed_lower
+    ]
+    if len(specs) != 1:
+        return _tool_refusal_recovery_example(allowed_tools, error_kind="tool_choice_violation")
+    spec = specs[0]
+    schema = spec.input_schema if isinstance(spec.input_schema, dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    keys = [str(key) for key in required if isinstance(key, str)]
+    if not keys and len(properties) == 1:
+        keys = [str(next(iter(properties)))]
+    args = {
+        key: _required_tool_choice_example_value(
+            key,
+            properties.get(key) if isinstance(properties, dict) else {},
+            str(getattr(bridge_context, "task_text", "") or ""),
+        )
+        for key in keys[:8]
+    }
+    return _dsml_example(spec.name, args)
+
+
+def _required_tool_choice_example_value(key: str, schema: Any, task_text: str) -> Any:
+    schema_type = ""
+    if isinstance(schema, dict):
+        raw_type = schema.get("type")
+        schema_type = str(raw_type[0] if isinstance(raw_type, list) and raw_type else raw_type or "").lower()
+    named = _extract_required_tool_choice_named_value(key, task_text)
+    if named:
+        return named
+    compact = re.sub(r"[^a-z0-9]+", "", key.lower())
+    if compact in {"city", "location", "place"}:
+        place = _extract_required_tool_choice_place_value(task_text)
+        if place:
+            return place
+    if schema_type in {"integer", "number"}:
+        return 1
+    if schema_type == "boolean":
+        return True
+    if schema_type == "array":
+        return ["value"]
+    if schema_type == "object":
+        return {}
+    return "value"
+
+
+def _extract_required_tool_choice_named_value(key: str, task_text: str) -> str:
+    if not key or not task_text:
+        return ""
+    pattern = re.compile(
+        rf"(?i)\b{re.escape(key)}\b\s*(?:=|:|is|with|为|是)?\s*([A-Za-z][A-Za-z0-9_. -]{{0,60}})",
+        re.IGNORECASE,
+    )
+    match = pattern.search(task_text)
+    if not match:
+        return ""
+    value = re.split(r"[.;,!?，。；！？\n]", match.group(1).strip(), maxsplit=1)[0].strip()
+    return value[:80]
+
+
+def _extract_required_tool_choice_place_value(task_text: str) -> str:
+    if not task_text:
+        return ""
+    for match in re.finditer(r"\b([A-Z][a-zA-Z]{2,40}(?:\s+[A-Z][a-zA-Z]{2,40}){0,3})\b", task_text):
+        value = match.group(1).strip()
+        if value.lower() in {"call", "tool", "weather", "city", "do", "not", "answer"}:
+            continue
+        return value
+    return ""
 
 
 def build_off_task_question_recovery_payload(
@@ -382,6 +682,156 @@ def build_off_task_question_recovery_payload(
     recovered["messages"] = retry_messages
     recovered["stream"] = False
     return recovered
+
+
+_READ_LOOP_RECOVERY_ERROR_KINDS = {
+    "repeat_read_call_without_progress",
+    "repeat_unchanged_read_without_progress",
+}
+_NON_PROGRESS_RECOVERY_ERROR_KINDS = {
+    "repeat_discovery_call_without_progress",
+    "repeat_read_call_without_progress",
+    "repeat_shell_housekeeping_without_progress",
+    "repeat_unchanged_read_without_progress",
+    "repeat_same_skill_without_progress",
+    "repeat_same_ask_user_without_progress",
+    "ask_user_question_budget_exceeded",
+    "optional_scope_question_without_need",
+}
+
+
+def _with_recovery_tool_override_message(
+    messages: list[dict[str, Any]],
+    bridge_result: BridgeResult,
+    *,
+    allowed_tools: set[str],
+) -> list[dict[str, Any]]:
+    error_kind = bridge_result.error.kind if bridge_result.error else ""
+    disabled_tools, effective_allowed_tools = _recovery_tool_visibility(
+        allowed_tools,
+        error_kind=error_kind,
+        raw_content=bridge_result.raw_content,
+    )
+    if not disabled_tools:
+        return messages
+    override = (
+        "TEMPORARY TOOL AVAILABILITY OVERRIDE\n"
+        "Gateway is retrying internally after a no-progress tool loop. This diagnostic must not be exposed downstream.\n"
+        f"Temporarily unavailable tools: {_format_tool_names(disabled_tools)}.\n"
+        f"Available tools for this recovery turn: {_format_tool_names(effective_allowed_tools)}.\n"
+        "For this one recovery turn, ignore any earlier tool manifest that listed the temporarily unavailable tools.\n"
+        "Do not output a tool call for any temporarily unavailable tool. Use the earlier tool results already in the conversation. "
+        "If the gathered evidence is enough, move forward with an allowed editing/writing/progress tool or answer without JSON."
+    )
+    return [*messages, {"role": "user", "content": override}]
+
+
+def _non_progress_recovery_instruction(error_kind: str, disabled_tools: set[str]) -> str:
+    if error_kind not in _NON_PROGRESS_RECOVERY_ERROR_KINDS:
+        return ""
+    if disabled_tools:
+        return (
+            "The rejection is a non-progress loop. Do not repeat any temporarily unavailable tool listed above. "
+            "Use the earlier result already in the conversation. If evidence is enough, request a real progress tool "
+            "such as Edit/MultiEdit/Write, or return a substantive final answer with no JSON. If more evidence is truly "
+            "required, choose one allowed tool that is not temporarily unavailable and use materially different input.\n"
+        )
+    return (
+        "The rejection is a non-progress loop. Do not repeat the same discovery/read/skill/question input. "
+        "Use the earlier result already in the conversation. If more evidence is required, choose one materially "
+        "different allowed tool/input; if evidence is enough, return a substantive final answer with no JSON.\n"
+    )
+
+
+def _recovery_tool_visibility(
+    allowed_tools: set[str],
+    *,
+    error_kind: str,
+    raw_content: str = "",
+) -> tuple[set[str], set[str]]:
+    allowed = {str(tool).strip() for tool in allowed_tools if str(tool).strip()}
+    disabled: set[str] = set()
+    if error_kind in _READ_LOOP_RECOVERY_ERROR_KINDS:
+        for name in allowed:
+            compact = _compact_recovery_tool_name(name)
+            if compact in {
+                "bash",
+                "cmd",
+                "fileread",
+                "glob",
+                "grep",
+                "listdir",
+                "listdirectory",
+                "ls",
+                "lsp",
+                "powershell",
+                "read",
+                "readfile",
+                "shell",
+                "terminal",
+            }:
+                disabled.add(name)
+    elif error_kind == "repeat_discovery_call_without_progress":
+        requested = {_compact_recovery_tool_name(name) for name in _requested_tool_names_from_raw(raw_content)}
+        for name in allowed:
+            compact = _compact_recovery_tool_name(name)
+            if compact in requested and compact in {"glob", "ls", "lsp", "listdir", "listdirectory"}:
+                disabled.add(name)
+    elif error_kind == "repeat_shell_housekeeping_without_progress":
+        for name in allowed:
+            compact = _compact_recovery_tool_name(name)
+            if compact in {
+                "bash",
+                "cmd",
+                "fileread",
+                "glob",
+                "grep",
+                "listdir",
+                "listdirectory",
+                "ls",
+                "lsp",
+                "powershell",
+                "read",
+                "readfile",
+                "shell",
+                "terminal",
+            }:
+                disabled.add(name)
+    return disabled, {name for name in allowed if name not in disabled}
+
+
+def _filter_recovery_payload_tools(payload: dict[str, Any], disabled_tools: set[str]) -> None:
+    if not disabled_tools:
+        return
+    disabled_compact = {_compact_recovery_tool_name(name) for name in disabled_tools}
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return
+    filtered = [
+        item
+        for item in tools
+        if _compact_recovery_tool_name(_tool_name_from_payload_tool(item)) not in disabled_compact
+    ]
+    payload["tools"] = filtered
+
+
+def _tool_name_from_payload_tool(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    if item.get("name") is not None:
+        return str(item.get("name") or "")
+    function = item.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return ""
+
+
+def _compact_recovery_tool_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower())
+
+
+def _format_tool_names(names: set[str]) -> str:
+    return ", ".join(sorted(names)) if names else "(none)"
 
 
 def _tool_refusal_recovery_example(allowed_tools: set[str], *, error_kind: str = "") -> str:
@@ -611,6 +1061,11 @@ def parse_chat_response(
         if not native_tool_calls and not content.strip():
             msg["content"] = EMPTY_ASSISTANT_RESPONSE_TEXT
             content = EMPTY_ASSISTANT_RESPONSE_TEXT
+        elif not native_tool_calls:
+            sanitized_content = sanitize_leaked_tool_protocol_output(content)
+            if sanitized_content != content:
+                content = sanitized_content or EMPTY_ASSISTANT_RESPONSE_TEXT
+                msg["content"] = content
         result = BridgeResult(content=content, tool_calls=[], raw_content=content)
         return (data, result) if return_bridge_result else data
     context = bridge_context or _context_from_allowed_tools(allowed_tools)
@@ -618,6 +1073,11 @@ def parse_chat_response(
         if not native_tool_calls and not content.strip():
             msg["content"] = EMPTY_ASSISTANT_RESPONSE_TEXT
             content = EMPTY_ASSISTANT_RESPONSE_TEXT
+        elif not native_tool_calls:
+            sanitized_content = sanitize_leaked_tool_protocol_output(content)
+            if sanitized_content != content:
+                content = sanitized_content or EMPTY_ASSISTANT_RESPONSE_TEXT
+                msg["content"] = content
         result = BridgeResult(content=content, tool_calls=[], raw_content=content)
         return (data, result) if return_bridge_result else data
     assistant_turn = build_assistant_turn(
@@ -657,7 +1117,11 @@ def parse_chat_response(
         if (
             result.error
             and result.error.kind not in {"upstream_empty_output", "content_filter"}
-            and (not result.error.repairable or _looks_like_raw_tool_json(result.raw_content))
+            and (
+                not result.error.repairable
+                or result.error.kind == "tool_choice_violation"
+                or _looks_like_raw_tool_json(result.raw_content)
+            )
         ):
             rejected_text = tool_bridge_rejected_response_text(result, allowed_tools)
             msg["content"] = rejected_text
@@ -905,14 +1369,127 @@ def build_openai_tool_calls_sse(tool_calls: list[dict[str, Any]], *, model: str)
 
 def post_upstream(client: httpx.Client, config: GatewayConfig, payload: dict[str, Any]) -> httpx.Response:
     url = config.upstream.base_url.rstrip("/") + "/chat/completions"
-    return client.post(url, json=payload, headers=upstream_headers(config))
+    timeout = max(30, int(config.provider_runtime.request_timeout_seconds or 300))
+    send_payload = _with_webai2api_web_input_budget(payload, config)
+    return client.post(url, json=send_payload, headers=upstream_headers(config), timeout=timeout)
 
 
-def build_repair_payload(payload: dict[str, Any], bridge_result: BridgeResult) -> dict[str, Any]:
+def _with_webai2api_web_input_budget(payload: dict[str, Any], config: GatewayConfig) -> dict[str, Any]:
+    if not _looks_like_webai2api_sidecar_url(config.upstream.base_url):
+        return payload
+    model = str(payload.get("model") or config.upstream.model or "")
+    prompt_max_chars = _webai2api_model_prompt_max_chars(model, config)
+    if prompt_max_chars <= 0:
+        return payload
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return payload
+    entries = _webai2api_ds2api_history_entries(messages)
+    if not entries:
+        return payload
+    raw_prompt = _render_webai2api_prompt_estimate(entries)
+    if len(raw_prompt) <= prompt_max_chars:
+        return payload
+    compacted = compact_role_messages_as_ds2api_history(
+        entries,
+        max_chars=prompt_max_chars,
+        protocol_marker=_webai2api_protocol_marker(entries),
+        current_user_override=str(payload.get("_webai_current_task_text") or ""),
+    )
+    if not compacted.strip():
+        return payload
+    out = dict(payload)
+    out["messages"] = [{"role": "user", "content": compacted[:prompt_max_chars]}]
+    return out
+
+
+def _webai2api_model_prompt_max_chars(model: str, config: GatewayConfig) -> int:
+    configured = max(4000, int(config.provider_runtime.prompt_max_chars or 32000))
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("chatgpt_text/"):
+        return min(configured, WEBAI2API_CHATGPT_TEXT_PROMPT_MAX_CHARS)
+    if normalized in WEBAI2API_CHATGPT_TEXT_MODELS:
+        return min(configured, WEBAI2API_CHATGPT_TEXT_PROMPT_MAX_CHARS)
+    return 0
+
+
+def _webai2api_ds2api_history_entries(messages: list[Any]) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = [("system", STATELESS_WEB_API_GUARD)]
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        text = _message_content_to_prompt_text(message.get("content"))
+        entries.extend(message_entries_for_ds2api_prompt(message, text))
+    return [(role, text) for role, text in entries if str(text or "").strip()]
+
+
+def _webai2api_protocol_marker(entries: list[tuple[str, str]]) -> str:
+    joined = "\n".join(str(text or "") for _role, text in entries)
+    if "TOOL CALL FORMAT - FOLLOW EXACTLY" in joined:
+        return "TOOL CALL FORMAT - FOLLOW EXACTLY"
+    if "Required tool-call format:" in joined:
+        return "Required tool-call format:"
+    return "You are using WebAI Gateway's strict tool bridge."
+
+
+def _message_content_to_prompt_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip()
+                if item_type == "tool_result":
+                    continue
+                value = item.get("text") if item.get("text") is not None else item.get("content")
+                if isinstance(value, str):
+                    chunks.append(value)
+        return "\n".join(chunk for chunk in chunks if chunk)
+    if isinstance(content, dict):
+        value = content.get("text") if content.get("text") is not None else content.get("content")
+        if isinstance(value, str):
+            return value
+    return str(content)
+
+
+def _render_webai2api_prompt_estimate(entries: list[tuple[str, str]]) -> str:
+    parts: list[str] = []
+    for role, text in entries:
+        content = str(text or "").strip()
+        if not content:
+            continue
+        label = str(role or "user").strip().title() or "User"
+        parts.append(f"{label}: {content}")
+    return "\n\n".join(parts)
+
+
+def build_repair_payload(
+    payload: dict[str, Any],
+    bridge_result: BridgeResult,
+    *,
+    allowed_tools: set[str] | None = None,
+) -> dict[str, Any]:
     repaired = dict(payload)
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     repaired["messages"] = build_repair_messages(messages, bridge_result.raw_content, bridge_result.error)
     repaired["stream"] = False
+    if allowed_tools:
+        repaired["messages"] = _with_recovery_tool_override_message(
+            repaired["messages"],
+            bridge_result,
+            allowed_tools=allowed_tools,
+        )
+        disabled_tools, _ = _recovery_tool_visibility(
+            allowed_tools,
+            error_kind=bridge_result.error.kind if bridge_result.error else "",
+            raw_content=bridge_result.raw_content,
+        )
+        _filter_recovery_payload_tools(repaired, disabled_tools)
     return repaired
 
 
