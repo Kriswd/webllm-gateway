@@ -25,8 +25,8 @@
     "maxReadonlyCallsPerTurn": 32,
     "toolPromptMaxChars": 8000,
     "observationMaxChars": 4000,
-    "exposurePolicy": "all",
-    "toolProfile": "all",
+    "exposurePolicy": "local-agent",
+    "toolProfile": "auto",
     "semanticFinalJudge": "off",
     "allowedToolNames": [],
     "readonlyToolNames": [

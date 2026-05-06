@@ -2106,6 +2106,76 @@ def test_strict_tool_bridge_repairs_realtime_web_denial_when_search_tool_availab
     assert json.loads(tool_call["function"]["arguments"]) == {"query": "今天 AI 热点新闻 周报"}
 
 
+def test_local_agent_auto_keeps_web_search_for_realtime_task_and_hides_unsafe_browser() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '```tool_json\n{"calls":[{"id":"toolu_search","name":"web_search","input":{"query":"今天 AI 热点新闻 周报"}}]}\n```'
+            ),
+            request=request,
+        )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(exposure_policy="local-agent", tool_profile="auto"),
+    )
+    client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "web-model",
+            "messages": [{"role": "user", "content": "你帮我整理一份今天的AI热点周报"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_url",
+                        "description": "Fetch a URL",
+                        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search the web for current information",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp_playwright_browser_run_code_unsafe",
+                        "description": "Run arbitrary Playwright browser JavaScript code",
+                        "parameters": {"type": "object", "properties": {"code": {"type": "string"}}},
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    prompt = "\n".join(
+        str(message.get("content", "")) for message in requests[0]["messages"] if message.get("role") == "system"
+    )
+    assert '"name": "fetch_url"' in prompt
+    assert '"name": "web_search"' in prompt
+    assert "mcp_playwright_browser_run_code_unsafe" not in prompt
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "web_search"
+    assert json.loads(tool_call["function"]["arguments"]) == {"query": "今天 AI 热点新闻 周报"}
+
+
 def test_openai_tool_controller_exposes_bash_like_ds2api_for_local_agent_task() -> None:
     requests: list[dict[str, Any]] = []
 

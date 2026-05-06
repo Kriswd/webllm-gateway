@@ -935,6 +935,7 @@ def prefer_local_tools_for_local_agent_task(
             and not force_activation
             and not force_tools
             and not has_tool_loop
+            and not (_looks_like_web_search_task(latest) and _has_web_research_tool(context.tools))
         ):
             return ToolBridgeContext(
                 enabled=False,
@@ -1345,7 +1346,7 @@ def _is_local_agent_prompt_tool(spec: ToolSpec) -> bool:
     compact = re.sub(r"[^a-z0-9]+", "", lowered)
     if lowered.startswith("mcp__") or lowered.startswith("mcp-"):
         return bool(spec.read_only)
-    return compact in _LOCAL_AGENT_TOOL_NAMES
+    return compact in _LOCAL_AGENT_TOOL_NAMES or spec.read_only or _is_read_only_name(spec.name)
 
 
 def _local_agent_task_explicitly_requests_shell(text: str) -> bool:
@@ -4352,6 +4353,10 @@ def _select_provider_search_tool(context: ToolBridgeContext) -> ToolSpec | None:
     return max(scored, key=lambda item: (item[0], item[1]))[2]
 
 
+def _has_web_research_tool(tools: list[ToolSpec]) -> bool:
+    return any(_provider_search_tool_score(tool) > 0 for tool in tools)
+
+
 def _provider_search_tool_score(tool: ToolSpec) -> int:
     name = (tool.name or "").strip()
     lowered = name.lower()
@@ -5235,7 +5240,13 @@ def _looks_like_web_search_task(text: str) -> bool:
         "搜",
         "查一下",
         "查找",
+        "今天",
+        "今日",
+        "实时",
         "最新",
+        "新闻",
+        "热点",
+        "周报",
         "当前",
         "现在",
         "发布",
@@ -5249,6 +5260,8 @@ def _looks_like_web_search_task(text: str) -> bool:
         "search",
         "browse",
         "lookup",
+        "today",
+        "news",
         "latest",
         "current",
         "official",
