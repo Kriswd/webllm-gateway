@@ -224,6 +224,65 @@ def test_tool_bridge_salvages_complete_tool_json_after_partial_marker() -> None:
     assert result.tool_calls[0].input == {"file_path": "README.md"}
 
 
+def test_tool_bridge_repairs_incomplete_fenced_tool_json_marker() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read files",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    result = parse_tool_response("```tool_json", context)
+
+    assert result.error is not None
+    assert result.error.kind == "malformed_json"
+    assert result.error.repairable is True
+    assert result.tool_calls == []
+
+
+def test_tool_bridge_repairs_fenced_tool_json_tail_fragment() -> None:
+    context = _controller_context_with_tools(["Bash", "Read"])
+
+    result = parse_tool_response(
+        "``` \u65f6\u81ea\u52a8\u4ee5 bypass permission \u542f\u52a8\"\n"
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "```",
+        context,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "malformed_json"
+    assert result.error.repairable is True
+    assert result.tool_calls == []
+
+
+def test_tool_bridge_repairs_optional_local_method_selection_without_tool_call() -> None:
+    context = _controller_context_with_tools(
+        ["Bash", "Read"],
+        task_text="Configure default claude launch permissions.",
+    )
+
+    result = parse_tool_response(
+        "\u4f60\u662f\u60f3\u8ba9 `claude` \u7528\u54ea\u79cd\u65b9\u5f0f\u5462\uff1f",
+        context,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "premature_clarification_without_tool_call"
+    assert result.error.repairable is True
+    assert result.tool_calls == []
+
+
 def test_tool_bridge_repairs_gpt_thinking_calls_array_colon_fragment() -> None:
     context = _controller_context_with_tools(["get_weather"])
 
@@ -2023,6 +2082,232 @@ def test_webai2api_gpt_thinking_repairs_chinese_setup_confirmation_to_tool_use()
     tool_use = response.json()["content"][0]
     assert tool_use["type"] == "tool_use"
     assert tool_use["id"].startswith("toolu_")
+    assert tool_use["name"] == "Read"
+    assert tool_use["input"] == {"file_path": "C:/Users/test/.claude/settings.json"}
+
+
+def test_webai2api_gpt_thinking_repairs_incomplete_tool_json_marker_to_tool_use() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(200, json=_openai_response("```tool_json"), request=request)
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '<|DSML|tool_calls><|DSML|invoke name="Read">'
+                '<|DSML|parameter name="file_path"><![CDATA[C:/Users/test/.claude/settings.json]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            ),
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "chatgpt_text/gpt-thinking",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "Configure default claude launch permissions."}],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "malformed_json" in retry_prompt
+    assert "```tool_json" in retry_prompt
+    tool_use = response.json()["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["name"] == "Read"
+    assert tool_use["input"] == {"file_path": "C:/Users/test/.claude/settings.json"}
+
+
+def test_webai2api_repairs_method_question_then_tool_json_tail_to_tool_use() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                200,
+                json=_openai_response(
+                    "\u4f60\u662f\u60f3\u8ba9 `claude` \u7528\u54ea\u79cd\u65b9\u5f0f\u5462\uff1f"
+                ),
+                request=request,
+            )
+        if len(seen_payloads) == 2:
+            return httpx.Response(
+                200,
+                json=_openai_response(
+                    "``` \u65f6\u81ea\u52a8\u4ee5 bypass permission \u542f\u52a8\"\n"
+                    "      }\n"
+                    "    }\n"
+                    "  ]\n"
+                    "}\n"
+                    "```"
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '<|DSML|tool_calls><|DSML|invoke name="Read">'
+                '<|DSML|parameter name="file_path"><![CDATA[C:/Users/test/.claude/settings.json]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            ),
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "gpt-instant",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "Configure default claude launch permissions."}],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run command", "input_schema": {"type": "object"}},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 3
+    first_retry = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    second_retry = "\n".join(str(message.get("content", "")) for message in seen_payloads[2]["messages"])
+    assert "premature_clarification_without_tool_call" in first_retry
+    assert "malformed_json" in second_retry
+    tool_use = response.json()["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["name"] == "Read"
+    assert tool_use["input"] == {"file_path": "C:/Users/test/.claude/settings.json"}
+
+
+def test_webai2api_reports_retry_exhausted_after_repair_returns_tool_json_tail() -> None:
+    tail = (
+        "``` claude command to always start with bypass permission\"}}]}\n"
+        "```"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_openai_response(tail), request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "gpt-instant",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "Configure default claude launch permissions."}],
+            "tools": [{"name": "Read", "description": "Read files", "input_schema": {"type": "object"}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-webai-tool-bridge-error"] == "malformed_json"
+    text = response.json()["content"][0]["text"]
+    assert "malformed_json" in text
+    assert "bypass permission\"}}]}" not in text
+
+
+def test_webai2api_gpt_thinking_repairs_method_selection_question_to_tool_use() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                200,
+                json=_openai_response(
+                    "\u4f60\u662f\u60f3\u8ba9 `claude` \u7528\u54ea\u79cd\u65b9\u5f0f\u5462\uff1f"
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '<|DSML|tool_calls><|DSML|invoke name="Read">'
+                '<|DSML|parameter name="file_path"><![CDATA[C:/Users/test/.claude/settings.json]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            ),
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "chatgpt_text/gpt-thinking",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "Configure default claude launch permissions."}],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run command", "input_schema": {"type": "object"}},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "premature_clarification_without_tool_call" in retry_prompt
+    assert "protocol-formatting retry" in retry_prompt
+    tool_use = response.json()["content"][0]
+    assert tool_use["type"] == "tool_use"
     assert tool_use["name"] == "Read"
     assert tool_use["input"] == {"file_path": "C:/Users/test/.claude/settings.json"}
 

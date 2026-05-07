@@ -3796,6 +3796,12 @@ def _parse_bridge_chat_data(
             allowed_tools=allowed_tools,
             bridge_context=bridge_context,
         )
+        parsed, bridge_result = _finalize_retry_exhausted_format_error(
+            parsed,
+            bridge_result,
+            bridge_context=bridge_context,
+            model=model,
+        )
     return parsed, bridge_result
 
 
@@ -4025,6 +4031,44 @@ def _copy_bridge_result_with_metadata(bridge_result: Any, **metadata: Any) -> An
         phases=bridge_result.phases,
         **metadata,
     )
+
+
+_RETRY_EXHAUSTED_FORMAT_ERROR_KINDS = {"malformed_json", "empty_tool_call", "invalid_tool_call", "invalid_input"}
+
+
+def _finalize_retry_exhausted_format_error(
+    parsed: dict[str, Any],
+    bridge_result: Any,
+    *,
+    bridge_context: Any,
+    model: str,
+) -> tuple[dict[str, Any], Any]:
+    error = getattr(bridge_result, "error", None)
+    if not (
+        error
+        and getattr(error, "repairable", False)
+        and str(getattr(error, "kind", "") or "") in _RETRY_EXHAUSTED_FORMAT_ERROR_KINDS
+        and str(getattr(bridge_result, "controller_reason", "") or "") == "retry_budget_exhausted"
+    ):
+        return parsed, bridge_result
+    final_error = BridgeError(str(error.kind), str(error.message or _controller_retry_error_message(error.kind)), repairable=False)
+    content = _controller_retry_exhausted_text(final_error, bridge_context=bridge_context)
+    finalized = BridgeResult(
+        content=content,
+        tool_calls=[],
+        error=final_error,
+        warning=getattr(bridge_result, "warning", None),
+        raw_content=str(getattr(bridge_result, "raw_content", "") or getattr(bridge_result, "content", "") or ""),
+        phases=getattr(bridge_result, "phases", []),
+        controller_state=str(getattr(bridge_result, "controller_state", "") or ""),
+        controller_reason=str(getattr(bridge_result, "controller_reason", "") or ""),
+        controller_retry_budget=str(getattr(bridge_result, "controller_retry_budget", "") or ""),
+        semantic_final_judge_mode=str(getattr(bridge_result, "semantic_final_judge_mode", "") or ""),
+        semantic_final_judge_verdict=str(getattr(bridge_result, "semantic_final_judge_verdict", "") or ""),
+        semantic_final_judge_confidence=getattr(bridge_result, "semantic_final_judge_confidence", None),
+        semantic_final_judge_reason=str(getattr(bridge_result, "semantic_final_judge_reason", "") or ""),
+    )
+    return _openai_response_from_stream_buffer(content, finish_reason="stop", model=model), finalized
 
 
 def _controller_retry_exhausted_text(error: BridgeError, *, bridge_context: Any) -> str:

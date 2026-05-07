@@ -16,6 +16,13 @@ from webai_gateway.prompt_compaction import looks_like_current_request_control_t
 
 
 _FENCED_TOOL_RE = re.compile(r"```tool_json\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_INCOMPLETE_FENCED_TOOL_RE = re.compile(r"```[ \t]*tool_json\b", re.IGNORECASE)
+_FENCED_JSON_FRAGMENT_RE = re.compile(
+    r"^\s*```(?:json|tool_json)?[\s\S]{0,2400}"
+    r"(?:\"calls\"|\"input\"|\"name\"|\"command\"|\"file_path\"|\]\s*\}|\}\s*\]\s*\})"
+    r"[\s\S]*```\s*$",
+    re.IGNORECASE,
+)
 _RUNAWAY_PLAIN_TEXT_MIN_CHARS = 8000
 _FENCED_CODE_BLOCK_RE = re.compile(
     r"```(?P<lang>[A-Za-z0-9_+.-]*)[ \t]*(?:\r?\n)?(?P<body>.*?)```",
@@ -491,6 +498,16 @@ _OPTIONAL_LOCAL_ACTION_CONFIRMATION_RE = re.compile(
     r"|\b(?:do you want|would you like|should i|shall i)\b"
     r".{0,120}\b(?:do this|generate|write|modify|configure|set up|run|execute|make the change|apply)\b"
     r".{0,40}(?:\?|\b)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_OPTIONAL_LOCAL_METHOD_SELECTION_RE = re.compile(
+    r"("
+    r"(?:\u4f60|\u60a8).{0,80}(?:\u60f3|\u5e0c\u671b|\u8981)"
+    r".{0,140}(?:\u65b9\u5f0f|\u65b9\u6cd5|\u6a21\u5f0f|\u65b9\u6848)"
+    r".{0,60}(?:\u5462|\u5417|\uff1f|\?)"
+    r"|(?:which|what).{0,80}(?:way|method|approach|mode|option)"
+    r".{0,80}(?:\?|would\s+you\s+prefer|do\s+you\s+prefer)"
     r")",
     re.IGNORECASE | re.DOTALL,
 )
@@ -2650,6 +2667,8 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
     unfenced_raw = _without_fenced_code_blocks(raw)
     marker_seen = bool(
         _FENCED_TOOL_RE.search(raw)
+        or _INCOMPLETE_FENCED_TOOL_RE.search(raw)
+        or _FENCED_JSON_FRAGMENT_RE.search(raw)
         or _XML_TOOL_RE.search(raw)
         or _has_dsml_tool_call_syntax(raw)
         or _looks_like_ds2api_xml_tool_markup(unfenced_raw)
@@ -2755,9 +2774,12 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
         record_phase("extract", "ok", "plain_text/no_candidate")
         warning = "tool_result_claim_without_tool_call" if _TOOL_RESULT_CLAIM_RE.search(raw) else None
         fenced_shell_commands = _extract_fenced_shell_command_lines(raw)
-        if _allows_ds2api_style_agent_guard_passthrough(
-            context
-        ) and not _plain_text_requires_tool_recovery_before_ds2api_passthrough(raw, context, fenced_shell_commands):
+        if (
+            not marker_seen
+            and not malformed_seen
+            and _allows_ds2api_style_agent_guard_passthrough(context)
+            and not _plain_text_requires_tool_recovery_before_ds2api_passthrough(raw, context, fenced_shell_commands)
+        ):
             return finish(content=raw, tool_calls=[], warning=warning, raw_content=raw)
         if echoed_tool_history:
             return finish(
@@ -5709,6 +5731,8 @@ def _is_premature_clarification_without_tool_call(text: str, context: ToolBridge
     raw = text or ""
     if _looks_like_optional_local_action_confirmation(raw, context):
         return True
+    if _looks_like_optional_local_method_selection(raw, context):
+        return True
     if not (
         (_CLARIFICATION_REQUEST_RE.search(raw) and _REPO_CLARIFICATION_RE.search(raw))
         or _looks_like_local_scope_selection_prompt(raw)
@@ -5723,6 +5747,23 @@ def _looks_like_optional_local_action_confirmation(text: str, context: ToolBridg
     if not raw or len(raw) > 1200:
         return False
     if not _OPTIONAL_LOCAL_ACTION_CONFIRMATION_RE.search(raw):
+        return False
+    if not (
+        context.has_tool_loop
+        or _looks_like_local_agent_task(context.task_text)
+        or _has_read_like_tool(context)
+        or _has_code_change_tool(context)
+    ):
+        return False
+    allowed = {name.strip().lower() for name in context.allowed_names}
+    return any(name in allowed for name in {"bash", "read", "glob", "grep", "edit", "write"})
+
+
+def _looks_like_optional_local_method_selection(text: str, context: ToolBridgeContext) -> bool:
+    raw = (text or "").strip()
+    if not raw or len(raw) > 1200:
+        return False
+    if not _OPTIONAL_LOCAL_METHOD_SELECTION_RE.search(raw):
         return False
     if not (
         context.has_tool_loop
@@ -6339,6 +6380,8 @@ def _plain_text_requires_tool_recovery_before_ds2api_passthrough(
     if _is_deferred_local_file_inspection_without_call(raw, context):
         return True
     if _looks_like_optional_local_action_confirmation(raw, context):
+        return True
+    if _looks_like_optional_local_method_selection(raw, context):
         return True
     if _is_unverified_code_change_completion(raw, context):
         return True
