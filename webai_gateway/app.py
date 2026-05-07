@@ -91,10 +91,14 @@ TOOL_BRIDGE_EVENT_LIMIT = 200
 WEBAI2API_BROWSER_READY_RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0, 20.0)
 WEBAI2API_BROWSER_NOT_READY_MARKERS = (
     "页面加载超时",
+    "页面加载失败",
     "未检测到可选模型",
     "未检测到可用模型",
     "当前页面可用模型：未检测到可选模型",
     "page load timeout",
+    "page.goto:",
+    "ns_binding_aborted",
+    "frame was detached",
     "no selectable model",
     "no selectable models",
     "model menu is empty",

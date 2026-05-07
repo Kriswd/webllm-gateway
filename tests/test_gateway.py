@@ -1811,6 +1811,55 @@ def test_webai2api_upstream_retries_transient_browser_not_ready_before_returning
     assert response.json()["content"] == [{"type": "text", "text": "camoufox-ready"}]
 
 
+def test_webai2api_upstream_retries_browser_frame_detached_before_returning_to_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    sleep_delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                502,
+                json={
+                    "detail": (
+                        "所有候选都失败: 页面加载失败: page.goto: NS_BINDING_ABORTED; "
+                        "maybe frame was detached?"
+                    )
+                },
+                request=request,
+            )
+        return httpx.Response(200, json=_openai_response("camoufox-frame-ready"), request=request)
+
+    import webai_gateway.app as gateway_app
+
+    monkeypatch.setattr(gateway_app.time, "sleep", lambda seconds: sleep_delays.append(seconds))
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={"model": "gpt-instant", "max_tokens": 512, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert sleep_delays and sleep_delays[0] >= 1
+    assert response.json()["content"] == [{"type": "text", "text": "camoufox-frame-ready"}]
+
+
 def test_webai2api_upstream_does_not_retry_permanent_model_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
