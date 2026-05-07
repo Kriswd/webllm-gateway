@@ -88,6 +88,23 @@ WEBAI2API_AUTH_COOKIE_HINTS: dict[str, tuple[str, ...]] = {
     ),
 }
 TOOL_BRIDGE_EVENT_LIMIT = 200
+WEBAI2API_BROWSER_READY_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
+WEBAI2API_BROWSER_NOT_READY_MARKERS = (
+    "页面加载超时",
+    "未检测到可选模型",
+    "未检测到可用模型",
+    "当前页面可用模型：未检测到可选模型",
+    "page load timeout",
+    "no selectable model",
+    "no selectable models",
+    "model menu is empty",
+)
+WEBAI2API_PERMANENT_MODEL_ERROR_MARKERS = (
+    "当前账号不支持该模型",
+    "账号不支持该模型",
+    "please run /login",
+    "request not allowed",
+)
 REQUEST_DIAGNOSTIC_LIMIT = 200
 TOOL_CALL_REGISTRY_LIMIT = 512
 OFF_TASK_QUESTION_ERROR_KINDS = {
@@ -2200,8 +2217,23 @@ def _post_upstream_with_login_mode_recovery(
 ) -> httpx.Response:
     response = post_upstream(client, cfg, payload)
     if allow_recovery and _is_webai2api_login_mode_response(response) and _restart_webai2api_api_mode(client, cfg):
-        return post_upstream(client, cfg, payload)
+        response = post_upstream(client, cfg, payload)
+    for delay_seconds in WEBAI2API_BROWSER_READY_RETRY_DELAYS_SECONDS:
+        if not _is_webai2api_transient_browser_not_ready_response(response):
+            break
+        time.sleep(delay_seconds)
+        response = post_upstream(client, cfg, payload)
     return response
+
+
+def _is_webai2api_transient_browser_not_ready_response(response: httpx.Response) -> bool:
+    if response.status_code not in {500, 502, 503, 504}:
+        return False
+    preview = _extract_upstream_error_preview(response)
+    lowered = preview.lower()
+    if any(marker in lowered for marker in WEBAI2API_PERMANENT_MODEL_ERROR_MARKERS):
+        return False
+    return any(marker in preview or marker in lowered for marker in WEBAI2API_BROWSER_NOT_READY_MARKERS)
 
 
 def _webai2api_login_mode_recovery_allowed(app: FastAPI) -> bool:

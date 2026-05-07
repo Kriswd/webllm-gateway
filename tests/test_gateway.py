@@ -1744,6 +1744,91 @@ def test_webai2api_upstream_required_tool_choice_failure_returns_sanitized_diagn
     assert "secret-token" not in json.dumps(event, ensure_ascii=False)
 
 
+def test_webai2api_upstream_retries_transient_browser_not_ready_before_returning_to_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    sleep_delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                502,
+                json={"detail": "所有候选都失败: 所有支持该模型的适配器都无法使用: 页面加载超时"},
+                request=request,
+            )
+        return httpx.Response(200, json=_openai_response("camoufox-ready"), request=request)
+
+    import webai_gateway.app as gateway_app
+
+    monkeypatch.setattr(gateway_app.time, "sleep", lambda seconds: sleep_delays.append(seconds))
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={"model": "gpt-thinking", "max_tokens": 512, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert sleep_delays and sleep_delays[0] >= 1
+    assert response.json()["content"] == [{"type": "text", "text": "camoufox-ready"}]
+
+
+def test_webai2api_upstream_does_not_retry_permanent_model_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    sleep_delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        return httpx.Response(
+            502,
+            json={"detail": "当前账号不支持该模型，请改用 gpt-instant"},
+            request=request,
+        )
+
+    import webai_gateway.app as gateway_app
+
+    monkeypatch.setattr(gateway_app.time, "sleep", lambda seconds: sleep_delays.append(seconds))
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={"model": "gpt-thinking", "max_tokens": 512, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 502
+    assert len(seen_payloads) == 1
+    assert sleep_delays == []
+
+
 def test_webai2api_upstream_repairs_agent_description_only_tool_call() -> None:
     seen_payloads: list[dict[str, Any]] = []
 
