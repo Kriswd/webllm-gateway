@@ -479,6 +479,21 @@ _REPO_CLARIFICATION_RE = re.compile(
     r"(github|git\s*hub|repository|repo|仓库|项目|更新|MediaCrawler|目录|路径)",
     re.IGNORECASE,
 )
+_OPTIONAL_LOCAL_ACTION_CONFIRMATION_RE = re.compile(
+    r"("
+    r"(?:\u4f60|\u60a8)?(?:\u5e0c\u671b|\u9700\u8981|\u8981\u4e0d\u8981|\u662f\u5426(?:\u9700\u8981|\u8981|\u5e0c\u671b)|\u60f3(?:\u8ba9|\u8981)?)"
+    r".{0,80}(?:\u6211|\u5e2e\u4f60|\u5e2e\u60a8|\u76f4\u63a5|\u987a\u4fbf|\u6765)"
+    r".{0,80}(?:\u505a|\u751f\u6210|\u5199|\u5199\u597d|\u4fee\u6539|\u914d\u7f6e|\u8bbe\u7f6e|\u6267\u884c|\u5904\u7406|\u843d\u5730)"
+    r".{0,40}(?:\u5417|\u4e48|\uff1f|\?)"
+    r"|(?:\u6211\u53ef\u4ee5|\u53ef\u4ee5\u5e2e\u4f60|\u8ba9\u6211|\u6211\u6765)"
+    r".{0,120}(?:\u505a|\u751f\u6210|\u5199|\u5199\u597d|\u4fee\u6539|\u914d\u7f6e|\u8bbe\u7f6e|\u6267\u884c|\u5904\u7406|\u843d\u5730)"
+    r".{0,40}(?:\u5417|\u4e48|\uff1f|\?)"
+    r"|\b(?:do you want|would you like|should i|shall i)\b"
+    r".{0,120}\b(?:do this|generate|write|modify|configure|set up|run|execute|make the change|apply)\b"
+    r".{0,40}(?:\?|\b)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 _READ_ONLY_PREFIXES = ("read", "list", "search", "fetch", "get", "show", "find", "query")
 _READ_ONLY_NAMES = frozenset(
     {
@@ -2955,7 +2970,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
                 tool_calls=[],
                 error=BridgeError(
                     "premature_clarification_without_tool_call",
-                    "The model asked the user to provide repository details before using available local tools. Inspect the local path/repo first with Bash/Read/Glob.",
+                    "The model asked the user to provide repository details or optional confirmation before using available local tools. Inspect the local path/repo first with Bash/Read/Glob, or request the next materially necessary allowed tool.",
                     repairable=True,
                 ),
                 warning=warning,
@@ -5082,6 +5097,20 @@ def _looks_like_direct_action_followup_task(text: str) -> bool:
         "change it",
         "modify it",
         "start implementing",
+        "\u641e",
+        "\u641e\u5427",
+        "\u53bb\u641e",
+        "\u5f00\u59cb\u641e",
+        "\u5f04",
+        "\u5f04\u5427",
+        "\u53bb\u5f04",
+        "\u751f\u6210",
+        "\u751f\u6210\u5427",
+        "\u76f4\u63a5\u751f\u6210",
+        "\u5f00\u59cb\u751f\u6210",
+        "\u5199",
+        "\u5199\u5427",
+        "\u76f4\u63a5\u5199",
     }
     if value in exact_markers:
         return True
@@ -5678,6 +5707,8 @@ def _is_premature_clarification_without_tool_call(text: str, context: ToolBridge
     if not context.allowed_names:
         return False
     raw = text or ""
+    if _looks_like_optional_local_action_confirmation(raw, context):
+        return True
     if not (
         (_CLARIFICATION_REQUEST_RE.search(raw) and _REPO_CLARIFICATION_RE.search(raw))
         or _looks_like_local_scope_selection_prompt(raw)
@@ -5685,6 +5716,23 @@ def _is_premature_clarification_without_tool_call(text: str, context: ToolBridge
         return False
     allowed = {name.strip().lower() for name in context.allowed_names}
     return any(name in allowed for name in {"bash", "read", "glob", "ls", "grep"})
+
+
+def _looks_like_optional_local_action_confirmation(text: str, context: ToolBridgeContext) -> bool:
+    raw = (text or "").strip()
+    if not raw or len(raw) > 1200:
+        return False
+    if not _OPTIONAL_LOCAL_ACTION_CONFIRMATION_RE.search(raw):
+        return False
+    if not (
+        context.has_tool_loop
+        or _looks_like_local_agent_task(context.task_text)
+        or _has_read_like_tool(context)
+        or _has_code_change_tool(context)
+    ):
+        return False
+    allowed = {name.strip().lower() for name in context.allowed_names}
+    return any(name in allowed for name in {"bash", "read", "glob", "grep", "edit", "write"})
 
 
 def _looks_like_local_scope_selection_prompt(text: str) -> bool:
@@ -5912,6 +5960,22 @@ def build_repair_messages(messages: list[dict[str, Any]], bad_text: str, error: 
             "local-agent task. If more evidence is needed, output exactly one valid fenced tool_json block using an "
             "allowed tool such as Read, Glob, Grep, LSP, WebFetch, Edit, or Write. If the gathered evidence is enough, "
             "return a substantive final answer grounded in that evidence with no tool_json block. No manual setup steps."
+        )
+        return [
+            *messages,
+            {"role": "assistant", "content": (bad_text or "")[:4000]},
+            {"role": "user", "content": repair_instruction},
+        ]
+    if error_kind == "premature_clarification_without_tool_call":
+        repair_instruction = (
+            "Previous answer asked the user an optional clarification or confirmation question before using available local tools.\n"
+            f"Error code: {error_kind}.\n"
+            f"Error: {reason}.\n"
+            "Do not ask the user whether you should do, generate, write, configure, inspect, or execute the already requested task. "
+            "The listed tools are available through the downstream client, not your own runtime. "
+            "If more evidence is needed, output exactly one valid fenced tool_json block using a materially necessary allowed tool "
+            "such as Read, Glob, Grep, Bash, Edit, or Write. Prefer a discovery/read tool when the target file or project state is unknown. "
+            "If no allowed tool can help, provide a substantive final answer without claiming that local changes were made."
         )
         return [
             *messages,
@@ -6272,6 +6336,8 @@ def _plain_text_requires_tool_recovery_before_ds2api_passthrough(
     if _is_deferred_named_tool_action_without_call(raw, context):
         return True
     if _is_deferred_local_file_inspection_without_call(raw, context):
+        return True
+    if _looks_like_optional_local_action_confirmation(raw, context):
         return True
     if _is_unverified_code_change_completion(raw, context):
         return True

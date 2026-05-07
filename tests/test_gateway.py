@@ -667,6 +667,40 @@ def test_tool_controller_retries_second_low_information_setup_final_after_first_
     assert decision.reason == "insufficient_final_evidence"
 
 
+def test_tool_bridge_rejects_chinese_optional_setup_confirmation_without_tool_call() -> None:
+    context = replace(
+        build_context(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": name, "description": f"{name} tool", "parameters": {"type": "object"}},
+                }
+                for name in ["AskUserQuestion", "Read", "Edit", "Write"]
+            ],
+            ToolBridgeConfig(exposure_policy="local-agent", tool_profile="auto", max_tools_in_prompt=32),
+        ),
+        task_text=(
+            "\u4f60\u5e2e\u6211 \u8bbe\u7f6e claude code \u4ee5\u540e\u8f93\u5165 claude "
+            "\u540e\u81ea\u52a8\u4ee5 bypass permissions \u65b9\u5f0f\u542f\u52a8"
+        ),
+        has_tool_loop=False,
+    )
+
+    result = parse_tool_response(
+        (
+            "\u8981\u8ba9 `claude` \u547d\u4ee4\u6c38\u4e45\u9ed8\u8ba4\u4f7f\u7528 "
+            "bypass permission\u3002\u4f60\u5e0c\u671b\u6211\u5e2e\u4f60\u505a"
+            "\u8fd9\u4e2a\u5417\uff1f"
+        ),
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is not None
+    assert result.error.kind == "premature_clarification_without_tool_call"
+    assert result.error.repairable is True
+
+
 def test_tool_bridge_local_agent_chinese_setup_task_exposes_structured_tools() -> None:
     context = build_context(
         [
@@ -1916,6 +1950,79 @@ def test_webai2api_upstream_anthropic_required_tool_choice_retries_plain_text() 
     assert tool_use["id"].startswith("toolu_")
     assert tool_use["name"] == "get_weather"
     assert tool_use["input"] == {"city": "Beijing"}
+
+
+def test_webai2api_gpt_thinking_repairs_chinese_setup_confirmation_to_tool_use() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                200,
+                json=_openai_response(
+                    "\u8981\u8ba9 `claude` \u547d\u4ee4\u6c38\u4e45\u9ed8\u8ba4\u4f7f\u7528 "
+                    "bypass permission\u3002\u4f60\u5e0c\u671b\u6211\u5e2e\u4f60\u505a"
+                    "\u8fd9\u4e2a\u5417\uff1f"
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json=_openai_response(
+                '<|DSML|tool_calls><|DSML|invoke name="Read">'
+                '<|DSML|parameter name="file_path"><![CDATA[C:/Users/test/.claude/settings.json]]></|DSML|parameter>'
+                "</|DSML|invoke></|DSML|tool_calls>"
+            ),
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "chatgpt_text/gpt-thinking",
+            "max_tokens": 32000,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "\u4f60\u5e2e\u6211 \u8bbe\u7f6e claude code \u4ee5\u540e"
+                        "\u8f93\u5165 claude \u540e\u81ea\u52a8\u4ee5 bypass permissions "
+                        "\u65b9\u5f0f\u542f\u52a8"
+                    ),
+                }
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "Edit files", "input_schema": {"type": "object"}},
+                {"name": "Write", "description": "Write files", "input_schema": {"type": "object"}},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "premature_clarification_without_tool_call" in retry_prompt
+    assert "Do not ask the user" in retry_prompt
+    tool_use = response.json()["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["id"].startswith("toolu_")
+    assert tool_use["name"] == "Read"
+    assert tool_use["input"] == {"file_path": "C:/Users/test/.claude/settings.json"}
 
 
 def test_webai2api_anthropic_stream_retries_short_setup_final_to_tool_use() -> None:
@@ -16979,6 +17086,48 @@ def test_tool_bridge_treats_chinese_direct_modify_as_task_continuation() -> None
     assert prior_task in context.task_text
     assert "你直接修改" in context.task_text
     assert context.task_text != "你直接修改"
+
+
+@pytest.mark.parametrize("latest", ["\u641e", "\u751f\u6210"])
+def test_tool_bridge_treats_chinese_short_confirmation_as_task_continuation(latest: str) -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in ["AskUserQuestion", "Read", "Edit", "Write", "Bash"]
+        ],
+        ToolBridgeConfig(exposure_policy="local-agent", tool_profile="auto", max_tools_in_prompt=32),
+    )
+    prior_task = (
+        "\u4f60\u5e2e\u6211 \u8bbe\u7f6e claude code \u4ee5\u540e\u8f93\u5165 claude "
+        "\u540e\u81ea\u52a8\u4ee5 bypass permissions \u65b9\u5f0f\u542f\u52a8"
+    )
+    context = prefer_local_tools_for_local_agent_task(
+        context,
+        [
+            {"role": "user", "content": prior_task},
+            {
+                "role": "assistant",
+                "content": (
+                    "\u6211\u53ef\u4ee5\u5e2e\u4f60\u76f4\u63a5\u5199\u597d\u542f\u52a8"
+                    "\u811a\u672c\u3002\u4f60\u5e0c\u671b\u6211\u76f4\u63a5\u751f\u6210\u5417\uff1f"
+                ),
+            },
+            {"role": "user", "content": latest},
+        ],
+    )
+
+    assert context.enabled is True
+    assert prior_task in context.task_text
+    assert latest in context.task_text
+    assert "Read" in context.allowed_names
+    assert "Edit" in context.allowed_names
 
 
 def test_tool_bridge_all_profile_retries_deferred_named_tool_after_direct_modify_followup() -> None:
