@@ -27,6 +27,7 @@ from webai_gateway.config import (
 from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.openai_api import (
     EMPTY_ASSISTANT_RESPONSE_TEXT,
+    build_incomplete_response_retry_payload,
     build_repair_payload,
     build_upstream_payload,
     build_tool_call_sse,
@@ -378,6 +379,29 @@ def test_tool_bridge_repairs_gpt_thinking_required_input_only_fragment() -> None
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].name == "get_weather"
     assert result.tool_calls[0].input == {"city": "北京"}
+
+
+def test_tool_bridge_extracts_gpt_thinking_tool_json_after_prose_prefix() -> None:
+    context = _controller_context_with_tools(["Read", "Glob", "Grep", "Edit", "Write"])
+
+    result = parse_tool_response(
+        (
+            "根据已收集证据，原任务应继续读取 shell profile，而不是继续看 .claude/settings.json。"
+            "下一步应请求读取 PowerShell profile，例如：\n\n"
+            "```tool_json\n"
+            '{"calls":[{"id":"call_1","name":"Read","input":{"file_path":"C:/Users/test/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"}}]}'
+            "\n```"
+        ),
+        context,
+    )
+
+    assert result.error is None
+    assert result.content == ""
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "Read"
+    assert result.tool_calls[0].input == {
+        "file_path": "C:/Users/test/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+    }
 
 
 def test_tool_bridge_generates_ds2api_style_unique_ids_for_idless_xml_calls() -> None:
@@ -20961,6 +20985,90 @@ def test_repair_payload_marks_read_and_glob_unavailable_for_read_cache_loop() ->
     assert "TEMPORARY TOOL AVAILABILITY OVERRIDE" in joined
     assert "Temporarily unavailable tools: Glob, Read" in joined
     assert "Available tools for this recovery turn: Edit" in joined
+
+
+def test_incomplete_bridge_retry_adds_compact_standard_json_formatter_prompt() -> None:
+    repaired = build_incomplete_response_retry_payload(
+        {
+            "messages": [
+                {"role": "system", "content": "Tool bridge prompt with Read, Edit, Write."},
+                {"role": "user", "content": "Configure default claude launch permissions."},
+            ]
+        },
+        "```tool_json } ] } ```",
+        bridge=True,
+        allowed_tools={"Read", "Edit", "Write"},
+    )
+
+    retry_prompt = str(repaired["messages"][-1]["content"])
+    assert "GATEWAY TOOL_JSON FORMATTER RETRY" in retry_prompt
+    assert "standard Gateway tool-call JSON" in retry_prompt
+    assert "Allowed tool names: Edit, Read, Write" in retry_prompt
+    assert "```tool_json" in retry_prompt
+    assert '"name":"Read"' in retry_prompt
+    assert '"file_path":"README.md"' in retry_prompt
+
+
+def test_malformed_repair_payload_adds_compact_standard_json_formatter_prompt() -> None:
+    bridge_result = BridgeResult(
+        content="",
+        tool_calls=[],
+        raw_content="```tool_json } ] } ```",
+        error=BridgeError(
+            "malformed_json",
+            "The model returned an empty or malformed markdown fence instead of a valid tool_json block.",
+            repairable=True,
+        ),
+    )
+
+    repaired = build_repair_payload(
+        {
+            "messages": [
+                {"role": "system", "content": "Tool bridge prompt with Read, Edit, Write."},
+                {"role": "user", "content": "Configure default claude launch permissions."},
+            ]
+        },
+        bridge_result,
+        allowed_tools={"Read", "Edit", "Write"},
+    )
+
+    retry_prompt = str(repaired["messages"][-1]["content"])
+    assert "GATEWAY TOOL_JSON FORMATTER RETRY" in retry_prompt
+    assert "standard Gateway tool-call JSON" in retry_prompt
+    assert "Allowed tool names: Edit, Read, Write" in retry_prompt
+    assert '"name":"Read"' in retry_prompt
+    assert '"file_path":"README.md"' in retry_prompt
+
+
+def test_off_task_environment_repair_payload_adds_compact_standard_json_formatter_prompt() -> None:
+    bridge_result = BridgeResult(
+        content="I will check the Claude command setup instead of reading the requested profile.",
+        tool_calls=[],
+        raw_content="I will check the Claude command setup instead of reading the requested profile.",
+        error=BridgeError(
+            "off_task_environment_configuration_final",
+            "The model returned environment configuration advice unrelated to the current local-agent task.",
+            repairable=True,
+        ),
+    )
+
+    repaired = build_repair_payload(
+        {
+            "messages": [
+                {"role": "system", "content": "Tool bridge prompt with Read, Edit, Write."},
+                {"role": "user", "content": "Configure default claude launch permissions."},
+            ]
+        },
+        bridge_result,
+        allowed_tools={"Read", "Edit", "Write"},
+    )
+
+    retry_prompt = str(repaired["messages"][-1]["content"])
+    assert "GATEWAY TOOL_JSON FORMATTER RETRY" in retry_prompt
+    assert "standard Gateway tool-call JSON" in retry_prompt
+    assert "Allowed tool names: Edit, Read, Write" in retry_prompt
+    assert '"name":"Read"' in retry_prompt
+    assert '"file_path":"README.md"' in retry_prompt
 
 
 def test_qwen_web_all_profile_passes_batch_repeated_unchanged_read_like_ds2api(tmp_path: Path) -> None:

@@ -3603,7 +3603,12 @@ def _parse_bridge_chat_data(
     elif should_retry_incomplete_response(data):
         _record_tool_bridge_event(app, "tool_bridge_retry", stage="incomplete_response", model=model)
         retry_data = retry_chat(
-            build_incomplete_response_retry_payload(payload, _openai_response_content(data), bridge=bridge)
+            build_incomplete_response_retry_payload(
+                payload,
+                _openai_response_content(data),
+                bridge=bridge,
+                allowed_tools=allowed_tools,
+            )
         )
         if isinstance(retry_data, dict):
             parsed, bridge_result = parse_chat_response(

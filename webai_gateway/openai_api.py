@@ -398,7 +398,13 @@ def build_native_web_search_retry_payload(payload: dict[str, Any], previous_cont
     return retry
 
 
-def build_incomplete_response_retry_payload(payload: dict[str, Any], previous_content: str, *, bridge: bool) -> dict[str, Any]:
+def build_incomplete_response_retry_payload(
+    payload: dict[str, Any],
+    previous_content: str,
+    *,
+    bridge: bool,
+    allowed_tools: set[str] | None = None,
+) -> dict[str, Any]:
     retry = dict(payload)
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
@@ -420,6 +426,12 @@ def build_incomplete_response_retry_payload(payload: dict[str, Any], previous_co
             ),
         }
     )
+    if bridge and allowed_tools:
+        retry_messages = _with_standard_tool_json_formatter_message(
+            retry_messages,
+            allowed_tools=allowed_tools,
+            error_kind="incomplete_response",
+        )
     retry["messages"] = retry_messages
     return retry
 
@@ -798,6 +810,73 @@ _NON_PROGRESS_RECOVERY_ERROR_KINDS = {
     "ask_user_question_budget_exceeded",
     "optional_scope_question_without_need",
 }
+_STANDARD_TOOL_JSON_FORMATTER_ERROR_KINDS = {
+    "deferred_code_change_without_call",
+    "deferred_tool_action_without_call",
+    "empty_tool_call",
+    "incomplete_response",
+    "invalid_tool_call",
+    "malformed_json",
+    "off_task_environment_configuration_final",
+    "premature_clarification_without_tool_call",
+    "tool_call_markdown_without_tool_json",
+    "unproven_final_answer_without_tool_call",
+    "insufficient_final_evidence",
+}
+
+
+def _with_standard_tool_json_formatter_message(
+    messages: list[dict[str, Any]],
+    *,
+    allowed_tools: set[str],
+    error_kind: str = "",
+) -> list[dict[str, Any]]:
+    if error_kind and error_kind not in _STANDARD_TOOL_JSON_FORMATTER_ERROR_KINDS:
+        return messages
+    effective_allowed = {str(name).strip() for name in allowed_tools if str(name).strip()}
+    if not effective_allowed:
+        return messages
+    allowed = _format_tool_names(effective_allowed)
+    example = _standard_tool_json_formatter_example(effective_allowed)
+    formatter = (
+        "GATEWAY TOOL_JSON FORMATTER RETRY\n"
+        "You are formatting standard Gateway tool-call JSON for a downstream agent runtime. "
+        "You are not executing tools inside the web model, and you are not writing a tutorial about JSON.\n"
+        f"Allowed tool names: {allowed}.\n"
+        "Pick the next materially necessary tool for the current user task. If local file/project state is unknown and "
+        "a read/discovery tool is available, choose Read/Glob/Grep/LS before Edit/Write. Do not ask for confirmation "
+        "when the user already requested the task.\n"
+        "Output only one fenced ```tool_json block. The first non-whitespace characters must be ```tool_json. "
+        "No prose, no markdown outside the block, no partial JSON, no tool_name placeholder.\n"
+        "Required standard Gateway tool-call JSON:\n"
+        f"{example}"
+    )
+    return [*messages, {"role": "user", "content": formatter}]
+
+
+def _standard_tool_json_formatter_example(allowed_tools: set[str]) -> str:
+    by_compact = {_compact_recovery_tool_name(name): name for name in sorted(allowed_tools)}
+    if "read" in by_compact:
+        return _dsml_example(by_compact["read"], {"file_path": "README.md"})
+    if "readfile" in by_compact:
+        return _dsml_example(by_compact["readfile"], {"path": "README.md"})
+    if "fileread" in by_compact:
+        return _dsml_example(by_compact["fileread"], {"file_path": "README.md"})
+    if "glob" in by_compact:
+        return _dsml_example(by_compact["glob"], {"path": ".", "pattern": "*.py"})
+    if "grep" in by_compact:
+        return _dsml_example(by_compact["grep"], {"path": ".", "pattern": "TODO"})
+    for compact in ("ls", "listdir", "listdirectory"):
+        if compact in by_compact:
+            return _dsml_example(by_compact[compact], {"path": "."})
+    if "bash" in by_compact:
+        return _dsml_example(by_compact["bash"], {"command": "git status --short"})
+    if "edit" in by_compact:
+        return _dsml_example(by_compact["edit"], {"file_path": "README.md", "old_string": "old text", "new_string": "new text"})
+    if "write" in by_compact:
+        return _dsml_example(by_compact["write"], {"file_path": "notes.txt", "content": "new file content"})
+    name = sorted(allowed_tools)[0] if allowed_tools else "tool_name"
+    return _dsml_example(name, {})
 
 
 def _with_recovery_tool_override_message(
@@ -1586,6 +1665,11 @@ def build_repair_payload(
             raw_content=bridge_result.raw_content,
         )
         _filter_recovery_payload_tools(repaired, disabled_tools)
+        repaired["messages"] = _with_standard_tool_json_formatter_message(
+            repaired["messages"],
+            allowed_tools=allowed_tools,
+            error_kind=bridge_result.error.kind if bridge_result.error else "",
+        )
     return repaired
 
 
