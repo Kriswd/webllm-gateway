@@ -29,6 +29,12 @@ DEEPSEEK_WEB_ACCEPTED_MODELS = {
 }
 
 
+class DeepSeekDs2apiError(RuntimeError):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def is_deepseek_web_model(model: Any) -> bool:
     normalized = normalize_model_id(model)
     return bool(
@@ -93,7 +99,7 @@ class DeepSeekWebClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise RuntimeError(_format_ds2api_error(response)) from exc
+            raise DeepSeekDs2apiError(response.status_code, _format_ds2api_error(response)) from exc
 
         content_type = (response.headers.get("content-type") or "").lower()
         if "text/event-stream" in content_type:

@@ -37,7 +37,12 @@ from webai_gateway.openai_api import (
     post_upstream,
     tool_bridge_rejected_response_text,
 )
-from webai_gateway.deepseek_web import DeepSeekWebClient, is_deepseek_web_model, normalize_deepseek_model
+from webai_gateway.deepseek_web import (
+    DeepSeekDs2apiError,
+    DeepSeekWebClient,
+    is_deepseek_web_model,
+    normalize_deepseek_model,
+)
 from webai_gateway.tool_controller import RetryState, classify_bridge_result
 from webai_gateway.prompt_compaction import build_preserved_task_state_snapshot, compact_web_prompt
 from webai_gateway.qwen_web import (
@@ -13407,6 +13412,70 @@ def test_deepseek_official_v4_pro_id_uses_saved_web_credentials(tmp_path: Path) 
     assert seen["credential"]["bearer"] == "bearer-secret"
     assert seen["payload"]["model"] == "deepseek-v4-pro"
     assert response.json()["choices"][0]["message"]["content"] == "来自 V4 Pro 网页模型"
+
+
+def test_deepseek_web_client_preserves_ds2api_http_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"message": "rate limit from ds2api"}},
+            request=request,
+        )
+
+    deepseek = DeepSeekWebClient(
+        {"bearer": "bearer-secret"},
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(DeepSeekDs2apiError) as exc_info:
+        deepseek.chat_completions({"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]})
+
+    assert exc_info.value.status_code == 429
+    assert "HTTP 429" in str(exc_info.value)
+    assert "rate limit from ds2api" in str(exc_info.value)
+
+
+def test_deepseek_web_chat_propagates_ds2api_rate_limit_and_records_diagnostic(tmp_path: Path) -> None:
+    class RateLimitedDeepSeekClient:
+        last_diagnostic = {"model": "deepseek-v4-pro", "ds2api_base_url": "http://127.0.0.1:9331/v1"}
+
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise DeepSeekDs2apiError(429, "ds2api DeepSeek 调用失败：HTTP 429 rate limit from ds2api")
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=store,
+            deepseek_client_factory=RateLimitedDeepSeekClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 429
+    assert "rate limit from ds2api" in response.text
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+    error_event = next(item for item in reversed(diagnostics) if item["kind"] == "completion_error")
+    assert error_event["route"] == "deepseek-web"
+    assert error_event["statusCode"] == 429
+    assert error_event["errorKind"] == "ds2api_http_error"
 
 
 def test_deepseek_openai_tool_calls_are_forwarded_to_ds2api(tmp_path: Path) -> None:

@@ -408,6 +408,11 @@ DS2API_DIFFERENTIAL_PARSE_CASES: list[dict[str, Any]] = [
         "text": 'Summary: support canonical <tool_calls> and DSML <|DSML|tool_calls> wrappers.\n\n<|DSML|tool_calls><|DSML|invoke name="Bash"><|DSML|parameter name="command"><![CDATA[git status]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>',
         "names": ["Bash"],
     },
+    {
+        "id": "mixed_case_cdata_ignored_before_wrapper",
+        "text": '<![cDaTa[<tool_calls><invoke name="Bash"><parameter name="command">bad</parameter></invoke></tool_calls>]]><tool_calls><invoke name="Read"><parameter name="file_path">README.md</parameter></invoke></tool_calls>',
+        "names": ["Bash", "Read"],
+    },
 ]
 
 
@@ -480,8 +485,8 @@ def test_ds2api_differential_openai_stream_format(ds2api_runner: Path) -> None:
 
 def test_ds2api_reference_commits_are_documented() -> None:
     assert_oracle_is_latest()
-    assert DS2API_MAIN_COMMIT == "66e0fa568fc851a160280f7b49bce3f9a92646b5"
-    assert DS2API_ORACLE_VERSION == "4.4.4"
+    assert DS2API_MAIN_COMMIT == "7ab5a0e66d3cf2fd82029b4940f30cf7a9105904"
+    assert DS2API_ORACLE_VERSION == "4.4.5"
 
 
 def test_ds2api_parity_accepts_hyphenated_dsml_but_rejects_bare_hyphenated_xml() -> None:

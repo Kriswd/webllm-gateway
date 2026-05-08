@@ -26,7 +26,12 @@ from webai_gateway.accounts import (
 )
 from webai_gateway.auto_research import build_auto_research_status
 from webai_gateway.config import GatewayConfig, config_to_admin, config_to_public, load_config, save_config, update_config
-from webai_gateway.deepseek_web import DEEPSEEK_DEFAULT_MODEL, DeepSeekWebClient, is_deepseek_web_model
+from webai_gateway.deepseek_web import (
+    DEEPSEEK_DEFAULT_MODEL,
+    DeepSeekDs2apiError,
+    DeepSeekWebClient,
+    is_deepseek_web_model,
+)
 from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.model_ids import normalize_model_body, normalize_model_id
 from webai_gateway.openai_api import (
@@ -4264,6 +4269,23 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
     try:
         web_client = _build_deepseek_web_client(app.state.deepseek_client_factory, credential, client, config)
         data = web_client.chat_completions(payload)
+    except DeepSeekDs2apiError as exc:
+        status_code = exc.status_code if 400 <= exc.status_code <= 599 else 502
+        _record_completion_error_diagnostic(
+            app,
+            endpoint="/v1/chat/completions",
+            route="deepseek-web",
+            model=model,
+            body=body,
+            stream=bool(body.get("stream")),
+            bridge=bridge,
+            status_code=status_code,
+            error_kind="ds2api_http_error",
+            error=exc,
+            provider_diagnostic=getattr(web_client, "last_diagnostic", None),
+            bridge_context=bridge_context,
+        )
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:
