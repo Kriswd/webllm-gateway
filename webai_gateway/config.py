@@ -30,6 +30,9 @@ DEFAULT_OBSERVATION_EXCLUDED_PATH_PARTS: tuple[str, ...] = (
     "vendor",
 )
 
+DEFAULT_DEEPSEEK_DS2API_ACCOUNT_MAX_INFLIGHT = 2
+DEFAULT_DEEPSEEK_DS2API_GLOBAL_MAX_INFLIGHT = 4
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -61,6 +64,8 @@ class ProviderRuntimeConfig:
     native_web_search_policy: str = "auto"
     response_language: str = "zh-CN"
     deepseek_ds2api_base_url: str = "http://127.0.0.1:9331/v1"
+    deepseek_ds2api_account_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_ACCOUNT_MAX_INFLIGHT
+    deepseek_ds2api_global_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_GLOBAL_MAX_INFLIGHT
     qwen_web_backend: str = "direct"
     gpt_thinking_backend: str = "webai2api"
 
@@ -107,6 +112,31 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
         else raw.get("provider_runtime") if isinstance(raw.get("provider_runtime"), dict) else {}
     )
     tool_bridge_raw = raw.get("tool_bridge") if isinstance(raw.get("tool_bridge"), dict) else {}
+    default_provider_runtime = ProviderRuntimeConfig()
+    deepseek_ds2api_account_max_inflight = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiAccountMaxInflight",
+            "deepseek_ds2api_account_max_inflight",
+            default=default_provider_runtime.deepseek_ds2api_account_max_inflight,
+        ),
+        default=default_provider_runtime.deepseek_ds2api_account_max_inflight,
+        minimum=1,
+        maximum=256,
+    )
+    deepseek_ds2api_global_max_inflight = max(
+        deepseek_ds2api_account_max_inflight,
+        _bounded_int(
+            _raw_first(
+                provider_runtime_raw,
+                "deepseekDs2apiGlobalMaxInflight",
+                "deepseek_ds2api_global_max_inflight",
+                default=default_provider_runtime.deepseek_ds2api_global_max_inflight,
+            ),
+            default=default_provider_runtime.deepseek_ds2api_global_max_inflight,
+            minimum=1,
+        ),
+    )
     allowed_tool_names = tool_bridge_raw.get("allowedToolNames", tool_bridge_raw.get("allowed_tool_names", ()))
     if not isinstance(allowed_tool_names, list):
         allowed_tool_names = []
@@ -145,6 +175,8 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
                 or provider_runtime_raw.get("deepseek_ds2api_base_url")
                 or "http://127.0.0.1:9331/v1"
             ),
+            deepseek_ds2api_account_max_inflight=deepseek_ds2api_account_max_inflight,
+            deepseek_ds2api_global_max_inflight=deepseek_ds2api_global_max_inflight,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend") or provider_runtime_raw.get("qwen_web_backend") or "direct"
             ),
@@ -192,6 +224,8 @@ def config_to_public(config: GatewayConfig) -> dict[str, Any]:
             "nativeWebSearchPolicy": config.provider_runtime.native_web_search_policy,
             "responseLanguage": config.provider_runtime.response_language,
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
+            "deepseekDs2apiAccountMaxInflight": config.provider_runtime.deepseek_ds2api_account_max_inflight,
+            "deepseekDs2apiGlobalMaxInflight": config.provider_runtime.deepseek_ds2api_global_max_inflight,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
@@ -234,6 +268,8 @@ def config_to_admin(config: GatewayConfig) -> dict[str, Any]:
             "nativeWebSearchPolicy": config.provider_runtime.native_web_search_policy,
             "responseLanguage": config.provider_runtime.response_language,
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
+            "deepseekDs2apiAccountMaxInflight": config.provider_runtime.deepseek_ds2api_account_max_inflight,
+            "deepseekDs2apiGlobalMaxInflight": config.provider_runtime.deepseek_ds2api_global_max_inflight,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
@@ -274,6 +310,30 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
         else payload.get("provider_runtime") if isinstance(payload.get("provider_runtime"), dict) else {}
     )
     tool_bridge_raw = payload.get("tool_bridge") if isinstance(payload.get("tool_bridge"), dict) else {}
+    deepseek_ds2api_account_max_inflight = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiAccountMaxInflight",
+            "deepseek_ds2api_account_max_inflight",
+            default=config.provider_runtime.deepseek_ds2api_account_max_inflight,
+        ),
+        default=config.provider_runtime.deepseek_ds2api_account_max_inflight,
+        minimum=1,
+        maximum=256,
+    )
+    deepseek_ds2api_global_max_inflight = max(
+        deepseek_ds2api_account_max_inflight,
+        _bounded_int(
+            _raw_first(
+                provider_runtime_raw,
+                "deepseekDs2apiGlobalMaxInflight",
+                "deepseek_ds2api_global_max_inflight",
+                default=config.provider_runtime.deepseek_ds2api_global_max_inflight,
+            ),
+            default=config.provider_runtime.deepseek_ds2api_global_max_inflight,
+            minimum=1,
+        ),
+    )
     allowed_tool_names = (
         tool_bridge_raw.get("allowedToolNames")
         if "allowedToolNames" in tool_bridge_raw
@@ -340,6 +400,8 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
                 if "deepseekDs2apiBaseUrl" in provider_runtime_raw
                 else provider_runtime_raw.get("deepseek_ds2api_base_url", config.provider_runtime.deepseek_ds2api_base_url)
             ),
+            deepseek_ds2api_account_max_inflight=deepseek_ds2api_account_max_inflight,
+            deepseek_ds2api_global_max_inflight=deepseek_ds2api_global_max_inflight,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend")
                 if "qwenWebBackend" in provider_runtime_raw
@@ -468,6 +530,24 @@ def _string_tuple(value: Any, *, default: tuple[str, ...] = ()) -> tuple[str, ..
         seen.add(text)
         out.append(text)
     return tuple(out)
+
+
+def _raw_first(raw: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in raw:
+            return raw[key]
+    return default
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int | None = None) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = int(default)
+    result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
 
 
 def _bool_value(value: Any) -> bool:

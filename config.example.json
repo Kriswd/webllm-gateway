@@ -16,6 +16,8 @@
     "nativeWebSearchPolicy": "auto",
     "responseLanguage": "zh-CN",
     "deepseekDs2apiBaseUrl": "http://127.0.0.1:9331/v1",
+    "deepseekDs2apiAccountMaxInflight": 2,
+    "deepseekDs2apiGlobalMaxInflight": 4,
     "qwenWebBackend": "direct",
     "gptThinkingBackend": "webai2api"
   },

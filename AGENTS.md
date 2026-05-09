@@ -138,6 +138,7 @@ pnpm build
 
 - 这个目录目前可能不是独立 git 仓库；改动前先检查 `git status`，不要假设可以提交。
 - 所有代码开发任务完成并通过端到端验证后，必须在确认不会覆盖用户改动的前提下更新本地 `main` 和远程 `origin/main`，然后启动本机最新 Gateway 代码供用户验收；如果仓库没有远程、推送失败或存在无法安全合并的用户改动，必须明确报告阻塞原因和当前分支状态。
+- 每天首次开发、验收或排查 ds2api 相关链路前，必须检查一次 `CJackHwang/ds2api` 是否有新源码：先执行 `git -C .tmp/ds2api fetch origin main`（GitHub 网络超时时按本文件代理规则重试），再对比 `origin/main` 与 `webai_gateway/ds2api_oracle.py` 中锁定的 commit/version；如果有更新，必须先更新本地 `.tmp/ds2api` 源码和 oracle commit/version，运行 parity/oracle 与 Gateway 回归测试通过后再继续。不得清理或覆盖 ds2api runtime 数据、登录态、凭证目录。
 - 优先改 Gateway 自己的模块和测试，不要跨目录修改 KrisAI、OpenClaw、Hermes 或 Claude Code。
 - 如果必须改下游示例或文档，只能作为接入说明，不得改变下游运行时代码。
 - 修改文本文件使用 `apply_patch`，避免脚本化批量重写造成编码和无关 diff。

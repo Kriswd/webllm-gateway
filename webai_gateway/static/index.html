@@ -250,6 +250,14 @@
                 <input id="deepseekDs2apiBaseUrl" name="deepseekDs2apiBaseUrl" type="text" placeholder="http://127.0.0.1:9331/v1" />
               </label>
               <label class="field">
+                <span>DeepSeek ds2api account max inflight</span>
+                <input id="deepseekDs2apiAccountMaxInflight" name="deepseekDs2apiAccountMaxInflight" type="number" min="1" max="256" />
+              </label>
+              <label class="field">
+                <span>DeepSeek ds2api global max inflight</span>
+                <input id="deepseekDs2apiGlobalMaxInflight" name="deepseekDs2apiGlobalMaxInflight" type="number" min="1" max="4096" />
+              </label>
+              <label class="field">
                 <span>Qwen Web 后端</span>
                 <select id="qwenWebBackendSelect" name="qwenWebBackendSelect">
                   <option value="direct">直连 Qwen Web</option>

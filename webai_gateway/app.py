@@ -1616,7 +1616,7 @@ def create_app(
             _record_completion_diagnostic(
                 app,
                 endpoint="/v1/messages",
-                route=_provider_route(normalize_model_id(openai_body.get("model"), cfg.upstream.model)),
+                route=_provider_route(normalize_model_id(openai_body.get("model"), cfg.upstream.model), cfg),
                 model=normalize_model_id(body.get("model") or openai_body.get("model"), cfg.upstream.model),
                 body=body,
                 stream=True,
@@ -1632,7 +1632,7 @@ def create_app(
         _record_completion_diagnostic(
             app,
             endpoint="/v1/messages",
-            route=_provider_route(normalize_model_id(openai_body.get("model"), cfg.upstream.model)),
+            route=_provider_route(normalize_model_id(openai_body.get("model"), cfg.upstream.model), cfg),
             model=normalize_model_id(body.get("model") or openai_body.get("model"), cfg.upstream.model),
             body=body,
             stream=False,
@@ -3182,12 +3182,18 @@ def _tool_bridge_phase_fields(result: Any, bridge_context: Any | None = None) ->
     return {"phases": safe_phases} if safe_phases else {}
 
 
-def _provider_route(model: str) -> str:
-    if is_deepseek_web_model(model):
+def _provider_route(model: str, config: GatewayConfig | None = None) -> str:
+    model_id = str(model or "")
+    if config is not None:
+        if _is_gpt_thinking_model(model_id) and _gpt_thinking_uses_deepseek_ds2api(config):
+            return "deepseek-web"
+        if is_qwen_web_model(model_id) and _qwen_web_uses_deepseek_ds2api(config):
+            return "deepseek-web"
+    if is_deepseek_web_model(model_id):
         return "deepseek-web"
-    if is_qwen_web_model(model):
+    if is_qwen_web_model(model_id):
         return "qwen-web"
-    if is_qwen_coder_model(model):
+    if is_qwen_coder_model(model_id):
         return "qwen-coder"
     return "upstream"
 
@@ -4431,6 +4437,30 @@ def _gpt_thinking_body_for_deepseek_ds2api(body: dict[str, Any]) -> dict[str, An
     return routed
 
 
+def _deepseek_ds2api_retry_delays(app: FastAPI) -> tuple[float, ...]:
+    raw = getattr(app.state, "deepseek_ds2api_retry_delays", (1.0, 3.0, 8.0))
+    if raw is None:
+        return ()
+    try:
+        return tuple(max(0.0, float(item)) for item in raw)
+    except (TypeError, ValueError):
+        return ()
+
+
+def _call_deepseek_ds2api_with_retry(app: FastAPI, web_client: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    delays = _deepseek_ds2api_retry_delays(app)
+    for attempt in range(len(delays) + 1):
+        try:
+            return web_client.chat_completions(payload)
+        except DeepSeekDs2apiError as exc:
+            if exc.status_code != 429 or attempt >= len(delays):
+                raise
+            delay = delays[attempt]
+            if delay > 0:
+                time.sleep(delay)
+    raise RuntimeError("unreachable ds2api retry state")
+
+
 def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> Response:
     credential = app.state.credential_store.get("deepseek-web")
     if not is_credential_authorized("deepseek-web", credential):
@@ -4452,7 +4482,7 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
     )
     try:
         web_client = _build_deepseek_web_client(app.state.deepseek_client_factory, credential, client, config)
-        data = web_client.chat_completions(payload)
+        data = _call_deepseek_ds2api_with_retry(app, web_client, payload)
     except DeepSeekDs2apiError as exc:
         status_code = exc.status_code if 400 <= exc.status_code <= 599 else 502
         _record_completion_error_diagnostic(
@@ -4496,11 +4526,28 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             allowed_tools=allowed_tools,
             bridge_context=bridge_context,
             model=model,
-            retry_chat=web_client.chat_completions,
+            retry_chat=lambda retry_payload: _call_deepseek_ds2api_with_retry(app, web_client, retry_payload),
             native_web_search=bool(payload.get("_webai_native_web_search")),
         )
     except HTTPException:
         raise
+    except DeepSeekDs2apiError as exc:
+        status_code = exc.status_code if 400 <= exc.status_code <= 599 else 502
+        _record_completion_error_diagnostic(
+            app,
+            endpoint="/v1/chat/completions",
+            route="deepseek-web",
+            model=model,
+            body=body,
+            stream=bool(body.get("stream")),
+            bridge=bridge,
+            status_code=status_code,
+            error_kind="ds2api_http_error",
+            error=exc,
+            provider_diagnostic=getattr(web_client, "last_diagnostic", None),
+            bridge_context=bridge_context,
+        )
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except (TimeoutError, httpx.TimeoutException) as exc:
         provider_diagnostic = _merge_provider_diagnostics(
             getattr(web_client, "last_diagnostic", None), getattr(exc, "diagnostic", None)

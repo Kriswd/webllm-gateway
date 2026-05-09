@@ -12647,10 +12647,14 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "providerRuntimePromptMaxChars" in index_response.text
     assert "providerRuntimeResponseLanguage" in index_response.text
     assert "deepseekDs2apiBaseUrl" in index_response.text
+    assert "deepseekDs2apiAccountMaxInflight" in index_response.text
+    assert "deepseekDs2apiGlobalMaxInflight" in index_response.text
     assert "qwenWebBackendSelect" in index_response.text
     assert "gptThinkingBackendSelect" in index_response.text
     assert "responseLanguage" in script_response.text
     assert "deepseekDs2apiBaseUrl" in script_response.text
+    assert "deepseekDs2apiAccountMaxInflight" in script_response.text
+    assert "deepseekDs2apiGlobalMaxInflight" in script_response.text
     assert "qwenWebBackend" in script_response.text
     assert "gptThinkingBackend" in script_response.text
     assert "providerRuntime" in script_response.text
@@ -12732,6 +12736,62 @@ def test_provider_runtime_deepseek_ds2api_base_url_round_trips_config(tmp_path: 
     assert saved["providerRuntime"]["deepseekDs2apiBaseUrl"] == "http://127.0.0.1:9555/v1"
     health = client.get("/health", headers=_headers()).json()
     assert health["config"]["providerRuntime"]["deepseekDs2apiBaseUrl"] == "http://127.0.0.1:9555/v1"
+
+
+def test_provider_runtime_deepseek_ds2api_concurrency_round_trips_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    client = TestClient(create_app(config=_config(), config_path=config_path, http_client=_not_found_client()))
+
+    response = client.put(
+        "/api/admin/config",
+        headers=_headers(),
+        json={
+            "providerRuntime": {
+                "deepseekDs2apiAccountMaxInflight": 3,
+                "deepseekDs2apiGlobalMaxInflight": 6,
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()["providerRuntime"]
+    assert body["deepseekDs2apiAccountMaxInflight"] == 3
+    assert body["deepseekDs2apiGlobalMaxInflight"] == 6
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["providerRuntime"]
+    assert saved["deepseekDs2apiAccountMaxInflight"] == 3
+    assert saved["deepseekDs2apiGlobalMaxInflight"] == 6
+    loaded = load_config(config_path)
+    assert loaded.provider_runtime.deepseek_ds2api_account_max_inflight == 3
+    assert loaded.provider_runtime.deepseek_ds2api_global_max_inflight == 6
+    health = client.get("/health", headers=_headers()).json()["config"]["providerRuntime"]
+    assert health["deepseekDs2apiAccountMaxInflight"] == 3
+    assert health["deepseekDs2apiGlobalMaxInflight"] == 6
+
+
+def test_deepseek_ds2api_sidecar_config_uses_provider_runtime_concurrency() -> None:
+    from webai_gateway.ds2api_sidecar_config import build_ds2api_sidecar_config
+
+    sidecar = build_ds2api_sidecar_config(
+        GatewayConfig(
+            provider_runtime=ProviderRuntimeConfig(
+                deepseek_ds2api_account_max_inflight=3,
+                deepseek_ds2api_global_max_inflight=6,
+            )
+        )
+    )
+
+    assert sidecar["keys"] == []
+    assert sidecar["accounts"] == []
+    assert sidecar["runtime"]["account_max_inflight"] == 3
+    assert sidecar["runtime"]["global_max_inflight"] == 6
+
+
+def test_start_script_uses_configured_ds2api_concurrency() -> None:
+    script = Path("start_webai_gateway.bat").read_text(encoding="utf-8")
+
+    assert "webai_gateway.ds2api_sidecar_config" in script
+    assert '"account_max_inflight":1' not in script
+    assert '"global_max_inflight":1' not in script
 
 
 def test_provider_runtime_qwen_web_backend_round_trips_config(tmp_path: Path) -> None:
@@ -13892,6 +13952,50 @@ def test_deepseek_web_chat_propagates_ds2api_rate_limit_and_records_diagnostic(t
     assert error_event["errorKind"] == "ds2api_http_error"
 
 
+def test_deepseek_gateway_retries_transient_ds2api_rate_limit(tmp_path: Path) -> None:
+    attempts = 0
+
+    class FlakyDeepSeekClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise DeepSeekDs2apiError(429, "ds2api DeepSeek 调用失败：HTTP 429 rate limit from ds2api")
+            return _openai_response("ok")
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    app = create_app(
+        config=_config(),
+        credential_store=store,
+        deepseek_client_factory=FlakyDeepSeekClient,
+        http_client=_not_found_client(),
+    )
+    app.state.deepseek_ds2api_retry_delays = (0.0,)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert attempts == 2
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+    assert not [item for item in diagnostics if item["kind"] == "completion_error" and item.get("statusCode") == 429]
+
+
 def test_deepseek_openai_tool_calls_are_forwarded_to_ds2api(tmp_path: Path) -> None:
     seen: dict[str, Any] = {}
 
@@ -14135,6 +14239,11 @@ def test_gpt_thinking_backend_can_route_anthropic_requests_to_deepseek_ds2api(
     assert response.json()["content"] == [
         {"type": "tool_use", "id": "toolu_call_read", "name": "Read", "input": {"file_path": "README.md"}}
     ]
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+    message_event = next(
+        item for item in reversed(diagnostics) if item["kind"] == "completion_response" and item["endpoint"] == "/v1/messages"
+    )
+    assert message_event["route"] == "deepseek-web"
 
 
 def test_deepseek_anthropic_tool_use_round_trip_uses_native_tool_calls(tmp_path: Path) -> None:

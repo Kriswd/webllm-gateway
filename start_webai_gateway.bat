@@ -67,7 +67,8 @@ if defined WEBAI_DS2API_PID (
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop';" ^
     "$env:PORT='9331';" ^
-    "$env:DS2API_CONFIG_JSON='{\"keys\":[],\"accounts\":[],\"runtime\":{\"global_max_inflight\":1,\"account_max_inflight\":1}}';" ^
+    "$configPath=(Join-Path '%~dp0' 'config.json');" ^
+    "$env:DS2API_CONFIG_JSON=(& python -m webai_gateway.ds2api_sidecar_config --config $configPath);" ^
     "$env:DS2API_ADMIN_KEY='local-dev-admin';" ^
     "$env:DS2API_CONFIG_PATH=(Join-Path '%~dp0' '.webai-gateway\\ds2api\\config.json');" ^
     "Start-Process -FilePath '%WEBAI_DS2API_EXE%' -WorkingDirectory '%~dp0' -RedirectStandardOutput '.webai-gateway\\logs\\ds2api-out.log' -RedirectStandardError '.webai-gateway\\logs\\ds2api-err.log' -WindowStyle Hidden"
