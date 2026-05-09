@@ -4785,21 +4785,41 @@ def _message_is_tool_loop_side_text(messages: list[Any], index: int) -> bool:
         return False
     if _text_explicitly_starts_new_task_after_tool_loop(text):
         return False
-    previous = _nearest_non_system_message(messages, index, step=-1)
+    previous_index = _nearest_non_system_message_index(messages, index, step=-1)
+    previous = messages[previous_index] if previous_index >= 0 else None
     if isinstance(previous, dict) and _message_has_tool_interaction(previous):
+        return True
+    if (
+        isinstance(previous, dict)
+        and str(previous.get("role") or "") == "user"
+        and _message_is_tool_loop_side_text(messages, previous_index)
+    ):
+        return True
+    following_index = _nearest_non_system_message_index(messages, index, step=1)
+    following = messages[following_index] if following_index >= 0 else None
+    if (
+        isinstance(following, dict)
+        and _message_has_tool_interaction(following)
+        and any(isinstance(message, dict) and _message_has_tool_interaction(message) for message in messages[:index])
+    ):
         return True
     return False
 
 
 def _nearest_non_system_message(messages: list[Any], index: int, *, step: int) -> Any:
+    found = _nearest_non_system_message_index(messages, index, step=step)
+    return messages[found] if found >= 0 else None
+
+
+def _nearest_non_system_message_index(messages: list[Any], index: int, *, step: int) -> int:
     cursor = index + step
     while 0 <= cursor < len(messages):
         message = messages[cursor]
         if isinstance(message, dict) and str(message.get("role") or "") == "system":
             cursor += step
             continue
-        return message
-    return None
+        return cursor
+    return -1
 
 
 def _text_explicitly_starts_new_task_after_tool_loop(text: str) -> bool:

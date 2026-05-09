@@ -2868,6 +2868,9 @@ def _request_body_diagnostic_fields(body: dict[str, Any]) -> dict[str, Any]:
     messages = body.get("messages")
     if isinstance(messages, list):
         fields["requestMessageCount"] = len(messages)
+        shapes = _request_message_shapes(messages)
+        if shapes:
+            fields["requestMessageShapes"] = shapes
     tools = body.get("tools")
     if isinstance(tools, list):
         fields["requestToolCount"] = len(tools)
@@ -2906,6 +2909,7 @@ def _tool_bridge_context_diagnostic_fields(bridge_context: Any | None) -> dict[s
     task_text = str(getattr(bridge_context, "task_text", "") or "")
     if task_text:
         fields["toolBridgeTaskChars"] = len(task_text)
+        fields["toolBridgeTaskPreview"] = _preview_text(_redact_sensitive_text(task_text), max_chars=220)
     options = getattr(bridge_context, "options", None)
     exposure_policy = str(getattr(options, "exposure_policy", "") or "")
     if exposure_policy:
@@ -2914,6 +2918,59 @@ def _tool_bridge_context_diagnostic_fields(bridge_context: Any | None) -> dict[s
     if tool_profile:
         fields["toolBridgeToolProfile"] = tool_profile
     return fields
+
+
+def _request_message_shapes(messages: list[Any]) -> list[dict[str, Any]]:
+    shapes: list[dict[str, Any]] = []
+    for message in messages[-12:]:
+        if not isinstance(message, dict):
+            shapes.append({"type": type(message).__name__})
+            continue
+        shape: dict[str, Any] = {"role": str(message.get("role") or "")}
+        content = message.get("content")
+        if isinstance(content, str):
+            shape["contentType"] = "text"
+            shape["contentChars"] = len(content)
+        elif isinstance(content, list):
+            shape["contentType"] = "blocks"
+            block_types = [
+                str(block.get("type") or "")
+                for block in content
+                if isinstance(block, dict) and str(block.get("type") or "")
+            ]
+            if block_types:
+                shape["blockTypes"] = block_types[:8]
+        elif isinstance(content, dict):
+            shape["contentType"] = "object"
+            block_type = str(content.get("type") or "")
+            if block_type:
+                shape["blockTypes"] = [block_type]
+        elif content is None:
+            shape["contentType"] = "none"
+        else:
+            shape["contentType"] = type(content).__name__
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            shape["toolCallCount"] = len(tool_calls)
+            names: list[str] = []
+            for call in tool_calls[:8]:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = function.get("name") or call.get("name")
+                if isinstance(name, str) and name:
+                    names.append(name)
+            if names:
+                shape["toolCallNames"] = names
+        if str(message.get("role") or "") == "tool":
+            name = message.get("name")
+            if isinstance(name, str) and name:
+                shape["toolName"] = name
+            tool_call_id = message.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                shape["hasToolCallId"] = True
+        shapes.append(shape)
+    return shapes
 
 
 def _openai_tool_names(tools: list[Any]) -> list[str]:

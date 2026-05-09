@@ -21279,6 +21279,49 @@ def test_qwen_web_local_agent_keeps_tool_loop_when_standalone_claude_status_text
     assert "superpowers" in response.text
 
 
+def test_build_upstream_payload_keeps_tool_loop_across_chained_claude_status_text() -> None:
+    config = GatewayConfig(
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="qwen-web/qwen3.6-max-preview"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="local-agent", tool_profile="auto"),
+    )
+    body = {
+        "model": "qwen-web/qwen3.6-max-preview",
+        "messages": [
+            {"role": "user", "content": "Investigate why the local slash command stopped loading and fix it."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "toolu_read",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": "{\"file_path\":\"CLAUDE.md\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_read", "name": "Read", "content": "CLAUDE content"},
+            {"role": "user", "content": "Searched for 1 pattern"},
+            {"role": "user", "content": "Read 2 files"},
+        ],
+        "tools": [
+            {"type": "function", "function": {"name": "Glob", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Grep", "parameters": {"type": "object"}}},
+        ],
+        "max_tokens": 32000,
+    }
+
+    payload, bridge, allowed_tools, bridge_context = build_upstream_payload(body, config)
+
+    assert bridge is True
+    assert bridge_context.has_tool_loop is True
+    assert allowed_tools == {"Glob", "Read", "Grep"}
+    assert "Investigate why the local slash command" in bridge_context.task_text
+    assert bridge_context.task_text != "Read 2 files"
+    prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
+    assert "Active tool-loop continuation" in prompt
+
+
 def test_qwen_web_all_profile_preserves_task_after_direct_modify_followup(tmp_path: Path) -> None:
     seen_payloads: list[dict[str, Any]] = []
 
@@ -23157,6 +23200,10 @@ def test_request_diagnostics_records_request_start_with_tool_context() -> None:
     assert started["toolBridgeAllowedToolCount"] == 1
     assert started["toolBridgeAllowedTools"] == ["Read"]
     assert started["toolBridgeExposurePolicy"] == "all"
+    assert started["toolBridgeTaskPreview"] == "Read the local project README."
+    assert started["requestMessageShapes"] == [
+        {"role": "user", "contentType": "text", "contentChars": 30}
+    ]
     assert diagnostics[-1]["kind"] == "completion_response"
 
 
