@@ -99,6 +99,7 @@ function applyConfig(config) {
   $("nativeWebSearchPolicySelect").value = config.providerRuntime?.nativeWebSearchPolicy || "auto";
   $("deepseekDs2apiBaseUrl").value = config.providerRuntime?.deepseekDs2apiBaseUrl || "http://127.0.0.1:9331/v1";
   $("qwenWebBackendSelect").value = config.providerRuntime?.qwenWebBackend || "direct";
+  $("gptThinkingBackendSelect").value = config.providerRuntime?.gptThinkingBackend || "webai2api";
   $("toolActivationPolicySelect").value = config.tool_bridge?.activationPolicy || "auto";
   $("toolExposurePolicySelect").value = config.tool_bridge?.exposurePolicy || "safe";
   $("semanticFinalJudgeSelect").value = config.tool_bridge?.semanticFinalJudge || "off";
@@ -509,6 +510,7 @@ async function saveConfig(event) {
       nativeWebSearchPolicy: $("nativeWebSearchPolicySelect").value,
       deepseekDs2apiBaseUrl: $("deepseekDs2apiBaseUrl").value || "http://127.0.0.1:9331/v1",
       qwenWebBackend: $("qwenWebBackendSelect").value || "direct",
+      gptThinkingBackend: $("gptThinkingBackendSelect").value || "webai2api",
     },
     tool_bridge: {
       ...(state.config?.tool_bridge || {}),

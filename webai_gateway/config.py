@@ -62,6 +62,7 @@ class ProviderRuntimeConfig:
     response_language: str = "zh-CN"
     deepseek_ds2api_base_url: str = "http://127.0.0.1:9331/v1"
     qwen_web_backend: str = "direct"
+    gpt_thinking_backend: str = "webai2api"
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,11 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend") or provider_runtime_raw.get("qwen_web_backend") or "direct"
             ),
+            gpt_thinking_backend=str(
+                provider_runtime_raw.get("gptThinkingBackend")
+                or provider_runtime_raw.get("gpt_thinking_backend")
+                or "webai2api"
+            ),
         ),
         tool_bridge=ToolBridgeConfig(
             mode=str(tool_bridge_raw.get("mode") or "strict"),
@@ -187,6 +193,7 @@ def config_to_public(config: GatewayConfig) -> dict[str, Any]:
             "responseLanguage": config.provider_runtime.response_language,
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
+            "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
         "tool_bridge": {
             "mode": config.tool_bridge.mode,
@@ -228,6 +235,7 @@ def config_to_admin(config: GatewayConfig) -> dict[str, Any]:
             "responseLanguage": config.provider_runtime.response_language,
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
+            "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
         "tool_bridge": {
             "mode": config.tool_bridge.mode,
@@ -336,6 +344,11 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
                 provider_runtime_raw.get("qwenWebBackend")
                 if "qwenWebBackend" in provider_runtime_raw
                 else provider_runtime_raw.get("qwen_web_backend", config.provider_runtime.qwen_web_backend)
+            ),
+            gpt_thinking_backend=str(
+                provider_runtime_raw.get("gptThinkingBackend")
+                if "gptThinkingBackend" in provider_runtime_raw
+                else provider_runtime_raw.get("gpt_thinking_backend", config.provider_runtime.gpt_thinking_backend)
             ),
         ),
         tool_bridge=ToolBridgeConfig(

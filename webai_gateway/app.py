@@ -139,6 +139,7 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"[\w.-]*\s*[\"']?\s*[:=]\s*[\"']?)([^\"'\s,;}]+)"
 )
 _SMOKE_SENSITIVE_FIELD_RE = re.compile(r"(?i)\b(?:qwen_session|ds_session_id|hwsid|sessiontoken)\s*=\s*\[redacted\]")
+_GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
 
 
 def create_app(
@@ -1245,6 +1246,14 @@ def create_app(
             return await run_in_threadpool(_qwen_web_chat, app, client, body, cfg)
         if is_qwen_coder_model(body.get("model")):
             return await run_in_threadpool(_qwen_coder_chat, app, client, body, cfg)
+        if _gpt_thinking_uses_deepseek_ds2api(cfg) and _is_gpt_thinking_model(body.get("model")):
+            return await run_in_threadpool(
+                _deepseek_web_chat,
+                app,
+                client,
+                _gpt_thinking_body_for_deepseek_ds2api(body),
+                cfg,
+            )
         payload, bridge, allowed_tools, bridge_context = build_upstream_payload(body, cfg)
         model = str(payload.get("model") or cfg.upstream.model)
         preflight = _local_preflight_response(app, body, str(payload.get("model") or cfg.upstream.model), bridge_context)
@@ -1494,6 +1503,15 @@ def create_app(
                 app,
                 client,
                 openai_body,
+                cfg,
+            )
+        elif _gpt_thinking_uses_deepseek_ds2api(cfg) and _is_gpt_thinking_model(openai_body.get("model")):
+            parsed, direct_bridge_headers = await run_in_threadpool(
+                _direct_provider_chat_payload_with_headers,
+                _deepseek_web_chat,
+                app,
+                client,
+                _gpt_thinking_body_for_deepseek_ds2api(openai_body),
                 cfg,
             )
         else:
@@ -2152,7 +2170,6 @@ def _onboarding_connection_profiles(providers: list[dict[str, Any]], cfg: Gatewa
         credential = provider.get("credential") if isinstance(provider.get("credential"), dict) else {}
         model_availability = provider.get("modelAvailability") if isinstance(provider.get("modelAvailability"), dict) else {}
         authorized = bool(credential.get("authorized"))
-        backend_kind, backend_base_url = _onboarding_backend_metadata(provider, cfg)
         available_models = provider.get("availableModels") if isinstance(provider.get("availableModels"), list) else []
         profile_model_ids: list[str] = []
         seen_model_ids: set[str] = set()
@@ -2167,6 +2184,7 @@ def _onboarding_connection_profiles(providers: list[dict[str, Any]], cfg: Gatewa
             availability = model_availability.get(model_id) if isinstance(model_availability.get(model_id), dict) else {}
             status = str(availability.get("status") or ("available" if authorized else "pending"))
             message = str(availability.get("message") or provider.get("availabilityMessage") or "")
+            backend_kind, backend_base_url = _onboarding_model_backend_metadata(provider, model_id, cfg)
             profiles.append(
                 {
                     "id": f"{provider_id}:{model_id}",
@@ -2190,6 +2208,12 @@ def _onboarding_connection_profiles(providers: list[dict[str, Any]], cfg: Gatewa
                 }
             )
     return profiles
+
+
+def _onboarding_model_backend_metadata(provider: dict[str, Any], model_id: str, cfg: GatewayConfig) -> tuple[str, str]:
+    if _is_gpt_thinking_model(model_id) and _gpt_thinking_uses_deepseek_ds2api(cfg):
+        return "ds2api-sidecar", cfg.provider_runtime.deepseek_ds2api_base_url
+    return _onboarding_backend_metadata(provider, cfg)
 
 
 def _onboarding_backend_metadata(provider: dict[str, Any], cfg: GatewayConfig) -> tuple[str, str]:
@@ -4383,6 +4407,25 @@ def _qwen_web_uses_deepseek_ds2api(config: GatewayConfig) -> bool:
 
 
 def _qwen_web_body_for_deepseek_ds2api(body: dict[str, Any]) -> dict[str, Any]:
+    routed = dict(body)
+    routed["model"] = "deepseek-v4-pro"
+    return routed
+
+
+def _gpt_thinking_backend(config: GatewayConfig) -> str:
+    backend = (config.provider_runtime.gpt_thinking_backend or "webai2api").strip().lower()
+    return backend.replace("_", "-")
+
+
+def _gpt_thinking_uses_deepseek_ds2api(config: GatewayConfig) -> bool:
+    return _gpt_thinking_backend(config) in {"deepseek-ds2api", "ds2api", "deepseek"}
+
+
+def _is_gpt_thinking_model(model: Any) -> bool:
+    return normalize_model_id(model) in _GPT_THINKING_MODEL_IDS
+
+
+def _gpt_thinking_body_for_deepseek_ds2api(body: dict[str, Any]) -> dict[str, Any]:
     routed = dict(body)
     routed["model"] = "deepseek-v4-pro"
     return routed

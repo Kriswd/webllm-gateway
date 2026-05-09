@@ -11906,6 +11906,73 @@ def test_onboarding_returns_claude_code_connection_profiles_for_web_providers(tm
     assert "bearer-secret" not in response.text
 
 
+def test_onboarding_marks_gpt_thinking_ds2api_backend_override(tmp_path: Path) -> None:
+    account_id = webai2api_account_id("chatgpt", "browser_default", "default")
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    registry.set_current("chatgpt", account_id)
+    registry.save_validation(account_id, "gpt-thinking", {"status": "available"})
+    registry.save_validation(account_id, "gpt-instant", {"status": "available"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-instant", "object": "model", "owned_by": "internal_server", "type": "text"},
+                        {"id": "gpt-thinking", "object": "model", "owned_by": "internal_server", "type": "text"},
+                    ],
+                },
+                request=request,
+            )
+        if request.url.path == "/admin/config/instances":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "browser_default",
+                        "workers": [{"name": "default", "type": "chatgpt_text", "mergeTypes": []}],
+                    }
+                ],
+                request=request,
+            )
+        if request.url.path == "/v1/cookies":
+            return httpx.Response(
+                200,
+                json={"cookies": [{"name": "__Secure-next-auth.session-token.0", "value": "chatgpt-session-secret"}]},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+                provider_runtime=ProviderRuntimeConfig(
+                    deepseek_ds2api_base_url="http://127.0.0.1:9331/v1",
+                    gpt_thinking_backend="deepseek-ds2api",
+                ),
+            ),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/api/admin/onboarding")
+
+    assert response.status_code == 200
+    profiles = response.json()["connectionProfiles"]
+    thinking = next(item for item in profiles if item["providerId"] == "chatgpt" and item["modelId"] == "gpt-thinking")
+    instant = next(item for item in profiles if item["providerId"] == "chatgpt" and item["modelId"] == "gpt-instant")
+    assert thinking["backendKind"] == "ds2api-sidecar"
+    assert thinking["backendBaseUrl"] == "http://127.0.0.1:9331/v1"
+    assert instant["backendKind"] == "webai2api-sidecar"
+    assert instant["backendBaseUrl"] == "http://upstream.test/v1"
+
+
 def test_onboarding_connection_profiles_keep_stale_unavailable_models_for_recheck(tmp_path: Path) -> None:
     account_id = webai2api_account_id("chatgpt", "browser_default", "default")
     registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
@@ -12581,9 +12648,11 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "providerRuntimeResponseLanguage" in index_response.text
     assert "deepseekDs2apiBaseUrl" in index_response.text
     assert "qwenWebBackendSelect" in index_response.text
+    assert "gptThinkingBackendSelect" in index_response.text
     assert "responseLanguage" in script_response.text
     assert "deepseekDs2apiBaseUrl" in script_response.text
     assert "qwenWebBackend" in script_response.text
+    assert "gptThinkingBackend" in script_response.text
     assert "providerRuntime" in script_response.text
 
 
@@ -12684,6 +12753,27 @@ def test_provider_runtime_qwen_web_backend_round_trips_config(tmp_path: Path) ->
     assert loaded.provider_runtime.qwen_web_backend == "deepseek-ds2api"
     health = client.get("/health", headers=_headers()).json()
     assert health["config"]["providerRuntime"]["qwenWebBackend"] == "deepseek-ds2api"
+
+
+def test_provider_runtime_gpt_thinking_backend_round_trips_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    client = TestClient(create_app(config=_config(), config_path=config_path, http_client=_not_found_client()))
+
+    response = client.put(
+        "/api/admin/config",
+        headers=_headers(),
+        json={"providerRuntime": {"gptThinkingBackend": "deepseek-ds2api"}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["providerRuntime"]["gptThinkingBackend"] == "deepseek-ds2api"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["providerRuntime"]["gptThinkingBackend"] == "deepseek-ds2api"
+    loaded = load_config(config_path)
+    assert loaded.provider_runtime.gpt_thinking_backend == "deepseek-ds2api"
+    health = client.get("/health", headers=_headers()).json()
+    assert health["config"]["providerRuntime"]["gptThinkingBackend"] == "deepseek-ds2api"
 
 
 def test_health_reports_runtime_source_freshness(tmp_path: Path) -> None:
@@ -13961,6 +14051,87 @@ def test_qwen_web_backend_can_route_anthropic_requests_to_deepseek_ds2api(tmp_pa
     assert seen["payload"]["model"] == "deepseek-v4-pro"
     assert seen["payload"]["tools"][0]["function"]["name"] == "Read"
     assert response.json()["model"] == "qwen-web/qwen3.6-max-preview"
+    assert response.json()["content"] == [
+        {"type": "tool_use", "id": "toolu_call_read", "name": "Read", "input": {"file_path": "README.md"}}
+    ]
+
+
+@pytest.mark.parametrize("model_id", ["gpt-thinking", "chatgpt_text/gpt-thinking"])
+def test_gpt_thinking_backend_can_route_anthropic_requests_to_deepseek_ds2api(
+    tmp_path: Path, model_id: str
+) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingDeepSeekClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            seen["credential"] = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return {
+                "id": "gpt-thinking-via-ds2api-test",
+                "object": "chat.completion",
+                "model": payload["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_read",
+                                    "type": "function",
+                                    "function": {"name": "Read", "arguments": "{\"file_path\":\"README.md\"}"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+
+    def unexpected_upstream(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("gptThinkingBackend=deepseek-ds2api must bypass WebAI2API upstream")
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+                provider_runtime=ProviderRuntimeConfig(gpt_thinking_backend="deepseek-ds2api"),
+            ),
+            credential_store=store,
+            deepseek_client_factory=CapturingDeepSeekClient,
+            http_client=httpx.Client(transport=httpx.MockTransport(unexpected_upstream)),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Read README.md first."}],
+            "tools": [{"name": "Read", "description": "Read files", "input_schema": {"type": "object"}}],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen["credential"]["bearer"] == "bearer-secret"
+    assert seen["payload"]["model"] == "deepseek-v4-pro"
+    assert seen["payload"]["tools"][0]["function"]["name"] == "Read"
+    assert response.json()["model"] == model_id
     assert response.json()["content"] == [
         {"type": "tool_use", "id": "toolu_call_read", "name": "Read", "input": {"file_path": "README.md"}}
     ]
