@@ -1,22 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 import uuid
 from typing import Any
 
 from webai_gateway.model_ids import normalize_model_id
 from webai_gateway.tool_bridge import normalize_anthropic_tools
-
-
-_CLAUDE_TOOL_RESULT_STATUS_TEXT_RE = re.compile(
-    r"^\s*(?:"
-    r"Searched\s+for\s+\d+\s+patterns?(?:\s*\([^)]*\))?(?:\s*,\s*read\s+\d+\s+files?)?|"
-    r"(?:Read|Edited|Wrote|Created|Updated|Deleted|Modified)\s+\d+\s+files?"
-    r")\s*(?:\([^)]*\))?\s*$",
-    re.IGNORECASE,
-)
 
 
 def anthropic_body_to_openai(
@@ -239,18 +229,12 @@ def _anthropic_message_to_openai(
     content_parts: list[dict[str, Any]] = []
     assistant_tool_calls: list[dict[str, Any]] = []
     out: list[dict[str, Any]] = []
-    message_has_tool_result = role == "user" and any(
-        isinstance(block, dict) and str(block.get("type") or "").strip() == "tool_result"
-        for block in content
-    )
     for block in content:
         if not isinstance(block, dict):
             raise ValueError("Anthropic content block must be an object")
         block_type = str(block.get("type") or "").strip()
         if block_type == "text":
             text = _as_text(block.get("text"))
-            if message_has_tool_result and _is_claude_tool_result_status_text(text):
-                continue
             text_parts.append(text)
             content_parts.append({"type": "text", "text": text})
             continue
@@ -324,10 +308,6 @@ def _anthropic_message_to_openai(
         content_value: Any = content_parts if has_non_text else "\n".join(part for part in text_parts if part).strip()
         out.insert(0, {"role": role, "content": content_value})
     return out
-
-
-def _is_claude_tool_result_status_text(text: str) -> bool:
-    return bool(_CLAUDE_TOOL_RESULT_STATUS_TEXT_RE.match(text or ""))
 
 
 def _registered_tool_call(registry: dict[str, dict[str, Any]] | None, tool_use_id: str) -> dict[str, Any] | None:

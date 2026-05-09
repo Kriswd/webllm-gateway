@@ -1654,6 +1654,9 @@ def prepare_openai_messages(messages: list[dict[str, Any]], context: ToolBridgeC
     unchanged_read_guard = _unchanged_read_tool_result_guard_message(task_messages, context)
     if unchanged_read_guard:
         converted.append({"role": "user", "content": unchanged_read_guard})
+    continuation_guard = _tool_loop_side_text_guard_message(messages, context)
+    if continuation_guard:
+        converted.append({"role": "user", "content": continuation_guard})
     boundary_guard = _new_task_boundary_guard_message(messages, context)
     if boundary_guard:
         converted.append({"role": "user", "content": boundary_guard})
@@ -2104,6 +2107,20 @@ def _new_task_boundary_guard_message(messages: list[dict[str, Any]], context: To
         "New user task boundary: the latest user request starts a new task after earlier tool history. "
         "Treat previous tool calls, previous tool results, background task ids, and install/run commands as historical context only. "
         "Do not poll TaskOutput, continue prior background jobs, or resume prior setup/install commands unless the latest user request explicitly asks to continue them.\n"
+        f"Current user task: {task[:1000]}"
+    )
+
+
+def _tool_loop_side_text_guard_message(messages: list[dict[str, Any]], context: ToolBridgeContext) -> str:
+    if not _latest_user_message_is_tool_loop_side_text(messages):
+        return ""
+    task = (context.task_text or _effective_human_task_text(messages)).strip()
+    if not task:
+        return ""
+    return (
+        "Active tool-loop continuation: the latest user text is adjacent to tool_use/tool_result history, "
+        "so it is context from the active tool round rather than a new user task boundary. Continue the current "
+        "user task using the available tool evidence; request another allowed tool only if more evidence is needed.\n"
         f"Current user task: {task[:1000]}"
     )
 
@@ -4724,6 +4741,8 @@ def _current_human_task_start_index(messages: list[Any]) -> int:
             continue
         if _message_is_skill_payload_after_tool_result(messages, index):
             continue
+        if _message_is_tool_loop_side_text(messages, index):
+            continue
         text = _human_task_text_from_message(message)
         if not text.strip():
             continue
@@ -4732,6 +4751,78 @@ def _current_human_task_start_index(messages: list[Any]) -> int:
         if not _looks_like_task_continuation_followup(text):
             return index
     return fallback
+
+
+def _latest_user_message_is_tool_loop_side_text(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+            continue
+        if _message_is_tool_result(message) or _message_is_gateway_control_instruction(message):
+            continue
+        if not _human_task_text_from_message(message).strip():
+            continue
+        return _message_is_tool_loop_side_text(messages, index)
+    return False
+
+
+def _message_is_tool_loop_side_text(messages: list[Any], index: int) -> bool:
+    if index < 0 or index >= len(messages):
+        return False
+    message = messages[index]
+    if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+        return False
+    if _message_is_tool_result(message) or _message_is_gateway_control_instruction(message):
+        return False
+    if _message_is_skill_payload_after_tool_result(messages, index):
+        return False
+    text = _human_task_text_from_message(message).strip()
+    if not text:
+        return False
+    if _looks_like_task_continuation_followup(text):
+        return False
+    if _text_explicitly_starts_new_task_after_tool_loop(text):
+        return False
+    previous = _nearest_non_system_message(messages, index, step=-1)
+    if isinstance(previous, dict) and _message_has_tool_interaction(previous):
+        return True
+    return False
+
+
+def _nearest_non_system_message(messages: list[Any], index: int, *, step: int) -> Any:
+    cursor = index + step
+    while 0 <= cursor < len(messages):
+        message = messages[cursor]
+        if isinstance(message, dict) and str(message.get("role") or "") == "system":
+            cursor += step
+            continue
+        return message
+    return None
+
+
+def _text_explicitly_starts_new_task_after_tool_loop(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _extract_command_args(stripped):
+        return True
+    if _looks_like_skill_injection_text(stripped):
+        return True
+    if _looks_like_meta_capability_question(stripped):
+        return True
+    if _looks_like_project_context_reset_task(stripped):
+        return True
+    if any(mark in stripped for mark in ("?", "？", "吗", "呢")):
+        return True
+    if re.search(
+        r"\b(?:now|please|fix|repair|implement|review|audit|inspect|search|find|update|modify|change|write|edit)\b",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return True
+    return len(stripped) >= 80
 
 
 def _message_is_skill_payload_after_tool_result(messages: list[Any], index: int) -> bool:
@@ -4823,12 +4914,15 @@ def _latest_user_text(messages: Any) -> str:
 def _latest_human_user_text(messages: Any) -> str:
     if not isinstance(messages, list):
         return ""
-    for message in reversed(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
         if not isinstance(message, dict) or str(message.get("role") or "") != "user":
             continue
         if _message_is_tool_result(message):
             continue
         if _message_is_gateway_control_instruction(message):
+            continue
+        if _message_is_tool_loop_side_text(messages, index):
             continue
         text = _human_task_text_from_message(message)
         if text.strip():
@@ -5002,6 +5096,8 @@ def _recent_prior_human_task_text(messages: list[Any]) -> str:
             continue
         if _message_is_tool_result(message) or _message_is_gateway_control_instruction(message):
             continue
+        if _message_is_tool_loop_side_text(messages, index):
+            continue
         text = _human_task_text_from_message(message).strip()
         if text:
             return text
@@ -5015,6 +5111,8 @@ def _latest_human_user_message_index(messages: list[Any]) -> int:
             continue
         if _message_is_tool_result(message) or _message_is_gateway_control_instruction(message):
             continue
+        if _message_is_tool_loop_side_text(messages, index):
+            continue
         if _human_task_text_from_message(message).strip():
             return index
     return -1
@@ -5024,12 +5122,15 @@ def _human_user_texts_newest_first(messages: Any) -> list[str]:
     if not isinstance(messages, list):
         return []
     texts: list[str] = []
-    for message in reversed(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
         if not isinstance(message, dict) or str(message.get("role") or "") != "user":
             continue
         if _message_is_tool_result(message):
             continue
         if _message_is_gateway_control_instruction(message):
+            continue
+        if _message_is_tool_loop_side_text(messages, index):
             continue
         text = _human_task_text_from_message(message)
         if text.strip():
