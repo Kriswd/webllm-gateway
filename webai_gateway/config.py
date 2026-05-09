@@ -61,6 +61,7 @@ class ProviderRuntimeConfig:
     native_web_search_policy: str = "auto"
     response_language: str = "zh-CN"
     deepseek_ds2api_base_url: str = "http://127.0.0.1:9331/v1"
+    qwen_web_backend: str = "direct"
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,9 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
                 or provider_runtime_raw.get("deepseek_ds2api_base_url")
                 or "http://127.0.0.1:9331/v1"
             ),
+            qwen_web_backend=str(
+                provider_runtime_raw.get("qwenWebBackend") or provider_runtime_raw.get("qwen_web_backend") or "direct"
+            ),
         ),
         tool_bridge=ToolBridgeConfig(
             mode=str(tool_bridge_raw.get("mode") or "strict"),
@@ -182,6 +186,7 @@ def config_to_public(config: GatewayConfig) -> dict[str, Any]:
             "nativeWebSearchPolicy": config.provider_runtime.native_web_search_policy,
             "responseLanguage": config.provider_runtime.response_language,
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
+            "qwenWebBackend": config.provider_runtime.qwen_web_backend,
         },
         "tool_bridge": {
             "mode": config.tool_bridge.mode,
@@ -222,6 +227,7 @@ def config_to_admin(config: GatewayConfig) -> dict[str, Any]:
             "nativeWebSearchPolicy": config.provider_runtime.native_web_search_policy,
             "responseLanguage": config.provider_runtime.response_language,
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
+            "qwenWebBackend": config.provider_runtime.qwen_web_backend,
         },
         "tool_bridge": {
             "mode": config.tool_bridge.mode,
@@ -325,6 +331,11 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
                 provider_runtime_raw.get("deepseekDs2apiBaseUrl")
                 if "deepseekDs2apiBaseUrl" in provider_runtime_raw
                 else provider_runtime_raw.get("deepseek_ds2api_base_url", config.provider_runtime.deepseek_ds2api_base_url)
+            ),
+            qwen_web_backend=str(
+                provider_runtime_raw.get("qwenWebBackend")
+                if "qwenWebBackend" in provider_runtime_raw
+                else provider_runtime_raw.get("qwen_web_backend", config.provider_runtime.qwen_web_backend)
             ),
         ),
         tool_bridge=ToolBridgeConfig(

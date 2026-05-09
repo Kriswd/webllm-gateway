@@ -12580,8 +12580,10 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "providerRuntimePromptMaxChars" in index_response.text
     assert "providerRuntimeResponseLanguage" in index_response.text
     assert "deepseekDs2apiBaseUrl" in index_response.text
+    assert "qwenWebBackendSelect" in index_response.text
     assert "responseLanguage" in script_response.text
     assert "deepseekDs2apiBaseUrl" in script_response.text
+    assert "qwenWebBackend" in script_response.text
     assert "providerRuntime" in script_response.text
 
 
@@ -12661,6 +12663,27 @@ def test_provider_runtime_deepseek_ds2api_base_url_round_trips_config(tmp_path: 
     assert saved["providerRuntime"]["deepseekDs2apiBaseUrl"] == "http://127.0.0.1:9555/v1"
     health = client.get("/health", headers=_headers()).json()
     assert health["config"]["providerRuntime"]["deepseekDs2apiBaseUrl"] == "http://127.0.0.1:9555/v1"
+
+
+def test_provider_runtime_qwen_web_backend_round_trips_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    client = TestClient(create_app(config=_config(), config_path=config_path, http_client=_not_found_client()))
+
+    response = client.put(
+        "/api/admin/config",
+        headers=_headers(),
+        json={"providerRuntime": {"qwenWebBackend": "deepseek-ds2api"}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["providerRuntime"]["qwenWebBackend"] == "deepseek-ds2api"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["providerRuntime"]["qwenWebBackend"] == "deepseek-ds2api"
+    loaded = load_config(config_path)
+    assert loaded.provider_runtime.qwen_web_backend == "deepseek-ds2api"
+    health = client.get("/health", headers=_headers()).json()
+    assert health["config"]["providerRuntime"]["qwenWebBackend"] == "deepseek-ds2api"
 
 
 def test_health_reports_runtime_source_freshness(tmp_path: Path) -> None:
@@ -13858,6 +13881,89 @@ def test_deepseek_openai_tool_calls_are_forwarded_to_ds2api(tmp_path: Path) -> N
     assert "tool_choice" in seen["payload"]
     assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
     assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_qwen_web_backend_can_route_anthropic_requests_to_deepseek_ds2api(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    class CapturingDeepSeekClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            seen["credential"] = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen["payload"] = payload
+            return {
+                "id": "qwen-via-ds2api-test",
+                "object": "chat.completion",
+                "model": payload["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_read",
+                                    "type": "function",
+                                    "function": {"name": "Read", "arguments": "{\"file_path\":\"README.md\"}"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+
+    class UnexpectedQwenClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("qwenWebBackend=deepseek-ds2api must bypass Qwen direct")
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+                provider_runtime=ProviderRuntimeConfig(qwen_web_backend="deepseek-ds2api"),
+            ),
+            credential_store=store,
+            deepseek_client_factory=CapturingDeepSeekClient,
+            qwen_client_factory=UnexpectedQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [{"role": "user", "content": "Read README.md first."}],
+            "tools": [{"name": "Read", "description": "Read files", "input_schema": {"type": "object"}}],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen["credential"]["bearer"] == "bearer-secret"
+    assert seen["payload"]["model"] == "deepseek-v4-pro"
+    assert seen["payload"]["tools"][0]["function"]["name"] == "Read"
+    assert response.json()["model"] == "qwen-web/qwen3.6-max-preview"
+    assert response.json()["content"] == [
+        {"type": "tool_use", "id": "toolu_call_read", "name": "Read", "input": {"file_path": "README.md"}}
+    ]
 
 
 def test_deepseek_anthropic_tool_use_round_trip_uses_native_tool_calls(tmp_path: Path) -> None:

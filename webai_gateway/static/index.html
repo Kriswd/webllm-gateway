@@ -250,6 +250,13 @@
                 <input id="deepseekDs2apiBaseUrl" name="deepseekDs2apiBaseUrl" type="text" placeholder="http://127.0.0.1:9331/v1" />
               </label>
               <label class="field">
+                <span>Qwen Web 后端</span>
+                <select id="qwenWebBackendSelect" name="qwenWebBackendSelect">
+                  <option value="direct">直连 Qwen Web</option>
+                  <option value="deepseek-ds2api">DeepSeek ds2api</option>
+                </select>
+              </label>
+              <label class="field">
                 <span>工具暴露策略</span>
                 <select id="toolExposurePolicySelect" name="toolExposurePolicySelect">
                   <option value="safe">安全默认（隐藏 Bash/Edit/Write 等底层工具）</option>

@@ -15,7 +15,8 @@
     "promptMaxChars": 32000,
     "nativeWebSearchPolicy": "auto",
     "responseLanguage": "zh-CN",
-    "deepseekDs2apiBaseUrl": "http://127.0.0.1:9331/v1"
+    "deepseekDs2apiBaseUrl": "http://127.0.0.1:9331/v1",
+    "qwenWebBackend": "direct"
   },
   "tool_bridge": {
     "mode": "strict",

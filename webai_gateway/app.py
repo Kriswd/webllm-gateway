@@ -1234,6 +1234,14 @@ def create_app(
         if is_deepseek_web_model(body.get("model")):
             return await run_in_threadpool(_deepseek_web_chat, app, client, body, cfg)
         if is_qwen_web_model(body.get("model")):
+            if _qwen_web_uses_deepseek_ds2api(cfg):
+                return await run_in_threadpool(
+                    _deepseek_web_chat,
+                    app,
+                    client,
+                    _qwen_web_body_for_deepseek_ds2api(body),
+                    cfg,
+                )
             return await run_in_threadpool(_qwen_web_chat, app, client, body, cfg)
         if is_qwen_coder_model(body.get("model")):
             return await run_in_threadpool(_qwen_coder_chat, app, client, body, cfg)
@@ -1461,14 +1469,24 @@ def create_app(
                 cfg,
             )
         elif is_qwen_web_model(openai_body.get("model")):
-            parsed, direct_bridge_headers = await run_in_threadpool(
-                _direct_provider_chat_payload_with_headers,
-                _qwen_web_chat,
-                app,
-                client,
-                openai_body,
-                cfg,
-            )
+            if _qwen_web_uses_deepseek_ds2api(cfg):
+                parsed, direct_bridge_headers = await run_in_threadpool(
+                    _direct_provider_chat_payload_with_headers,
+                    _deepseek_web_chat,
+                    app,
+                    client,
+                    _qwen_web_body_for_deepseek_ds2api(openai_body),
+                    cfg,
+                )
+            else:
+                parsed, direct_bridge_headers = await run_in_threadpool(
+                    _direct_provider_chat_payload_with_headers,
+                    _qwen_web_chat,
+                    app,
+                    client,
+                    openai_body,
+                    cfg,
+                )
         elif is_qwen_coder_model(openai_body.get("model")):
             parsed, direct_bridge_headers = await run_in_threadpool(
                 _direct_provider_chat_payload_with_headers,
@@ -4353,6 +4371,21 @@ def _should_retry_no_progress_escalation(bridge_result: Any) -> bool:
 def _should_retry_off_task_question_recovery(bridge_result: Any) -> bool:
     error = getattr(bridge_result, "error", None)
     return bool(error and getattr(error, "kind", "") in OFF_TASK_QUESTION_ERROR_KINDS)
+
+
+def _qwen_web_backend(config: GatewayConfig) -> str:
+    backend = (config.provider_runtime.qwen_web_backend or "direct").strip().lower()
+    return backend.replace("_", "-")
+
+
+def _qwen_web_uses_deepseek_ds2api(config: GatewayConfig) -> bool:
+    return _qwen_web_backend(config) in {"deepseek-ds2api", "ds2api", "deepseek"}
+
+
+def _qwen_web_body_for_deepseek_ds2api(body: dict[str, Any]) -> dict[str, Any]:
+    routed = dict(body)
+    routed["model"] = "deepseek-v4-pro"
+    return routed
 
 
 def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], config: GatewayConfig) -> Response:
