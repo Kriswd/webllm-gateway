@@ -6,6 +6,7 @@ import inspect
 import json
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -142,6 +143,37 @@ _SMOKE_SENSITIVE_FIELD_RE = re.compile(r"(?i)\b(?:qwen_session|ds_session_id|hws
 _GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
 
 
+class _DeepSeekDs2apiBearerGate:
+    def __init__(self, *, max_inflight: int, cooldown_seconds: float) -> None:
+        self.max_inflight = max(1, int(max_inflight))
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._condition = threading.Condition()
+        self._inflight = 0
+        self._cooldown_until = 0.0
+
+    def acquire(self) -> None:
+        with self._condition:
+            while True:
+                now = time.monotonic()
+                cooldown_wait = max(0.0, self._cooldown_until - now)
+                if self._inflight < self.max_inflight and cooldown_wait <= 0:
+                    self._inflight += 1
+                    return
+                self._condition.wait(timeout=cooldown_wait if cooldown_wait > 0 else 0.1)
+
+    def release(self) -> None:
+        with self._condition:
+            self._inflight = max(0, self._inflight - 1)
+            self._condition.notify_all()
+
+    def note_rate_limit(self) -> None:
+        if self.cooldown_seconds <= 0:
+            return
+        with self._condition:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + self.cooldown_seconds)
+            self._condition.notify_all()
+
+
 def create_app(
     *,
     config: GatewayConfig | None = None,
@@ -176,6 +208,9 @@ def create_app(
     app.state.auto_research_fixture_dir = Path(auto_research_fixture_dir) if auto_research_fixture_dir is not None else _default_auto_research_fixture_dir()
     app.state.runtime_started_at = utc_now()
     app.state.runtime_started_epoch = datetime.now(timezone.utc).timestamp()
+    app.state.deepseek_ds2api_bearer_gate = None
+    app.state.deepseek_ds2api_bearer_gate_config = None
+    app.state.deepseek_ds2api_bearer_gate_lock = threading.Lock()
 
     static_dir = Path(__file__).with_name("static")
     webai2api_ui_dir = Path(native_ui_dir) if native_ui_dir is not None else _default_native_ui_dir()
@@ -4447,15 +4482,54 @@ def _deepseek_ds2api_retry_delays(app: FastAPI) -> tuple[float, ...]:
         return ()
 
 
-def _call_deepseek_ds2api_with_retry(app: FastAPI, web_client: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def _deepseek_ds2api_bearer_gate(app: FastAPI, config: GatewayConfig) -> _DeepSeekDs2apiBearerGate:
+    gate_config = (
+        max(1, int(config.provider_runtime.deepseek_ds2api_bearer_max_inflight)),
+        max(0.0, float(config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds)),
+    )
+    lock = getattr(app.state, "deepseek_ds2api_bearer_gate_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        app.state.deepseek_ds2api_bearer_gate_lock = lock
+    with lock:
+        if (
+            getattr(app.state, "deepseek_ds2api_bearer_gate", None) is None
+            or getattr(app.state, "deepseek_ds2api_bearer_gate_config", None) != gate_config
+        ):
+            app.state.deepseek_ds2api_bearer_gate = _DeepSeekDs2apiBearerGate(
+                max_inflight=gate_config[0],
+                cooldown_seconds=gate_config[1],
+            )
+            app.state.deepseek_ds2api_bearer_gate_config = gate_config
+        return app.state.deepseek_ds2api_bearer_gate
+
+
+def _is_deepseek_ds2api_upstream_empty_output_rate_limit(exc: DeepSeekDs2apiError) -> bool:
+    text = str(exc).lower()
+    return exc.status_code == 429 and ("upstream_empty_output" in text or "empty output" in text)
+
+
+def _call_deepseek_ds2api_with_retry(
+    app: FastAPI,
+    web_client: Any,
+    payload: dict[str, Any],
+    config: GatewayConfig,
+) -> dict[str, Any]:
     delays = _deepseek_ds2api_retry_delays(app)
+    gate = _deepseek_ds2api_bearer_gate(app, config)
     for attempt in range(len(delays) + 1):
+        gate.acquire()
         try:
             return web_client.chat_completions(payload)
         except DeepSeekDs2apiError as exc:
+            if _is_deepseek_ds2api_upstream_empty_output_rate_limit(exc):
+                gate.note_rate_limit()
             if exc.status_code != 429 or attempt >= len(delays):
                 raise
             delay = delays[attempt]
+        finally:
+            gate.release()
+        if attempt < len(delays):
             if delay > 0:
                 time.sleep(delay)
     raise RuntimeError("unreachable ds2api retry state")
@@ -4482,7 +4556,7 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
     )
     try:
         web_client = _build_deepseek_web_client(app.state.deepseek_client_factory, credential, client, config)
-        data = _call_deepseek_ds2api_with_retry(app, web_client, payload)
+        data = _call_deepseek_ds2api_with_retry(app, web_client, payload, config)
     except DeepSeekDs2apiError as exc:
         status_code = exc.status_code if 400 <= exc.status_code <= 599 else 502
         _record_completion_error_diagnostic(
@@ -4526,7 +4600,7 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             allowed_tools=allowed_tools,
             bridge_context=bridge_context,
             model=model,
-            retry_chat=lambda retry_payload: _call_deepseek_ds2api_with_retry(app, web_client, retry_payload),
+            retry_chat=lambda retry_payload: _call_deepseek_ds2api_with_retry(app, web_client, retry_payload, config),
             native_web_search=bool(payload.get("_webai_native_web_search")),
         )
     except HTTPException:

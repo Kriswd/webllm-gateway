@@ -100,6 +100,8 @@ function applyConfig(config) {
   $("deepseekDs2apiBaseUrl").value = config.providerRuntime?.deepseekDs2apiBaseUrl || "http://127.0.0.1:9331/v1";
   $("deepseekDs2apiAccountMaxInflight").value = config.providerRuntime?.deepseekDs2apiAccountMaxInflight || 2;
   $("deepseekDs2apiGlobalMaxInflight").value = config.providerRuntime?.deepseekDs2apiGlobalMaxInflight || 4;
+  $("deepseekDs2apiBearerMaxInflight").value = config.providerRuntime?.deepseekDs2apiBearerMaxInflight || 1;
+  $("deepseekDs2apiRateLimitCooldownSeconds").value = config.providerRuntime?.deepseekDs2apiRateLimitCooldownSeconds ?? 6;
   $("qwenWebBackendSelect").value = config.providerRuntime?.qwenWebBackend || "direct";
   $("gptThinkingBackendSelect").value = config.providerRuntime?.gptThinkingBackend || "webai2api";
   $("toolActivationPolicySelect").value = config.tool_bridge?.activationPolicy || "auto";
@@ -513,6 +515,8 @@ async function saveConfig(event) {
       deepseekDs2apiBaseUrl: $("deepseekDs2apiBaseUrl").value || "http://127.0.0.1:9331/v1",
       deepseekDs2apiAccountMaxInflight: Number($("deepseekDs2apiAccountMaxInflight").value) || 2,
       deepseekDs2apiGlobalMaxInflight: Number($("deepseekDs2apiGlobalMaxInflight").value) || 4,
+      deepseekDs2apiBearerMaxInflight: Number($("deepseekDs2apiBearerMaxInflight").value) || 1,
+      deepseekDs2apiRateLimitCooldownSeconds: Number($("deepseekDs2apiRateLimitCooldownSeconds").value) || 0,
       qwenWebBackend: $("qwenWebBackendSelect").value || "direct",
       gptThinkingBackend: $("gptThinkingBackendSelect").value || "webai2api",
     },

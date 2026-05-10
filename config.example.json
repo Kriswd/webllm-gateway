@@ -18,6 +18,8 @@
     "deepseekDs2apiBaseUrl": "http://127.0.0.1:9331/v1",
     "deepseekDs2apiAccountMaxInflight": 2,
     "deepseekDs2apiGlobalMaxInflight": 4,
+    "deepseekDs2apiBearerMaxInflight": 1,
+    "deepseekDs2apiRateLimitCooldownSeconds": 6,
     "qwenWebBackend": "direct",
     "gptThinkingBackend": "webai2api"
   },

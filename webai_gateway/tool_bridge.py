@@ -3462,10 +3462,7 @@ def _extract_dsml_tool_call_candidates(text: str, context: ToolBridgeContext | N
                 if not name:
                     continue
                 input_value = _xml_invoke_input(body)
-                if input_value:
-                    if not _tool_call_input_has_meaningful_value(input_value):
-                        continue
-                elif _xml_invoke_body_is_invalid_without_params(body):
+                if not input_value and _xml_invoke_body_is_invalid_without_params(body):
                     continue
                 block_candidates.append(
                     {
@@ -4002,18 +3999,6 @@ def _xml_invoke_body_is_invalid_without_params(body: str) -> bool:
             return True
         nested = parsed.get("input")
         return nested is not None and not isinstance(nested, dict)
-    return True
-
-
-def _tool_call_input_has_meaningful_value(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, dict):
-        return any(_tool_call_input_has_meaningful_value(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_tool_call_input_has_meaningful_value(child) for child in value)
     return True
 
 
@@ -7983,12 +7968,12 @@ def _shell_tool_command_error(call: ToolCallDraft, canonical_name: str, context:
     shell_tool = _tool_by_name(context.tools, canonical_name) or _tool_by_name(list(context.hidden_tools), canonical_name)
     if not _is_shell_execution_tool(shell_tool, canonical_name):
         return None
+    if _allows_ds2api_style_shell_passthrough(context):
+        return None
     command_key = _shell_command_key(shell_tool) if shell_tool else "command"
     command = call.input.get(command_key)
     if not isinstance(command, str) or not command.strip():
         return BridgeError("incomplete_shell_command", "Shell command is empty; provide a complete command string.", repairable=True)
-    if _allows_ds2api_style_shell_passthrough(context):
-        return None
     return (
         _invalid_shell_dialect_error(command, canonical_name)
         or _invalid_shell_command_artifact_error(command)

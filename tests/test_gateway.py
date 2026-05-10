@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
+import threading
+import time
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -12649,12 +12652,16 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "deepseekDs2apiBaseUrl" in index_response.text
     assert "deepseekDs2apiAccountMaxInflight" in index_response.text
     assert "deepseekDs2apiGlobalMaxInflight" in index_response.text
+    assert "deepseekDs2apiBearerMaxInflight" in index_response.text
+    assert "deepseekDs2apiRateLimitCooldownSeconds" in index_response.text
     assert "qwenWebBackendSelect" in index_response.text
     assert "gptThinkingBackendSelect" in index_response.text
     assert "responseLanguage" in script_response.text
     assert "deepseekDs2apiBaseUrl" in script_response.text
     assert "deepseekDs2apiAccountMaxInflight" in script_response.text
     assert "deepseekDs2apiGlobalMaxInflight" in script_response.text
+    assert "deepseekDs2apiBearerMaxInflight" in script_response.text
+    assert "deepseekDs2apiRateLimitCooldownSeconds" in script_response.text
     assert "qwenWebBackend" in script_response.text
     assert "gptThinkingBackend" in script_response.text
     assert "providerRuntime" in script_response.text
@@ -12749,6 +12756,8 @@ def test_provider_runtime_deepseek_ds2api_concurrency_round_trips_config(tmp_pat
             "providerRuntime": {
                 "deepseekDs2apiAccountMaxInflight": 3,
                 "deepseekDs2apiGlobalMaxInflight": 6,
+                "deepseekDs2apiBearerMaxInflight": 1,
+                "deepseekDs2apiRateLimitCooldownSeconds": 7,
             }
         },
     )
@@ -12757,15 +12766,23 @@ def test_provider_runtime_deepseek_ds2api_concurrency_round_trips_config(tmp_pat
     body = response.json()["providerRuntime"]
     assert body["deepseekDs2apiAccountMaxInflight"] == 3
     assert body["deepseekDs2apiGlobalMaxInflight"] == 6
+    assert body["deepseekDs2apiBearerMaxInflight"] == 1
+    assert body["deepseekDs2apiRateLimitCooldownSeconds"] == 7.0
     saved = json.loads(config_path.read_text(encoding="utf-8"))["providerRuntime"]
     assert saved["deepseekDs2apiAccountMaxInflight"] == 3
     assert saved["deepseekDs2apiGlobalMaxInflight"] == 6
+    assert saved["deepseekDs2apiBearerMaxInflight"] == 1
+    assert saved["deepseekDs2apiRateLimitCooldownSeconds"] == 7.0
     loaded = load_config(config_path)
     assert loaded.provider_runtime.deepseek_ds2api_account_max_inflight == 3
     assert loaded.provider_runtime.deepseek_ds2api_global_max_inflight == 6
+    assert loaded.provider_runtime.deepseek_ds2api_bearer_max_inflight == 1
+    assert loaded.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds == 7.0
     health = client.get("/health", headers=_headers()).json()["config"]["providerRuntime"]
     assert health["deepseekDs2apiAccountMaxInflight"] == 3
     assert health["deepseekDs2apiGlobalMaxInflight"] == 6
+    assert health["deepseekDs2apiBearerMaxInflight"] == 1
+    assert health["deepseekDs2apiRateLimitCooldownSeconds"] == 7.0
 
 
 def test_deepseek_ds2api_sidecar_config_uses_provider_runtime_concurrency() -> None:
@@ -13994,6 +14011,124 @@ def test_deepseek_gateway_retries_transient_ds2api_rate_limit(tmp_path: Path) ->
     assert attempts == 2
     diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
     assert not [item for item in diagnostics if item["kind"] == "completion_error" and item.get("statusCode") == 429]
+
+
+def test_deepseek_gateway_limits_bearer_ds2api_inflight(tmp_path: Path) -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class SlowDeepSeekClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return _openai_response("ok")
+            finally:
+                with lock:
+                    active -= 1
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                provider_runtime=ProviderRuntimeConfig(
+                    deepseek_ds2api_bearer_max_inflight=1,
+                    deepseek_ds2api_rate_limit_cooldown_seconds=0,
+                ),
+            ),
+            credential_store=store,
+            deepseek_client_factory=SlowDeepSeekClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    def post_once() -> int:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        return response.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = list(executor.map(lambda _: post_once(), range(2)))
+
+    assert statuses == [200, 200]
+    assert max_active == 1
+
+
+def test_deepseek_gateway_cools_down_after_upstream_empty_output_rate_limit(tmp_path: Path) -> None:
+    starts: list[float] = []
+
+    class EmptyOutputThenOkClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            starts.append(time.monotonic())
+            if len(starts) == 1:
+                raise DeepSeekDs2apiError(
+                    429,
+                    'ds2api DeepSeek 调用失败：HTTP 429 {"error":{"code":"upstream_empty_output"}}',
+                )
+            return _openai_response("ok")
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    app = create_app(
+        config=GatewayConfig(
+            server=ServerConfig(api_key="local-dev-key"),
+            provider_runtime=ProviderRuntimeConfig(
+                deepseek_ds2api_bearer_max_inflight=1,
+                deepseek_ds2api_rate_limit_cooldown_seconds=0.05,
+            ),
+        ),
+        credential_store=store,
+        deepseek_client_factory=EmptyOutputThenOkClient,
+        http_client=_not_found_client(),
+    )
+    app.state.deepseek_ds2api_retry_delays = ()
+    client = TestClient(app)
+
+    first = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    second_started = time.monotonic()
+    second = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi again"}]},
+    )
+
+    assert first.status_code == 429
+    assert second.status_code == 200
+    assert len(starts) == 2
+    assert starts[1] - second_started >= 0.04
 
 
 def test_deepseek_openai_tool_calls_are_forwarded_to_ds2api(tmp_path: Path) -> None:

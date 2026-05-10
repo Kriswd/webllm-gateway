@@ -32,6 +32,8 @@ DEFAULT_OBSERVATION_EXCLUDED_PATH_PARTS: tuple[str, ...] = (
 
 DEFAULT_DEEPSEEK_DS2API_ACCOUNT_MAX_INFLIGHT = 2
 DEFAULT_DEEPSEEK_DS2API_GLOBAL_MAX_INFLIGHT = 4
+DEFAULT_DEEPSEEK_DS2API_BEARER_MAX_INFLIGHT = 1
+DEFAULT_DEEPSEEK_DS2API_RATE_LIMIT_COOLDOWN_SECONDS = 6.0
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,8 @@ class ProviderRuntimeConfig:
     deepseek_ds2api_base_url: str = "http://127.0.0.1:9331/v1"
     deepseek_ds2api_account_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_ACCOUNT_MAX_INFLIGHT
     deepseek_ds2api_global_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_GLOBAL_MAX_INFLIGHT
+    deepseek_ds2api_bearer_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_BEARER_MAX_INFLIGHT
+    deepseek_ds2api_rate_limit_cooldown_seconds: float = DEFAULT_DEEPSEEK_DS2API_RATE_LIMIT_COOLDOWN_SECONDS
     qwen_web_backend: str = "direct"
     gpt_thinking_backend: str = "webai2api"
 
@@ -137,6 +141,28 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
             minimum=1,
         ),
     )
+    deepseek_ds2api_bearer_max_inflight = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiBearerMaxInflight",
+            "deepseek_ds2api_bearer_max_inflight",
+            default=default_provider_runtime.deepseek_ds2api_bearer_max_inflight,
+        ),
+        default=default_provider_runtime.deepseek_ds2api_bearer_max_inflight,
+        minimum=1,
+        maximum=256,
+    )
+    deepseek_ds2api_rate_limit_cooldown_seconds = _bounded_float(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiRateLimitCooldownSeconds",
+            "deepseek_ds2api_rate_limit_cooldown_seconds",
+            default=default_provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
+        ),
+        default=default_provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
+        minimum=0.0,
+        maximum=300.0,
+    )
     allowed_tool_names = tool_bridge_raw.get("allowedToolNames", tool_bridge_raw.get("allowed_tool_names", ()))
     if not isinstance(allowed_tool_names, list):
         allowed_tool_names = []
@@ -177,6 +203,8 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
             ),
             deepseek_ds2api_account_max_inflight=deepseek_ds2api_account_max_inflight,
             deepseek_ds2api_global_max_inflight=deepseek_ds2api_global_max_inflight,
+            deepseek_ds2api_bearer_max_inflight=deepseek_ds2api_bearer_max_inflight,
+            deepseek_ds2api_rate_limit_cooldown_seconds=deepseek_ds2api_rate_limit_cooldown_seconds,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend") or provider_runtime_raw.get("qwen_web_backend") or "direct"
             ),
@@ -226,6 +254,8 @@ def config_to_public(config: GatewayConfig) -> dict[str, Any]:
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
             "deepseekDs2apiAccountMaxInflight": config.provider_runtime.deepseek_ds2api_account_max_inflight,
             "deepseekDs2apiGlobalMaxInflight": config.provider_runtime.deepseek_ds2api_global_max_inflight,
+            "deepseekDs2apiBearerMaxInflight": config.provider_runtime.deepseek_ds2api_bearer_max_inflight,
+            "deepseekDs2apiRateLimitCooldownSeconds": config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
@@ -270,6 +300,8 @@ def config_to_admin(config: GatewayConfig) -> dict[str, Any]:
             "deepseekDs2apiBaseUrl": config.provider_runtime.deepseek_ds2api_base_url,
             "deepseekDs2apiAccountMaxInflight": config.provider_runtime.deepseek_ds2api_account_max_inflight,
             "deepseekDs2apiGlobalMaxInflight": config.provider_runtime.deepseek_ds2api_global_max_inflight,
+            "deepseekDs2apiBearerMaxInflight": config.provider_runtime.deepseek_ds2api_bearer_max_inflight,
+            "deepseekDs2apiRateLimitCooldownSeconds": config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
@@ -333,6 +365,28 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
             default=config.provider_runtime.deepseek_ds2api_global_max_inflight,
             minimum=1,
         ),
+    )
+    deepseek_ds2api_bearer_max_inflight = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiBearerMaxInflight",
+            "deepseek_ds2api_bearer_max_inflight",
+            default=config.provider_runtime.deepseek_ds2api_bearer_max_inflight,
+        ),
+        default=config.provider_runtime.deepseek_ds2api_bearer_max_inflight,
+        minimum=1,
+        maximum=256,
+    )
+    deepseek_ds2api_rate_limit_cooldown_seconds = _bounded_float(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiRateLimitCooldownSeconds",
+            "deepseek_ds2api_rate_limit_cooldown_seconds",
+            default=config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
+        ),
+        default=config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
+        minimum=0.0,
+        maximum=300.0,
     )
     allowed_tool_names = (
         tool_bridge_raw.get("allowedToolNames")
@@ -402,6 +456,8 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
             ),
             deepseek_ds2api_account_max_inflight=deepseek_ds2api_account_max_inflight,
             deepseek_ds2api_global_max_inflight=deepseek_ds2api_global_max_inflight,
+            deepseek_ds2api_bearer_max_inflight=deepseek_ds2api_bearer_max_inflight,
+            deepseek_ds2api_rate_limit_cooldown_seconds=deepseek_ds2api_rate_limit_cooldown_seconds,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend")
                 if "qwenWebBackend" in provider_runtime_raw
@@ -544,6 +600,17 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int | None 
         result = int(value)
     except (TypeError, ValueError):
         result = int(default)
+    result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float | None = None) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(default)
     result = max(minimum, result)
     if maximum is not None:
         result = min(maximum, result)
