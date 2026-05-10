@@ -3625,6 +3625,14 @@ def test_local_agent_auto_keeps_web_search_for_realtime_task_and_hides_unsafe_br
                         "parameters": {"type": "object", "properties": {"code": {"type": "string"}}},
                     },
                 },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "generate_image",
+                        "description": "Generate an image locally",
+                        "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}},
+                    },
+                },
             ],
         },
     )
@@ -3636,6 +3644,7 @@ def test_local_agent_auto_keeps_web_search_for_realtime_task_and_hides_unsafe_br
     assert '"name": "fetch_url"' in prompt
     assert '"name": "web_search"' in prompt
     assert "mcp_playwright_browser_run_code_unsafe" not in prompt
+    assert "generate_image" not in prompt
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     tool_call = choice["message"]["tool_calls"][0]
@@ -11586,6 +11595,112 @@ def test_v1_routes_remain_gateway_owned_when_admin_proxy_exists(tmp_path: Path) 
     assert "sidecar-model" in model_ids
     assert "qwen-web/qwen3.6-plus" in model_ids
     assert "gpt-instant" not in model_ids
+
+
+def test_images_generations_wraps_webai2api_chat_media_response(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json=_openai_response("data:image/png;base64,aGVsbG8="),
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/images/generations",
+        headers=_headers(),
+        json={"model": "gpt-image-1.5", "prompt": "画一只蓝色杯子", "response_format": "b64_json"},
+    )
+
+    assert response.status_code == 200
+    assert seen["path"] == "/v1/chat/completions"
+    assert seen["body"]["model"] == "gpt-image-1.5"
+    assert seen["body"]["messages"] == [{"role": "user", "content": "画一只蓝色杯子"}]
+    body = response.json()
+    assert body["object"] == "list"
+    assert body["data"] == [{"b64_json": "aGVsbG8="}]
+
+
+def test_videos_create_stores_retrievable_content_from_webai2api(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_openai_response("data:video/mp4;base64,AAECAw=="),
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    created = client.post(
+        "/v1/videos",
+        headers=_headers(),
+        json={"model": "sora-2", "prompt": "海边日落延时摄影"},
+    )
+
+    assert created.status_code == 200
+    video = created.json()
+    assert video["object"] == "video"
+    assert video["status"] == "completed"
+    assert video["model"] == "sora-2"
+    assert video["id"].startswith("video_")
+
+    fetched = client.get(f"/v1/videos/{video['id']}", headers=_headers())
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "completed"
+
+    content = client.get(f"/v1/videos/{video['id']}/content", headers=_headers())
+    assert content.status_code == 200
+    assert content.headers["content-type"].startswith("video/mp4")
+    assert content.content == b"\x00\x01\x02\x03"
+
+
+def test_media_models_are_advertised_with_image_and_video_capabilities(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "gpt-image-1.5", "object": "model", "owned_by": "chatgpt", "type": "image"},
+                    {"id": "sora-2", "object": "model", "owned_by": "sora", "type": "image"},
+                ],
+            },
+            request=request,
+        )
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.get("/v1/models", headers=_headers())
+
+    assert response.status_code == 200
+    models = {item["id"]: item for item in response.json()["data"]}
+    assert models["gpt-image-1.5"]["capabilities"]["image"] is True
+    assert models["gpt-image-1.5"]["capabilities"]["video"] is False
+    assert models["sora-2"]["type"] == "video"
+    assert models["sora-2"]["capabilities"]["video"] is True
 
 
 def test_onboarding_returns_gateway_providers_and_models(tmp_path: Path) -> None:

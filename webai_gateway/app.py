@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 import inspect
@@ -102,6 +103,10 @@ WEBAI2API_AUTH_COOKIE_HINTS: dict[str, tuple[str, ...]] = {
     ),
 }
 TOOL_BRIDGE_EVENT_LIMIT = 200
+MEDIA_GENERATION_CACHE_LIMIT = 100
+MEDIA_GENERATION_TTL_SECONDS = 60 * 60
+DEFAULT_IMAGE_GENERATION_MODEL = "gpt-image-1.5"
+DEFAULT_VIDEO_GENERATION_MODEL = "sora-2"
 WEBAI2API_BROWSER_READY_RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0, 20.0)
 WEBAI2API_BROWSER_NOT_READY_MARKERS = (
     "页面加载超时",
@@ -205,6 +210,7 @@ def create_app(
     app.state.tool_bridge_events = deque(maxlen=TOOL_BRIDGE_EVENT_LIMIT)
     app.state.request_diagnostics = deque(maxlen=REQUEST_DIAGNOSTIC_LIMIT)
     app.state.tool_call_registry = OrderedDict()
+    app.state.media_generations = OrderedDict()
     app.state.auto_research_fixture_dir = Path(auto_research_fixture_dir) if auto_research_fixture_dir is not None else _default_auto_research_fixture_dir()
     app.state.runtime_started_at = utc_now()
     app.state.runtime_started_epoch = datetime.now(timezone.utc).timestamp()
@@ -1257,6 +1263,58 @@ def create_app(
         except Exception:
             pass
         return JSONResponse(_append_web_models({"object": "list", "data": [{"id": cfg.upstream.model, "object": "model"}]}))
+
+    @app.post("/v1/images/generations")
+    async def image_generations(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    ) -> JSONResponse:
+        require_auth(authorization, x_api_key)
+        cfg = current_config()
+        body = await _json_body(request)
+        result = await run_in_threadpool(_create_image_generation_response, app, client, cfg, body)
+        return JSONResponse(result)
+
+    @app.post("/v1/videos")
+    async def video_generations(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    ) -> JSONResponse:
+        require_auth(authorization, x_api_key)
+        cfg = current_config()
+        body = await _json_body(request)
+        result = await run_in_threadpool(_create_video_generation_response, app, client, cfg, body)
+        return JSONResponse(result)
+
+    @app.get("/v1/videos/{video_id}")
+    def get_video_generation(
+        video_id: str,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    ) -> JSONResponse:
+        require_auth(authorization, x_api_key)
+        item = _get_cached_media_generation(app, video_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Video generation not found")
+        return JSONResponse(_video_generation_public_payload(item))
+
+    @app.get("/v1/videos/{video_id}/content")
+    def get_video_generation_content(
+        video_id: str,
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    ) -> Response:
+        require_auth(authorization, x_api_key)
+        item = _get_cached_media_generation(app, video_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Video generation not found")
+        data = _decode_data_uri(str(item.get("data_uri") or ""), expected_kind="video")
+        if data is None:
+            raise HTTPException(status_code=502, detail="Cached video content is invalid")
+        mime_type, content = data
+        return Response(content, media_type=mime_type)
 
     @app.post("/v1/chat/completions")
     async def chat(
@@ -3407,6 +3465,195 @@ async def _json_body(request: Request) -> dict[str, Any]:
     return body
 
 
+def _create_image_generation_response(
+    app: FastAPI,
+    client: httpx.Client,
+    cfg: GatewayConfig,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    n = int(body.get("n") or 1)
+    if n != 1:
+        raise HTTPException(status_code=400, detail="Only n=1 is supported for web image generation")
+    response_format = str(body.get("response_format") or "url").strip().lower()
+    if response_format not in {"url", "b64_json"}:
+        raise HTTPException(status_code=400, detail="response_format must be url or b64_json")
+    model = normalize_model_id(body.get("model"), DEFAULT_IMAGE_GENERATION_MODEL)
+    data_uri = _run_webai2api_media_generation(client, cfg, model=model, prompt=prompt, kind="image")
+    decoded = _decode_data_uri(data_uri, expected_kind="image")
+    if decoded is None:
+        raise HTTPException(status_code=502, detail="Upstream image response did not contain valid image data")
+    _mime_type, content = decoded
+    item = {"url": data_uri} if response_format == "url" else {"b64_json": base64.b64encode(content).decode("ascii")}
+    return {"created": int(time.time()), "object": "list", "data": [item]}
+
+
+def _create_video_generation_response(
+    app: FastAPI,
+    client: httpx.Client,
+    cfg: GatewayConfig,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    model = normalize_model_id(body.get("model"), DEFAULT_VIDEO_GENERATION_MODEL)
+    input_images = _media_input_images_from_body(body)
+    data_uri = _run_webai2api_media_generation(
+        client,
+        cfg,
+        model=model,
+        prompt=prompt,
+        kind="video",
+        input_images=input_images,
+    )
+    if _decode_data_uri(data_uri, expected_kind="video") is None:
+        raise HTTPException(status_code=502, detail="Upstream video response did not contain valid video data")
+    item = _store_media_generation(app, model=model, data_uri=data_uri, kind="video")
+    return _video_generation_public_payload(item)
+
+
+def _run_webai2api_media_generation(
+    client: httpx.Client,
+    cfg: GatewayConfig,
+    *,
+    model: str,
+    prompt: str,
+    kind: str,
+    input_images: list[str] | None = None,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": [_media_user_message(prompt, input_images or [])],
+        "stream": True,
+    }
+    response = _post_upstream_with_login_mode_recovery(client, cfg, payload, True)
+    if response.status_code >= 400:
+        message = _upstream_http_error_message(response)
+        raise HTTPException(
+            status_code=_gateway_status_code_for_upstream_http_error(response),
+            detail=_preview_text(_redact_sensitive_text(message), max_chars=800),
+        )
+    text = response.text.strip()
+    if text.startswith("data:") or "text/event-stream" in response.headers.get("content-type", ""):
+        content, _finish_reason = parse_sse_text(response.text)
+    else:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Upstream media response must be JSON or SSE") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail="Upstream media response must be a JSON object")
+        content = _openai_response_content(data)
+    data_uri = _extract_media_data_uri(content, expected_kind=kind)
+    if not data_uri:
+        raise HTTPException(status_code=502, detail=f"Upstream {kind} response did not contain media data")
+    return data_uri
+
+
+def _media_user_message(prompt: str, input_images: list[str]) -> dict[str, Any]:
+    if not input_images:
+        return {"role": "user", "content": prompt}
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image in input_images:
+        content.append({"type": "image_url", "image_url": {"url": image}})
+    return {"role": "user", "content": content}
+
+
+def _media_input_images_from_body(body: dict[str, Any]) -> list[str]:
+    value = (
+        body.get("input_reference")
+        if "input_reference" in body
+        else body.get("input_image", body.get("image", body.get("reference_image")))
+    )
+    values = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for item in values:
+        if isinstance(item, dict):
+            item = item.get("url") or item.get("image_url") or item.get("data")
+        if isinstance(item, str) and item.startswith("data:image/"):
+            out.append(item)
+    return out
+
+
+def _extract_media_data_uri(content: str, *, expected_kind: str) -> str:
+    pattern = rf"data:{re.escape(expected_kind)}/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+"
+    match = re.search(pattern, str(content or ""))
+    return re.sub(r"\s+", "", match.group(0)) if match else ""
+
+
+def _decode_data_uri(data_uri: str, *, expected_kind: str) -> tuple[str, bytes] | None:
+    match = re.match(r"^data:([^;]+);base64,(.+)$", str(data_uri or ""), re.DOTALL)
+    if not match:
+        return None
+    mime_type = match.group(1).strip().lower()
+    if not mime_type.startswith(f"{expected_kind}/"):
+        return None
+    try:
+        return mime_type, base64.b64decode(re.sub(r"\s+", "", match.group(2)), validate=True)
+    except ValueError:
+        return None
+
+
+def _store_media_generation(app: FastAPI, *, model: str, data_uri: str, kind: str) -> dict[str, Any]:
+    store = _media_generation_store(app)
+    _prune_media_generations(store)
+    media_id = f"{kind}_{secrets.token_hex(12)}"
+    created_at = int(time.time())
+    item = {
+        "id": media_id,
+        "object": kind,
+        "created_at": created_at,
+        "expires_at": created_at + MEDIA_GENERATION_TTL_SECONDS,
+        "status": "completed",
+        "model": model,
+        "data_uri": data_uri,
+    }
+    store[media_id] = item
+    store.move_to_end(media_id)
+    while len(store) > MEDIA_GENERATION_CACHE_LIMIT:
+        store.popitem(last=False)
+    return item
+
+
+def _get_cached_media_generation(app: FastAPI, media_id: str) -> dict[str, Any] | None:
+    store = _media_generation_store(app)
+    _prune_media_generations(store)
+    item = store.get(media_id)
+    if not isinstance(item, dict):
+        return None
+    store.move_to_end(media_id)
+    return item
+
+
+def _media_generation_store(app: FastAPI) -> OrderedDict[str, dict[str, Any]]:
+    store = getattr(app.state, "media_generations", None)
+    if not isinstance(store, OrderedDict):
+        store = OrderedDict()
+        app.state.media_generations = store
+    return store
+
+
+def _prune_media_generations(store: OrderedDict[str, dict[str, Any]]) -> None:
+    now = int(time.time())
+    expired = [key for key, item in store.items() if int(item.get("expires_at") or 0) <= now]
+    for key in expired:
+        store.pop(key, None)
+
+
+def _video_generation_public_payload(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "object": "video",
+        "created_at": item.get("created_at"),
+        "expires_at": item.get("expires_at"),
+        "status": item.get("status") or "completed",
+        "model": item.get("model"),
+    }
+
+
 def _append_web_models(data: dict[str, Any], *, include_webai2api_catalog: bool = False) -> dict[str, Any]:
     items = data.get("data") if isinstance(data.get("data"), list) else []
     normalized_items: list[Any] = []
@@ -3419,14 +3666,76 @@ def _append_web_models(data: dict[str, Any], *, include_webai2api_catalog: bool 
         if not model_id or model_id in seen:
             continue
         seen.add(model_id)
-        normalized_items.append({**item, "id": model_id})
+        normalized_items.append(_enrich_model_payload({**item, "id": model_id}))
     items = normalized_items
     for item in catalog_model_payloads(include_webai2api=include_webai2api_catalog):
         model_id = item["id"]
         if model_id not in seen:
             seen.add(model_id)
-            items.append(item)
+            items.append(_enrich_model_payload(dict(item)))
     return {**data, "object": data.get("object") or "list", "data": items}
+
+
+def _enrich_model_payload(item: dict[str, Any]) -> dict[str, Any]:
+    model_id = str(item.get("id") or "")
+    owner = str(item.get("owned_by") or "")
+    model_type = _infer_model_type(model_id, owner, item.get("type"))
+    capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+    out = dict(item)
+    if model_type:
+        out["type"] = model_type
+    enriched_capabilities = dict(capabilities)
+    if model_type in {"image", "video", "text"}:
+        enriched_capabilities.setdefault("text", model_type == "text")
+        enriched_capabilities.setdefault("image", model_type == "image")
+        enriched_capabilities.setdefault("video", model_type == "video")
+    elif owner:
+        provider_caps = _provider_capabilities_for_owner(owner)
+        for key in ("text", "image", "video"):
+            if key in provider_caps:
+                enriched_capabilities.setdefault(key, bool(provider_caps.get(key)))
+    if model_type in {"image", "video"}:
+        enriched_capabilities.setdefault("tool_bridge", False)
+        enriched_capabilities.setdefault("supports_native_tools", False)
+        enriched_capabilities.setdefault("preferred_protocol", "openai")
+    if enriched_capabilities:
+        out["capabilities"] = enriched_capabilities
+    return out
+
+
+def _infer_model_type(model_id: str, owner: str, raw_type: Any) -> str:
+    model = str(model_id or "").strip().lower()
+    owned_by = str(owner or "").strip().lower()
+    explicit = str(raw_type or "").strip().lower()
+    if owned_by == "sora" or model.startswith("sora") or "veo" in model or "video" in model:
+        return "video"
+    if explicit == "video":
+        return "video"
+    if explicit == "text":
+        return "text"
+    if explicit == "image":
+        return "image"
+    if any(marker in model for marker in ("gpt-image", "image", "imagen", "dall-e", "seedream", "flux", "recraft")):
+        return "image"
+    provider_caps = _provider_capabilities_for_owner(owned_by)
+    if provider_caps.get("video") and not provider_caps.get("text") and not provider_caps.get("image"):
+        return "video"
+    if provider_caps.get("image") and not provider_caps.get("text"):
+        return "image"
+    return explicit
+
+
+def _provider_capabilities_for_owner(owner: str) -> dict[str, Any]:
+    owner = str(owner or "").strip()
+    if not owner:
+        return {}
+    provider = PROVIDERS.get(owner)
+    if provider is not None:
+        return dict(provider.capabilities)
+    for provider in PROVIDERS.values():
+        if owner in provider.adapters:
+            return dict(provider.capabilities)
+    return {}
 
 
 def _load_gateway_models(client: httpx.Client, cfg: GatewayConfig) -> dict[str, Any]:
