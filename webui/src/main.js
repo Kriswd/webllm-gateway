@@ -7,7 +7,6 @@ import 'ant-design-vue/dist/reset.css';
 
 const routes = [
     { path: '/', component: () => import('@/components/gateway/KrisBridge.vue') },
-    { path: '/dashboard', component: () => import('@/components/dash.vue') },
     { path: '/settings/server', component: () => import('@/components/settings/server.vue') },
     { path: '/settings/workers', component: () => import('@/components/settings/workers.vue') },
     { path: '/settings/browser', component: () => import('@/components/settings/browser.vue') },
@@ -17,6 +16,7 @@ const routes = [
     { path: '/tools/logs', component: () => import('@/components/tools/logs.vue') },
     { path: '/tools/request', component: () => import('@/components/tools/request.vue') },
     { path: '/gateway/kris-bridge', component: () => import('@/components/gateway/KrisBridge.vue') },
+    { path: '/:pathMatch(.*)*', redirect: '/' },
 ];
 
 const router = createRouter({

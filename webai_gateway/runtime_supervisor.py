@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from typing import Any, Sequence
+from urllib.parse import urlsplit, urlunsplit
+
+from webai_gateway.config import GatewayConfig, load_config
+from webai_gateway.ds2api_sidecar_config import build_ds2api_sidecar_config
+
+
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def collect_supervisor_status(
+    config: GatewayConfig,
+    gateway_root: Path,
+    *,
+    probe_ports: bool = True,
+) -> dict[str, Any]:
+    state = _load_state(gateway_root)
+    gateway_url = _public_base_url(config)
+    services = [
+        {
+            "id": "gateway",
+            "label": "WebAI Gateway",
+            "role": "public-api",
+            "internal": False,
+            "baseUrl": gateway_url,
+            "port": int(config.server.port),
+            "status": "running",
+            "pid": os.getpid(),
+        },
+        _service_status(
+            "webai2api",
+            "WebAI2API browser runtime",
+            "web-login-runtime",
+            config.upstream.base_url,
+            default_port=8500,
+            state=state,
+            probe_ports=probe_ports,
+        ),
+        _service_status(
+            "ds2api",
+            "DeepSeek ds2api runtime",
+            "deepseek-web-runtime",
+            config.provider_runtime.deepseek_ds2api_base_url,
+            default_port=9331,
+            state=state,
+            probe_ports=probe_ports,
+        ),
+    ]
+    failed = [item for item in services if item.get("internal") and item.get("status") in {"failed", "missing", "stopped"}]
+    return {
+        "mode": "single-entry",
+        "singleEntry": True,
+        "publicBaseUrl": gateway_url,
+        "publicPort": int(config.server.port),
+        "internalRuntimeCount": sum(1 for item in services if item.get("internal")),
+        "services": services,
+        "failedServices": failed,
+        "lastSupervisorRun": state.get("updatedAt") or "",
+    }
+
+
+def ensure_managed_runtimes(config: GatewayConfig, config_path: Path, gateway_root: Path) -> dict[str, Any]:
+    services = {
+        "webai2api": _ensure_webai2api(config, gateway_root),
+        "ds2api": _ensure_ds2api(config, config_path, gateway_root),
+    }
+    state = {"updatedAt": _utc_timestamp(), "services": services}
+    _save_state(gateway_root, state)
+    return state
+
+
+def _service_status(
+    service_id: str,
+    label: str,
+    role: str,
+    base_url: str,
+    *,
+    default_port: int,
+    state: dict[str, Any],
+    probe_ports: bool,
+) -> dict[str, Any]:
+    parsed = _parse_service_url(base_url, default_port)
+    saved = state.get("services", {}).get(service_id, {}) if isinstance(state.get("services"), dict) else {}
+    status = str(saved.get("status") or "unknown")
+    if probe_ports:
+        if parsed["local"] and parsed["port"] and _port_is_listening(parsed["host"], parsed["port"]):
+            status = "running"
+        elif status in {"started", "running", "already-running"}:
+            status = "stopped"
+        elif status not in {"missing", "failed"}:
+            status = "unknown" if not parsed["local"] else "stopped"
+    return {
+        "id": service_id,
+        "label": label,
+        "role": role,
+        "internal": True,
+        "baseUrl": base_url,
+        "host": parsed["host"],
+        "port": parsed["port"],
+        "status": status,
+        "pid": saved.get("pid"),
+        "message": _safe_message(saved.get("message")),
+    }
+
+
+def _ensure_webai2api(config: GatewayConfig, gateway_root: Path) -> dict[str, Any]:
+    parsed = _parse_service_url(config.upstream.base_url, 8500)
+    if parsed["local"] and parsed["port"] and _port_is_listening(parsed["host"], parsed["port"]):
+        return {"status": "already-running", "message": "WebAI2API runtime already listening"}
+    sidecar_dir = _default_webai2api_sidecar_dir(gateway_root).resolve()
+    if not (sidecar_dir / "package.json").exists():
+        return {"status": "missing", "path": str(sidecar_dir), "message": f"未找到 WebAI2API runtime：{sidecar_dir}"}
+    corepack = shutil.which("corepack.cmd") or shutil.which("corepack")
+    if not corepack:
+        return {"status": "missing", "path": str(sidecar_dir), "message": "未找到 corepack，请先安装 Node.js/Corepack"}
+    log_dir = _log_dir(gateway_root)
+    with (log_dir / "webai2api-out.log").open("ab") as stdout, (log_dir / "webai2api-err.log").open("ab") as stderr:
+        process = subprocess.Popen(
+            [corepack, "pnpm", "start"],
+            cwd=sidecar_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=_creation_flags(),
+        )
+    return {"status": "started", "pid": process.pid, "path": str(sidecar_dir), "message": "WebAI2API runtime started"}
+
+
+def _ensure_ds2api(config: GatewayConfig, config_path: Path, gateway_root: Path) -> dict[str, Any]:
+    parsed = _parse_service_url(config.provider_runtime.deepseek_ds2api_base_url, 9331)
+    if parsed["local"] and parsed["port"] and _port_is_listening(parsed["host"], parsed["port"]):
+        return {"status": "already-running", "message": "ds2api runtime already listening"}
+    exe = _default_ds2api_exe(gateway_root).resolve()
+    if not exe.exists():
+        return {"status": "missing", "path": str(exe), "message": f"未找到 ds2api runtime：{exe}"}
+    log_dir = _log_dir(gateway_root)
+    env = os.environ.copy()
+    env["PORT"] = str(parsed["port"] or 9331)
+    env["DS2API_CONFIG_JSON"] = json.dumps(build_ds2api_sidecar_config(config), ensure_ascii=True, separators=(",", ":"))
+    env["DS2API_ADMIN_KEY"] = env.get("DS2API_ADMIN_KEY") or "local-dev-admin"
+    env["DS2API_CONFIG_PATH"] = str((gateway_root / ".webai-gateway" / "ds2api" / "config.json").resolve())
+    Path(env["DS2API_CONFIG_PATH"]).parent.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "ds2api-out.log").open("ab") as stdout, (log_dir / "ds2api-err.log").open("ab") as stderr:
+        process = subprocess.Popen(
+            [str(exe)],
+            cwd=gateway_root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=_creation_flags(),
+        )
+    return {"status": "started", "pid": process.pid, "path": str(exe), "message": "ds2api runtime started"}
+
+
+def _parse_service_url(base_url: str, default_port: int) -> dict[str, Any]:
+    parsed = urlsplit(base_url or "")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or default_port
+    return {"host": host, "port": port, "local": host.lower() in LOCAL_HOSTS}
+
+
+def _public_base_url(config: GatewayConfig) -> str:
+    host = config.server.host
+    public_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return urlunsplit(("http", f"{public_host}:{int(config.server.port)}", "", "", ""))
+
+
+def _default_webai2api_sidecar_dir(gateway_root: Path) -> Path:
+    configured = os.environ.get("WEBAI2API_SIDECAR_DIR")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return gateway_root.parent / "WebAI2API-sidecar"
+
+
+def _default_ds2api_exe(gateway_root: Path) -> Path:
+    configured = os.environ.get("WEBAI_DEEPSEEK_DS2API_EXE")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return gateway_root / ".tmp" / "ds2api" / ".tmp-bin" / "ds2api.exe"
+
+
+def _port_is_listening(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _log_dir(gateway_root: Path) -> Path:
+    path = gateway_root / ".webai-gateway" / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _state_path(gateway_root: Path) -> Path:
+    return gateway_root / ".webai-gateway" / "runtime" / "managed-runtimes.json"
+
+
+def _load_state(gateway_root: Path) -> dict[str, Any]:
+    path = _state_path(gateway_root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_state(gateway_root: Path, state: dict[str, Any]) -> None:
+    path = _state_path(gateway_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _safe_message(value: Any) -> str:
+    text = str(value or "")
+    for marker in ("cookie", "bearer", "token", "session", "api_key", "apikey"):
+        if marker in text.lower():
+            return "runtime status message hidden"
+    text = re.sub(r"[A-Za-z]:\\[^\s,;]+", "[local path]", text)
+    text = re.sub(r"/(?:[^/\s]+/){2,}[^\s,;]+", "[local path]", text)
+    return text[:500]
+
+
+def _creation_flags() -> int:
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Start and inspect WebAI Gateway internal runtimes.")
+    parser.add_argument("--config", default="config.json", help="Path to WebAI Gateway config.json")
+    parser.add_argument("--ensure", action="store_true", help="Start missing internal runtimes if possible")
+    args = parser.parse_args(argv)
+    config_path = Path(args.config).resolve()
+    gateway_root = config_path.parent
+    config = load_config(config_path)
+    if args.ensure:
+        result = ensure_managed_runtimes(config, config_path, gateway_root)
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0
+    json.dump(collect_supervisor_status(config, gateway_root), sys.stdout, ensure_ascii=False, indent=2)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

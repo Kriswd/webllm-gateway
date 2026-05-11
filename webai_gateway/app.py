@@ -39,6 +39,7 @@ from webai_gateway.deepseek_web import (
 )
 from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.model_ids import normalize_model_body, normalize_model_id
+from webai_gateway.runtime_supervisor import collect_supervisor_status
 from webai_gateway.openai_api import (
     bridge_error_headers,
     build_incomplete_response_retry_payload,
@@ -841,11 +842,7 @@ def create_app(
         app.state.account_registry.update_metadata(account_id, body)
         return admin_accounts(request, providerId=parsed.provider_id)
 
-    @app.post("/api/admin/webai2api/login/start")
-    async def admin_webai2api_login_start(request: Request) -> dict[str, Any]:
-        require_local_admin(request)
-        body = await _json_body(request)
-        provider_id = str(body.get("providerId") or body.get("provider_id") or "").strip()
+    async def _start_webai2api_login_mode(provider_id: str, body: dict[str, Any]) -> dict[str, Any]:
         provider = get_provider(provider_id)
         if provider.route == "direct":
             raise HTTPException(status_code=400, detail="该 Provider 使用 Gateway 直连授权，不需要 WebAI2API 登录模式")
@@ -903,6 +900,8 @@ def create_app(
             "newAccount": create_account,
             "sidecarStarted": bool(sidecar_ready.get("started")),
             "sidecarPid": sidecar_ready.get("pid"),
+            "loginKind": "webai2api",
+            "actionLabel": "打开网页登录授权",
             "message": (
                 f"已为 {provider.name} 创建独立浏览器 Profile 并进入登录模式"
                 if create_account
@@ -910,9 +909,7 @@ def create_app(
             ),
         }
 
-    @app.post("/api/admin/webai2api/login/finish")
-    async def admin_webai2api_login_finish(request: Request) -> dict[str, Any]:
-        require_local_admin(request)
+    async def _finish_webai2api_login_mode() -> dict[str, Any]:
         cfg = current_config()
         sidecar_ready = await run_in_threadpool(_ensure_webai2api_sidecar_available, app, client, cfg)
         if not sidecar_ready.get("available"):
@@ -925,6 +922,40 @@ def create_app(
             raise HTTPException(status_code=502, detail="WebAI2API 未能恢复普通 API 模式，请在缓存与重启页面手动重启")
         app.state.webai2api_login_mode_started_at = None
         return {"success": True, "message": "WebAI2API 已恢复普通 API 模式，可以继续调用模型"}
+
+    @app.post("/api/admin/onboarding/providers/{provider_id}/login")
+    async def admin_onboarding_provider_login(provider_id: str, request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider = get_provider(provider_id)
+        if provider.route == "direct":
+            cdp_url = str(body.get("cdpUrl") or body.get("cdp_url") or DEFAULT_CDP_URL)
+            result = app.state.browser_launcher.start(provider_id, cdp_url)
+            return {
+                **result,
+                "success": True,
+                "providerId": provider_id,
+                "loginKind": "direct",
+                "actionLabel": "打开网页登录授权",
+            }
+        return await _start_webai2api_login_mode(provider_id, body)
+
+    @app.post("/api/admin/onboarding/login/finish")
+    async def admin_onboarding_login_finish(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        return await _finish_webai2api_login_mode()
+
+    @app.post("/api/admin/webai2api/login/start")
+    async def admin_webai2api_login_start(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider_id = str(body.get("providerId") or body.get("provider_id") or "").strip()
+        return await _start_webai2api_login_mode(provider_id, body)
+
+    @app.post("/api/admin/webai2api/login/finish")
+    async def admin_webai2api_login_finish(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        return await _finish_webai2api_login_mode()
 
     def _webai2api_instances_with_new_login_account(
         provider: Any,
@@ -1794,6 +1825,10 @@ def _runtime_status(app: FastAPI) -> dict[str, Any]:
         "sourceStale": stale,
         "latestSource": latest,
         "ds2api": ds2api_status,
+        "supervisor": collect_supervisor_status(
+            getattr(app.state, "config", GatewayConfig()),
+            Path(getattr(app.state, "gateway_root", Path.cwd())).resolve(),
+        ),
         "statusText": "运行代码是最新的" if not stale else "源码已更新，请重启 Gateway 让补丁生效",
     }
 

@@ -12560,6 +12560,44 @@ def test_webai2api_login_finish_restores_api_mode(tmp_path: Path) -> None:
     assert restart_payloads == [{"loginMode": False}]
 
 
+def test_onboarding_provider_login_alias_starts_webai2api_login_mode(tmp_path: Path) -> None:
+    restart_payloads: list[Any] = []
+    original_instances = [
+        {
+            "name": "chatgpt_plus_profile",
+            "userDataMark": "plus",
+            "workers": [{"name": "plus", "type": "chatgpt_text", "mergeTypes": []}],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            return httpx.Response(200, json=original_instances, request=request)
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post("/api/admin/onboarding/providers/chatgpt/login", json={"newAccount": False})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["providerId"] == "chatgpt"
+    assert body["workerName"] == "plus"
+    assert body["actionLabel"] == "打开网页登录授权"
+    assert restart_payloads == [{"loginMode": True, "workerName": "plus"}]
+
+
 def test_upstream_login_mode_503_restores_api_mode_and_retries_chat() -> None:
     chat_calls = 0
     restart_payloads: list[Any] = []
@@ -12841,23 +12879,30 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     bridge_source = bridge_vue.read_text(encoding="utf-8")
     assert "path: '/'" in main_source
     assert "KrisBridge.vue" in main_source.split("path: '/'", 1)[1].split("}", 1)[0]
-    assert "/dashboard" in main_source
     assert "/gateway/kris-bridge" in main_source
+    assert "/dashboard" not in main_source
+    assert "redirect: '/'" in main_source
     assert "网页登录向导" in app_source
-    assert "高级管理" in app_source
     assert "publicRoutes" in app_source
-    assert "管理登录" in app_source
+    assert "WebAI Gateway" in app_source
+    assert "状态概览" not in app_source
+    assert "请求模型" not in app_source
+    assert "系统设置" not in app_source
+    assert "高级管理" not in app_source
+    assert "a-layout-sider" not in app_source
     assert "/api/admin/onboarding" in bridge_source
-    assert "/api/admin/web-auth/browser/start" in bridge_source
-    assert "/api/admin/webai2api/login/start" in bridge_source
-    assert "/api/admin/webai2api/login/finish" in bridge_source
+    assert "/api/admin/onboarding/providers/" in bridge_source
+    assert "/api/admin/onboarding/login/finish" in bridge_source
     assert "const newAccount = Boolean(options.newAccount);" in bridge_source
     assert "options.newAccount || !workerName" not in bridge_source
-    assert "新增网页账号" in bridge_source
+    assert "新增网页账号" not in bridge_source
+    assert "添加授权账号" in bridge_source
     assert "切换并检测" in bridge_source
     assert "网页文本通路" in bridge_source
     assert "不支持原生工具调用" in bridge_source
-    assert "未授权" in bridge_source
+    assert "账号池暂不可读" not in bridge_source
+    assert "需要登录" in bridge_source
+    assert "打开网页登录授权" in bridge_source
     assert "可用模型" in bridge_source
     assert "http://127.0.0.1:8610/v1" in bridge_source
     assert "Claude Code" in bridge_source
@@ -13069,6 +13114,15 @@ def test_start_script_uses_configured_ds2api_concurrency() -> None:
     assert '"global_max_inflight":1' not in script
 
 
+def test_start_script_delegates_internal_runtimes_to_gateway_supervisor() -> None:
+    script = Path("start_webai_gateway.bat").read_text(encoding="utf-8")
+
+    assert "webai_gateway.runtime_supervisor" in script
+    assert "--ensure" in script
+    assert "netstat -ano" not in script
+    assert "corepack" not in script
+
+
 def test_provider_runtime_qwen_web_backend_round_trips_config(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     client = TestClient(create_app(config=_config(), config_path=config_path, http_client=_not_found_client()))
@@ -13127,6 +13181,46 @@ def test_health_reports_runtime_source_freshness(tmp_path: Path) -> None:
     assert runtime["ds2api"]["sidecarCommit"] == "unknown"
     assert runtime["ds2api"]["latestAlignmentClaimAllowed"] is False
     assert runtime["statusText"] == "运行代码是最新的"
+    supervisor = runtime["supervisor"]
+    assert supervisor["singleEntry"] is True
+    assert supervisor["publicPort"] == 8610
+    assert supervisor["publicBaseUrl"] == "http://127.0.0.1:8610"
+    assert supervisor["internalRuntimeCount"] == 2
+    services = {item["id"]: item for item in supervisor["services"]}
+    assert services["gateway"]["internal"] is False
+    assert services["gateway"]["status"] == "running"
+    assert services["webai2api"]["internal"] is True
+    assert services["webai2api"]["role"] == "web-login-runtime"
+    assert "path" not in services["webai2api"]
+    assert services["ds2api"]["internal"] is True
+    assert services["ds2api"]["role"] == "deepseek-web-runtime"
+    assert "path" not in services["ds2api"]
+
+
+def test_health_redacts_internal_runtime_paths(tmp_path: Path) -> None:
+    state_path = tmp_path / ".webai-gateway" / "runtime" / "managed-runtimes.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "services": {
+                    "webai2api": {
+                        "status": "missing",
+                        "message": r"未找到 WebAI2API runtime：D:\ProjectX\WebAI2API-sidecar",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(config=_config(), config_path=tmp_path / "config.json", http_client=_not_found_client()))
+
+    response = client.get("/health", headers=_headers())
+
+    assert response.status_code == 200
+    text = response.text
+    assert r"D:\ProjectX\WebAI2API-sidecar" not in text
+    assert "[local path]" in text
 
 
 def test_health_flags_runtime_when_source_changed_after_start(tmp_path: Path) -> None:

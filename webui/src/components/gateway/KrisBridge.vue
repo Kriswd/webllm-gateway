@@ -45,6 +45,7 @@ const accountEditForm = ref({
   planType: 'unknown',
   note: '',
 });
+const diagnosticsOpen = ref(false);
 
 const localExampleBaseUrl = 'http://127.0.0.1:8610/v1';
 
@@ -213,12 +214,12 @@ const selectedProviderAccountStatus = computed(() => {
   if (provider.loginKind !== 'direct') {
     return {
       tone: 'sidecar',
-      title: 'WebAI2API 账号池暂不可读',
-      description: `${provider.name} 的账号和浏览器登录态由 WebAI2API sidecar 管理。当前 Gateway 没有读到账号池；如果你之前登录过，通常只是 sidecar 或 API 没启动，不代表账号被清空。`,
+      title: '需要登录',
+      description: `${provider.name} 还没有检测到可用网页登录账号。点击“打开网页登录授权”后，在弹出的浏览器里完成登录，回到这里恢复 API 并刷新模型。`,
       note: declaredModelCount
-        ? `本地仍保留 ${declaredModelCount} 个候选模型配置；启动 sidecar 并刷新后，会显示实际可用账号和模型。`
-        : '启动 WebAI2API sidecar 并刷新后，会同步实际可用账号和模型。',
-      action: '可用“登录或修复账号”进入 WebAI2API 登录/恢复流程。',
+        ? `本地已有 ${declaredModelCount} 个候选模型配置；授权完成后会自动检测实际可用模型。`
+        : '授权完成并刷新后，会显示实际可用账号和模型。',
+      action: '不需要手动配置 cookie、worker 或内部 runtime。',
     };
   }
 
@@ -295,8 +296,8 @@ function providerSubtitle(provider) {
     if (!accountCount && !modelCount) {
       const declaredModelCount = providerDeclaredModelCount(provider);
       return declaredModelCount
-        ? `账号池暂不可读 · ${declaredModelCount} 个候选模型`
-        : '账号池暂不可读 · 等待 sidecar 同步';
+        ? `需要登录 · ${declaredModelCount} 个候选模型`
+        : '需要登录 · 等待授权';
     }
     return `${accountCount} 个账号 · ${modelCount} 个已验证模型 ID`;
   }
@@ -468,11 +469,11 @@ async function handleStartLogin(options = {}) {
   }
   const newAccount = Boolean(options.newAccount);
   Modal.confirm({
-    title: newAccount ? '新增网页账号？' : '修复当前网页登录？',
+    title: newAccount ? '添加授权账号？' : '打开网页登录授权？',
     content: newAccount
       ? '这会为新账号创建独立浏览器 Profile，并打开网页登录窗口。完成登录后回到这里，点击“恢复 API 并刷新”。'
       : '这会打开当前账号的网页登录窗口，用于修复登录态或更新账号权益。完成后回到这里，点击“恢复 API 并刷新”。',
-    okText: newAccount ? '新增并登录' : '打开登录窗口',
+    okText: newAccount ? '添加并授权' : '打开授权窗口',
     cancelText: '取消',
     async onOk() {
       await startWebAI2APILogin(provider, { newAccount });
@@ -485,10 +486,10 @@ async function startDirectAuth(provider) {
   actionLoading.value = true;
   try {
     appendLog(`正在为 ${provider.name} 启动授权浏览器`);
-    const browserRes = await fetch('/api/admin/web-auth/browser/start', {
+    const browserRes = await fetch(`/api/admin/onboarding/providers/${encodeURIComponent(provider.id)}/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: provider.id, cdpUrl: cdpUrl.value }),
+      body: JSON.stringify({ cdpUrl: cdpUrl.value }),
     });
     const browserData = await browserRes.json();
     if (!browserRes.ok) throw new Error(browserData.detail || `HTTP ${browserRes.status}`);
@@ -541,9 +542,9 @@ async function startWebAI2APILogin(provider, options = {}) {
         ? `正在以登录模式重启 Worker：${workerName}`
         : newAccount
           ? '正在创建独立浏览器 Profile 并打开网页登录窗口'
-          : '正在启动 WebAI2API sidecar 并查找已有登录 Worker',
+          : '正在准备网页登录授权窗口',
     );
-    const res = await fetch('/api/admin/webai2api/login/start', {
+    const res = await fetch(`/api/admin/onboarding/providers/${encodeURIComponent(provider.id)}/login`, {
       method: 'POST',
       headers: {
         ...settingsStore.getHeaders(),
@@ -556,9 +557,9 @@ async function startWebAI2APILogin(provider, options = {}) {
       throw new Error(data.message || data.error?.message || `HTTP ${res.status}`);
     }
     if (data.sidecarStarted) {
-      appendLog(`WebAI2API sidecar 已启动${data.sidecarPid ? `，PID ${data.sidecarPid}` : ''}`);
+      appendLog(`内部网页登录 runtime 已启动${data.sidecarPid ? `，PID ${data.sidecarPid}` : ''}`);
     }
-    appendLog(data.message || 'WebAI2API 已进入登录模式');
+    appendLog(data.message || '已进入网页登录授权模式');
     if (data.instanceName || data.workerName) {
       appendLog(`登录目标：${data.instanceName || '-'} / ${data.workerName || '-'}`);
     }
@@ -577,8 +578,8 @@ async function startWebAI2APILogin(provider, options = {}) {
 async function finishWebAI2APILogin({ close = false } = {}) {
   actionLoading.value = true;
   try {
-    appendLog('正在恢复 WebAI2API 普通 API 模式');
-    const res = await fetch('/api/admin/webai2api/login/finish', {
+    appendLog('正在恢复 Gateway API 调用模式');
+    const res = await fetch('/api/admin/onboarding/login/finish', {
       method: 'POST',
       headers: {
         ...settingsStore.getHeaders(),
@@ -590,7 +591,7 @@ async function finishWebAI2APILogin({ close = false } = {}) {
     if (!res.ok || data.success === false) {
       throw new Error(data.message || data.detail || data.error?.message || `HTTP ${res.status}`);
     }
-    appendLog(data.message || 'WebAI2API 已恢复普通 API 模式');
+    appendLog(data.message || 'Gateway API 已恢复可调用模式');
     await loadOnboarding();
     message.success('已恢复 API 并刷新模型');
     if (close) progressVisible.value = false;
@@ -883,7 +884,7 @@ onMounted(loadOnboarding);
           <div v-if="selectedProvider" class="provider-detail">
             <div class="detail-row">
               <span>登录方式</span>
-              <strong>{{ selectedProvider.loginKind === 'direct' ? '网关自动捕获' : 'WebAI2API 登录模式' }}</strong>
+              <strong>{{ selectedProvider.loginKind === 'direct' ? '网关自动捕获' : '网页登录授权模式' }}</strong>
             </div>
             <div class="detail-row">
               <span>网页登录页</span>
@@ -1023,14 +1024,14 @@ onMounted(loadOnboarding);
               <a-alert
                 type="info"
                 show-icon
-                message="WebAI2API 会管理这些平台的浏览器缓存。登录模式只用于授权；完成后请回到这里恢复 API，然后检测模型。"
+                message="Gateway 会打开网页登录窗口完成授权；授权结束后回到这里恢复 API，然后检测模型。"
               />
             </template>
 
             <div class="action-row">
               <a-button type="primary" size="large" :loading="actionLoading" @click="handleStartLogin">
                 <template #icon><LoginOutlined /></template>
-                {{ selectedProvider.loginKind === 'direct' ? '打开授权浏览器' : '修复当前登录' }}
+                {{ selectedProvider.loginKind === 'direct' ? '打开授权浏览器' : '打开网页登录授权' }}
               </a-button>
               <a-button
                 v-if="selectedProvider.loginKind !== 'direct'"
@@ -1039,7 +1040,7 @@ onMounted(loadOnboarding);
                 @click="handleStartLogin({ newAccount: true })"
               >
                 <template #icon><PlusOutlined /></template>
-                新增网页账号
+                添加授权账号
               </a-button>
               <a-button size="large" :disabled="!selectedProviderDefaultModel" @click="copySelectedDefaultModel">
                 <template #icon><CopyOutlined /></template>
@@ -1058,18 +1059,24 @@ onMounted(loadOnboarding);
             </div>
 
             <div class="shortcut-row">
-              <a-button type="link" @click="openAdvanced('/tools/display')">
-                <template #icon><LinkOutlined /></template>
-                虚拟显示器
-              </a-button>
-              <a-button type="link" @click="openAdvanced('/tools/cache')">
-                <template #icon><SettingOutlined /></template>
-                缓存与重启
-              </a-button>
-              <a-button type="link" @click="openAdvanced('/settings/workers')">
+              <a-button type="link" @click="diagnosticsOpen = !diagnosticsOpen">
                 <template #icon><ToolOutlined /></template>
-                工作池
+                {{ diagnosticsOpen ? '收起故障诊断' : '故障诊断' }}
               </a-button>
+              <div v-if="diagnosticsOpen" class="diagnostic-links">
+                <a-button type="link" @click="openAdvanced('/tools/display')">
+                  <template #icon><LinkOutlined /></template>
+                  虚拟显示器
+                </a-button>
+                <a-button type="link" @click="openAdvanced('/tools/cache')">
+                  <template #icon><SettingOutlined /></template>
+                  缓存与重启
+                </a-button>
+                <a-button type="link" @click="openAdvanced('/settings/workers')">
+                  <template #icon><ToolOutlined /></template>
+                  工作池
+                </a-button>
+              </div>
             </div>
           </div>
         </section>
@@ -1121,15 +1128,15 @@ onMounted(loadOnboarding);
 
           <article class="arch-stage">
             <span class="arch-eyebrow">Provider Runtime</span>
-            <h3>直连与 Sidecar</h3>
+            <h3>直连与内部 Runtime</h3>
             <ul class="arch-list">
               <li>
                 <strong>Direct Provider</strong>
                 <small>Qwen Web、DeepSeek Web，按 ds2api 行为对齐</small>
               </li>
               <li>
-                <strong>WebAI2API Sidecar</strong>
-                <small>ChatGPT、Gemini、Sora、LMArena 等网页账号池</small>
+                <strong>WebAI2API Runtime</strong>
+                <small>ChatGPT、Gemini、Sora、LMArena 等网页登录和网页调用能力</small>
               </li>
               <li>
                 <strong>ds2api Oracle</strong>
@@ -1144,7 +1151,7 @@ onMounted(loadOnboarding);
             <ul class="arch-list">
               <li>
                 <strong>ChatGPT / Gemini / Sora</strong>
-                <small>登录态在 WebAI2API sidecar 的浏览器缓存和账号池里</small>
+                <small>登录态由内部网页登录 runtime 的浏览器缓存保存</small>
               </li>
               <li>
                 <strong>Qwen / DeepSeek</strong>
@@ -1155,7 +1162,7 @@ onMounted(loadOnboarding);
         </div>
 
         <div class="architecture-note">
-          ChatGPT 之前授权过但这里显示为空，通常是因为只启动了 Gateway，未连接 WebAI2API sidecar。授权记录大概率仍在 sidecar 的浏览器缓存中；启动 sidecar 并刷新后才会同步账号和模型。
+          ChatGPT 之前授权过但这里显示为空，通常是内部网页登录 runtime 还在启动或没有完成 API 恢复。授权记录通常仍在本机浏览器缓存中；点击“打开网页登录授权”或“刷新模型”即可重新同步账号和模型。
         </div>
       </section>
 

@@ -6,6 +6,7 @@
 
 - 核心边界清晰：Gateway 只做协议适配、工具桥和网页登录 provider 交互，不执行本地工具。
 - 后端已有较厚测试覆盖：OpenAI、Anthropic、ToolBridge、provider、ds2api parity、replay fixtures。
+- 运行体验已收敛为单入口：`start_webai_gateway.bat` 通过 Gateway runtime supervisor 托管 WebAI2API / ds2api 内部 runtime，前端默认只暴露网页登录向导、模型可用性和接入信息。
 - 本地运行态已在 `.gitignore` 中排除：`config.json`、`data/`、`credentials/`、`.webai-gateway/`、日志和 `.codex-logs/`。
 - README 有基本启动、登录、客户端配置和 API 说明。
 
@@ -45,8 +46,9 @@ Invoke-RestMethod http://127.0.0.1:8610/health
 
 网页登录 E2E：
 
-- WebAI2API sidecar 已启动且只存在一个监听 `8500` 的进程树。
-- DeepSeek ds2api sidecar 已启动且监听 `9331`。
+- `http://127.0.0.1:8610/health` 显示 `runtime.supervisor.singleEntry=true`，并能看到 WebAI2API / ds2api 内部 runtime 状态。
+- WebAI2API 内部 runtime 已启动且只存在一个监听 `8500` 的进程树。
+- DeepSeek ds2api 内部 runtime 已启动且监听 `9331`。
 - `/v1/models` 能看到已授权 provider 的模型。
 - `POST /v1/chat/completions` 普通文本请求成功。
 - 带工具的 OpenAI 请求返回标准 `message.tool_calls`。
