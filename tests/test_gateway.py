@@ -12920,9 +12920,74 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "需要登录" in bridge_source
     assert "打开网页登录授权" in bridge_source
     assert "可用模型" in bridge_source
+    assert "图片生成测试" in bridge_source
+    assert "/v1/images/generations" in bridge_source
+    assert "gpt-image-2" in bridge_source
+    assert "response_format" in bridge_source
     assert "http://127.0.0.1:8610/v1" in bridge_source
     assert "Claude Code" in bridge_source
     assert "/health" in app_source
+
+
+def test_open_source_release_materials_are_present() -> None:
+    root = Path(__file__).resolve().parents[1]
+    required_files = [
+        "LICENSE",
+        "NOTICE.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "docs/installation.md",
+        "docs/media-generation.md",
+        "docs/third-party-runtime.md",
+        ".github/workflows/ci.yml",
+    ]
+
+    for relative in required_files:
+        assert (root / relative).exists(), f"{relative} is required before open-source release"
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    architecture = (root / "docs" / "architecture.md").read_text(encoding="utf-8")
+    installation = (root / "docs" / "installation.md").read_text(encoding="utf-8")
+    media = (root / "docs" / "media-generation.md").read_text(encoding="utf-8")
+    third_party = (root / "docs" / "third-party-runtime.md").read_text(encoding="utf-8")
+    security = (root / "SECURITY.md").read_text(encoding="utf-8")
+    contributing = (root / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+
+    assert "docs/installation.md" in readme
+    assert "docs/media-generation.md" in readme
+    assert "docs/third-party-runtime.md" in readme
+    assert "POST /v1/images/generations" in media
+    assert "gpt-image-2" in media
+    assert "WebAI2API" in third_party and "MIT" in third_party
+    assert "ds2api" in third_party and "AGPL-3.0" in third_party
+    assert "Gateway 不执行本地工具" in architecture
+    assert "flowchart" in architecture
+    assert "python -m pytest -q" in ci
+    assert "corepack pnpm build" in ci
+    assert "credentials/" in gitignore
+    assert ".webai-gateway/" in gitignore
+    assert "不要提交" in security
+    assert "ds2api parity" in contributing
+    assert "WebAI2API" in installation and "ds2api" in installation
+
+    formal_docs = [
+        "README.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "NOTICE.md",
+        ".env.example",
+        "docs/architecture.md",
+        "docs/auto-research-loop.md",
+        "docs/installation.md",
+        "docs/media-generation.md",
+        "docs/third-party-runtime.md",
+    ]
+    personal_path_markers = ("C:\\Users\\woody", "woody.DESKTOP", "E:\\ProjectX", "D:\\ProjectX")
+    for relative in formal_docs:
+        text = (root / relative).read_text(encoding="utf-8")
+        assert not any(marker in text for marker in personal_path_markers), relative
 
 
 def test_admin_root_serves_management_ui() -> None:

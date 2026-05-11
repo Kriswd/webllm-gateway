@@ -8,7 +8,7 @@ WebAI Gateway 的 auto-research loop 用于把 Claude Code / 网页模型适配�
 
 ```powershell
 python -m webai_gateway.auto_research collect `
-  C:\Users\woody\.claude\projects\E--ProjectX-mindcraft\a16b4cda-89d1-4ef3-9a7c-05f3e58e22c8.jsonl `
+  <path-to-claude-transcript.jsonl> `
   --output tests\fixtures\tool_bridge_replays
 ```
 

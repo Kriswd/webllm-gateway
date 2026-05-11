@@ -15,6 +15,9 @@ webui/node_modules.broken_acl_*/
 *.log
 *.tmp
 *.swp
+*.sqlite
+*.sqlite3
+*.db
 .codex-logs/
 .learnings/
 
@@ -23,11 +26,16 @@ config.json
 data/
 credentials/
 .webai-gateway/
+browser-profile/
+cookies/
+*.pem
+*.key
 
 # Environment
 .env
 .env.local
 .env.*
+!.env.example
 
 # Editors
 .vscode/

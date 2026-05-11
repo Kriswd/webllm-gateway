@@ -2,6 +2,21 @@
 
 WebAI Gateway 是一个网页登录模型 API 网关。它把 Qwen Web、DeepSeek Web、ChatGPT/WebAI2API 等网页登录上游包装成 OpenAI / Anthropic 兼容 API，同时把不稳定的网页模型文本工具调用转换成稳定的标准工具协议。
 
+```mermaid
+flowchart LR
+  U["用户 / 下游客户端"] --> G["WebAI Gateway :8610"]
+  G --> UI["极简登录向导 UI"]
+  G --> API["OpenAI / Anthropic API"]
+  G --> MEDIA["图片 / 视频 API"]
+  G --> SUP["Runtime Supervisor"]
+  API --> TB["ToolBridgeV2 / 协议适配"]
+  SUP --> W["WebAI2API 内部子进程"]
+  SUP --> D["ds2api 内部子进程"]
+  W --> GPT["ChatGPT / Gemini / Sora 网页登录"]
+  D --> DS["DeepSeek Web"]
+  G --> Q["Qwen / Qwen Coder 直连网页登录"]
+```
+
 ## 设计边界
 
 - Gateway 是协议层和适配层，不是 agent runtime。

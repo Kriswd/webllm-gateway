@@ -34,6 +34,11 @@ const selectedProviderId = ref('');
 const selectedWorkerName = ref('');
 const modelSearch = ref('');
 const modelScope = ref('selected');
+const imagePrompt = ref('一张干净的产品摄影图：蓝色玻璃质感的 AI 网关设备，白色背景，柔和棚拍光');
+const imageModel = ref('gpt-image-2');
+const imageGenerating = ref(false);
+const imageError = ref('');
+const imageResultUrl = ref('');
 const tokenVisible = ref(false);
 const cdpUrl = ref('http://127.0.0.1:9222');
 const workerOptions = ref([]);
@@ -156,6 +161,29 @@ const filteredModels = computed(() => {
     return inScope && matchesQuery;
   });
 });
+
+const imageModelOptions = computed(() => {
+  const discovered = (onboarding.value.models || [])
+    .filter((model) => {
+      const modelId = String(model.id || '').toLowerCase();
+      const capabilities = model.capabilities || {};
+      return capabilities.image === true
+        || model.type === 'image'
+        || modelId.includes('image')
+        || modelId.includes('gpt-image');
+    })
+    .map((model) => String(model.id || '').trim())
+    .filter(Boolean);
+  return [...new Set(['gpt-image-2', 'gpt-image-1.5', ...discovered])]
+    .map((value) => ({ label: value, value }));
+});
+
+const imageRequestExample = computed(() => JSON.stringify({
+  model: imageModel.value || 'gpt-image-2',
+  prompt: imagePrompt.value,
+  n: 1,
+  response_format: 'b64_json',
+}, null, 2));
 
 const clientConfig = computed(() => [
   '# OpenAI-compatible clients',
@@ -613,6 +641,54 @@ async function copyText(text, successText) {
   message.success(successText);
 }
 
+async function runImageSmokeTest() {
+  const prompt = imagePrompt.value.trim();
+  if (!prompt) {
+    message.warning('请先输入图片提示词');
+    return;
+  }
+  imageGenerating.value = true;
+  imageError.value = '';
+  imageResultUrl.value = '';
+  try {
+    const headers = {
+      ...settingsStore.getHeaders(),
+      'Content-Type': 'application/json',
+    };
+    if (!headers.Authorization && gatewayToken.value) {
+      headers.Authorization = `Bearer ${gatewayToken.value}`;
+    }
+    const res = await fetch('/v1/images/generations', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: imageModel.value || 'gpt-image-2',
+        prompt,
+        n: 1,
+        response_format: 'b64_json',
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = data.detail || data.error?.message || `HTTP ${res.status}`;
+      throw new Error(String(detail));
+    }
+    const first = Array.isArray(data.data) ? data.data[0] : null;
+    if (first?.b64_json) {
+      imageResultUrl.value = `data:image/png;base64,${first.b64_json}`;
+    } else if (first?.url) {
+      imageResultUrl.value = first.url;
+    } else {
+      throw new Error('接口已返回，但没有拿到图片内容');
+    }
+    message.success('图片生成链路可用');
+  } catch (error) {
+    imageError.value = error.message || '图片生成失败，请先确认 ChatGPT / WebAI2API 授权账号可用';
+  } finally {
+    imageGenerating.value = false;
+  }
+}
+
 function copyModel(modelId) {
   copyText(modelId, '模型 ID 已复制');
 }
@@ -1061,20 +1137,20 @@ onMounted(loadOnboarding);
             <div class="shortcut-row">
               <a-button type="link" @click="diagnosticsOpen = !diagnosticsOpen">
                 <template #icon><ToolOutlined /></template>
-                {{ diagnosticsOpen ? '收起故障诊断' : '故障诊断' }}
+                {{ diagnosticsOpen ? '收起排障入口' : '排障入口' }}
               </a-button>
               <div v-if="diagnosticsOpen" class="diagnostic-links">
                 <a-button type="link" @click="openAdvanced('/tools/display')">
                   <template #icon><LinkOutlined /></template>
-                  虚拟显示器
+                  内部浏览器画面
                 </a-button>
                 <a-button type="link" @click="openAdvanced('/tools/cache')">
                   <template #icon><SettingOutlined /></template>
-                  缓存与重启
+                  运行缓存
                 </a-button>
                 <a-button type="link" @click="openAdvanced('/settings/workers')">
                   <template #icon><ToolOutlined /></template>
-                  工作池
+                  网页登录工作池
                 </a-button>
               </div>
             </div>
@@ -1228,6 +1304,62 @@ onMounted(loadOnboarding);
             </template>
           </template>
         </a-table>
+      </section>
+
+      <section class="panel media-panel">
+        <div class="panel-heading compact">
+          <div>
+            <h2>图片生成测试</h2>
+            <p>使用 `gpt-image-2` 调用 `POST /v1/images/generations`，用于确认 ChatGPT / WebAI2API 生图链路是否可用。</p>
+          </div>
+          <ExperimentOutlined />
+        </div>
+
+        <div class="media-test-grid">
+          <div class="media-form">
+            <label class="field-label" for="image-model-select">模型</label>
+            <a-select
+              id="image-model-select"
+              v-model:value="imageModel"
+              :options="imageModelOptions"
+              class="full-width"
+            />
+
+            <label class="field-label" for="image-prompt-input">提示词</label>
+            <a-textarea
+              id="image-prompt-input"
+              v-model:value="imagePrompt"
+              :rows="4"
+              placeholder="描述你要生成的图片"
+            />
+
+            <div class="action-row">
+              <a-button type="primary" :loading="imageGenerating" @click="runImageSmokeTest">
+                <template #icon><ExperimentOutlined /></template>
+                生成测试图片
+              </a-button>
+              <a-button @click="copyText(imageRequestExample, '生图请求示例已复制')">
+                <template #icon><CopyOutlined /></template>
+                复制请求示例
+              </a-button>
+            </div>
+            <a-alert
+              v-if="imageError"
+              type="error"
+              show-icon
+              :message="imageError"
+            />
+          </div>
+
+          <div class="image-preview-card">
+            <img v-if="imageResultUrl" :src="imageResultUrl" alt="图片生成测试结果" />
+            <div v-else class="image-placeholder">
+              <ExperimentOutlined />
+              <span>生成后会在这里预览图片</span>
+              <small>该测试会走当前 Gateway 的 `/v1/images/generations`，不会绕过授权账号。</small>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="panel config-panel">
@@ -1687,6 +1819,7 @@ onMounted(loadOnboarding);
 
 .models-panel,
 .architecture-panel,
+.media-panel,
 .config-panel {
   margin-bottom: 16px;
 }
@@ -1773,6 +1906,64 @@ onMounted(loadOnboarding);
   max-width: 420px;
 }
 
+.media-test-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1.1fr) minmax(260px, 0.9fr);
+}
+
+.media-form {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.field-label {
+  color: #334155;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.full-width {
+  width: 100%;
+}
+
+.image-preview-card {
+  align-items: center;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  display: flex;
+  justify-content: center;
+  min-height: 260px;
+  overflow: hidden;
+  padding: 14px;
+}
+
+.image-preview-card img {
+  border-radius: 8px;
+  display: block;
+  max-height: 360px;
+  max-width: 100%;
+  object-fit: contain;
+}
+
+.image-placeholder {
+  align-items: center;
+  color: #64748b;
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  line-height: 1.6;
+  max-width: 320px;
+  text-align: center;
+}
+
+.image-placeholder .anticon {
+  color: #1677ff;
+  font-size: 26px;
+}
+
 .availability-message {
   color: #64748b;
   display: block;
@@ -1842,6 +2033,7 @@ onMounted(loadOnboarding);
   .hero-panel,
   .workspace-grid,
   .architecture-map,
+  .media-test-grid,
   .config-grid {
     grid-template-columns: 1fr;
   }

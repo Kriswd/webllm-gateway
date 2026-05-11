@@ -8,19 +8,21 @@
 - 后端已有较厚测试覆盖：OpenAI、Anthropic、ToolBridge、provider、ds2api parity、replay fixtures。
 - 运行体验已收敛为单入口：`start_webai_gateway.bat` 通过 Gateway runtime supervisor 托管 WebAI2API / ds2api 内部 runtime，前端默认只暴露网页登录向导、模型可用性和接入信息。
 - 本地运行态已在 `.gitignore` 中排除：`config.json`、`data/`、`credentials/`、`.webai-gateway/`、日志和 `.codex-logs/`。
-- README 有基本启动、登录、客户端配置和 API 说明。
+- README 已补齐安装、登录、客户端配置、媒体接口、第三方 runtime、贡献和安全入口。
+- 已补齐 `LICENSE`、`NOTICE.md`、`CONTRIBUTING.md`、`SECURITY.md`、`.github/workflows/ci.yml`。
+- 首页已加入 `gpt-image-2` 图片生成 smoke test，便于开源后快速验证 ChatGPT / WebAI2API 媒体链路。
 
 ## 开源前必须完成
 
-- 选择并添加 `LICENSE`。推荐在 MIT、Apache-2.0、AGPL-3.0 中明确取舍；当前仓库没有许可证文件。
+- 已选择并添加 MIT `LICENSE`；第三方 runtime 授权差异记录在 `NOTICE.md` 和 [third-party-runtime.md](third-party-runtime.md)。
 - 决定 `webui/dist/` 是否继续跟踪。如果希望开箱即用，可保留构建产物；如果希望源码发布更干净，应从仓库移除并在 README 中要求 `pnpm build`。
 - 清理或归档 `docs/superpowers/plans/` 中的内部开发计划。它们对开发有价值，但包含大量本地路径、历史决策和临时语境；公开仓库建议迁移到 `docs/dev-history/` 或删减。
 - 将示例路径从 `E:/ProjectX/...`、`C:\Users\...` 泛化为 fixture 路径，至少避免在 README 和正式文档中出现个人机器路径。测试 fixture 中的路径可保留为协议样本，但应说明是匿名化测试数据。
-- 明确 WebAI2API sidecar 依赖方式：作为外部 prerequisite、git submodule、release 下载，或 vendor/fork。当前 ChatGPT `gpt-image-2` 生图链路依赖 sidecar 里的同步修复。
-- 给 ds2api oracle 增加公开可复现说明：如何拉取 `.tmp/ds2api`、如何更新 oracle commit、如何运行 parity 测试。
-- 增加贡献指南 `CONTRIBUTING.md`：编码规范、测试命令、敏感信息规则、ds2api parity 要求、provider 改动要求。
-- 增加安全说明 `SECURITY.md`：凭证存储位置、日志脱敏、漏洞报告方式、网页登录账号风险。
-- 增加 `.env.example` 或配置说明，说明真实 cookie/bearer/API key 不应写入仓库。
+- 已明确 WebAI2API sidecar 依赖方式：作为外部 prerequisite 或本地 sidecar 目录，详见 [installation.md](installation.md) 和 [third-party-runtime.md](third-party-runtime.md)。
+- 已给 ds2api oracle 增加公开可复现说明：如何拉取 `.tmp/ds2api`、如何更新 oracle commit、如何运行 parity 测试，详见 [third-party-runtime.md](third-party-runtime.md)。
+- 已增加贡献指南 `CONTRIBUTING.md`：编码规范、测试命令、敏感信息规则、ds2api parity 要求、provider 改动要求。
+- 已增加安全说明 `SECURITY.md`：凭证存储位置、日志脱敏、漏洞报告方式、网页登录账号风险。
+- 已增加 `.env.example`，说明真实 cookie/bearer/API key 不应写入仓库。
 
 ## 发布前验证矩阵
 
@@ -34,7 +36,7 @@ python -m pytest -q
 
 ```powershell
 cd webui
-pnpm build
+corepack pnpm build
 ```
 
 启动脚本：

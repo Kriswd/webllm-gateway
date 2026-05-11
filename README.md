@@ -24,16 +24,29 @@ http://127.0.0.1:8610/
 stop_webai_gateway.bat
 ```
 
+更多安装、依赖和启动排障见 [docs/installation.md](docs/installation.md)。
+
 ## 登录授权
 
 打开统一控制台后，先进入“网页登录向导”：
 
-- DeepSeek Web、Qwen / 通义千问国际版：点击“打开授权浏览器”，在弹出的浏览器里登录。网关检测到真实登录态后才会显示已授权。
-- ChatGPT、Gemini、LMArena、豆包、Sora 等 WebAI2API 站点：在 Gateway 控制台点击 WebAI2API 原生管理入口完成授权。
+- 首页默认只展示当前已经实际验证可用的网页登录通路，避免把未验证站点当成可用产品能力。
+- DeepSeek Web、Qwen / 通义千问国际版、Qwen Coder：点击“打开授权浏览器”，在弹出的浏览器里登录。网关检测到真实登录态后才会显示已授权。
+- ChatGPT：通过内部托管的 WebAI2API 登录授权能力接入；点击“登录或修复账号”后完成网页授权，再回到 Gateway 检测模型。
 - 授权完成后，在“可用模型”里复制模型 ID，填到 KrisAI、OpenClaw、Hermes 或 Claude Code。
-- “接入 KrisAI”区域可以复制 OpenAI 兼容地址和 API Key，也可以重新生成本地网关令牌。
+- “接入客户端”区域可以复制 OpenAI / Anthropic 兼容地址和 API Key，也可以重新生成本地网关令牌。
 
 Gateway 首页优先展示统一接入、状态、授权和复制配置。WebAI2API 原来的状态概览、工作池、适配器、浏览器、虚拟显示器、缓存、日志、请求历史和接口测试页面保留在控制台的“WebAI2API 原生管理台”高级入口中。
+
+## 文档索引
+
+- 安装和单入口启动：[docs/installation.md](docs/installation.md)
+- 图片和视频生成：[docs/media-generation.md](docs/media-generation.md)
+- WebAI2API / ds2api 第三方 runtime 说明：[docs/third-party-runtime.md](docs/third-party-runtime.md)
+- 架构和边界：[docs/architecture.md](docs/architecture.md)
+- 贡献规范：[CONTRIBUTING.md](CONTRIBUTING.md)
+- 安全策略：[SECURITY.md](SECURITY.md)
+- 第三方声明：[NOTICE.md](NOTICE.md)
 
 ## 工具调用适配层
 
@@ -111,6 +124,21 @@ Claude Code Best 可在 `/login` 里选择 `Anthropic Compatible`，或写入 `~
 网页登录模型的单次请求超时由通用 `providerRuntime.requestTimeoutSeconds` 控制，默认 300 秒。工具调用 JSON 一旦完整返回仍会提前结束请求，因此提高该值主要保护 `/init`、项目总结、长文档归纳等慢任务，不会刻意拖慢快速工具选择。
 
 网页登录模型的输入预算由 `providerRuntime.promptMaxChars` 控制，默认 32000 字符。超过预算时会保留开头、WebAI Gateway 工具协议和最后的用户任务，压缩中间的大段技能列表、规则列表或历史上下文，避免网页模型在第一轮请求里长时间无输出。
+
+## 图片和视频生成
+
+Gateway 暴露 OpenAI-compatible 媒体接口：
+
+```text
+POST /v1/images/generations
+POST /v1/videos
+GET /v1/videos/{video_id}
+GET /v1/videos/{video_id}/content
+```
+
+图片生成建议优先使用 `gpt-image-2`，兼容 `gpt-image-1.5`。这条链路通过内部 WebAI2API / ChatGPT 网页授权账号调用；首页“图片生成测试”可以直接执行一次 smoke test，并预览返回图片。
+
+视频生成使用 `sora-2` 等 WebAI2API 暴露的 Sora 模型，结果由 Gateway 做短期缓存并通过 `/v1/videos/{video_id}/content` 取回。完整请求示例和注意事项见 [docs/media-generation.md](docs/media-generation.md)。
 
 ## 模型目录
 
@@ -221,6 +249,8 @@ WebAI2API 支持的站点和模型会继续透传并合并到 `/v1/models`。模
 ```powershell
 python -m pytest -q
 cd webui
-pnpm build
+corepack pnpm build
 python -m webai_gateway
 ```
+
+修改 provider、工具桥、模型目录、授权流程或 ds2api 相关链路前，请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，并检查当前锁定的 ds2api oracle 是否仍是最新上游源码。
