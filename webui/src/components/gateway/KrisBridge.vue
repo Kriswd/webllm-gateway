@@ -534,12 +534,14 @@ async function startWebAI2APILogin(provider, options = {}) {
   resetActionState('webai2api');
   actionLoading.value = true;
   try {
-    const workerName = options.newAccount ? undefined : (selectedWorkerName.value || undefined);
-    const newAccount = Boolean(options.newAccount || !workerName);
+    const newAccount = Boolean(options.newAccount);
+    const workerName = newAccount ? undefined : (selectedWorkerName.value || undefined);
     appendLog(
       workerName
         ? `正在以登录模式重启 Worker：${workerName}`
-        : '正在创建独立浏览器 Profile 并打开网页登录窗口',
+        : newAccount
+          ? '正在创建独立浏览器 Profile 并打开网页登录窗口'
+          : '正在启动 WebAI2API sidecar 并查找已有登录 Worker',
     );
     const res = await fetch('/api/admin/webai2api/login/start', {
       method: 'POST',
@@ -552,6 +554,9 @@ async function startWebAI2APILogin(provider, options = {}) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.success === false) {
       throw new Error(data.message || data.error?.message || `HTTP ${res.status}`);
+    }
+    if (data.sidecarStarted) {
+      appendLog(`WebAI2API sidecar 已启动${data.sidecarPid ? `，PID ${data.sidecarPid}` : ''}`);
     }
     appendLog(data.message || 'WebAI2API 已进入登录模式');
     if (data.instanceName || data.workerName) {

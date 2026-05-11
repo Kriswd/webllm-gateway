@@ -12456,10 +12456,87 @@ def test_webai2api_login_start_creates_isolated_profile_without_touching_existin
     assert "cookie" not in response.text.lower()
 
 
+def test_webai2api_login_start_autostarts_sidecar_for_existing_worker_repair(tmp_path: Path) -> None:
+    sidecar_ready = False
+    starter_calls: list[Path] = []
+    restart_payloads: list[Any] = []
+    original_instances = [
+        {
+            "name": "chatgpt_plus_profile",
+            "userDataMark": "plus",
+            "workers": [{"name": "plus", "type": "chatgpt_text", "mergeTypes": []}],
+        }
+    ]
+
+    def starter(gateway_root: Path) -> dict[str, Any]:
+        nonlocal sidecar_ready
+        sidecar_ready = True
+        starter_calls.append(gateway_root)
+        return {"started": True, "pid": 1234}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            if not sidecar_ready:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json=original_instances, request=request)
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            return httpx.Response(200, json={"success": True}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            webai2api_sidecar_starter=starter,
+        )
+    )
+
+    response = client.post("/api/admin/webai2api/login/start", json={"providerId": "chatgpt", "newAccount": False})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert starter_calls == [tmp_path]
+    assert body["newAccount"] is False
+    assert body["workerName"] == "plus"
+    assert body["sidecarStarted"] is True
+    assert body["sidecarPid"] == 1234
+    assert restart_payloads == [{"loginMode": True, "workerName": "plus"}]
+
+
+def test_webai2api_login_start_reports_sidecar_start_failure(tmp_path: Path) -> None:
+    def starter(gateway_root: Path) -> dict[str, Any]:
+        raise RuntimeError("未找到 WebAI2API sidecar：D:\\ProjectX\\WebAI2API-sidecar")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/config/instances":
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            webai2api_sidecar_starter=starter,
+        )
+    )
+
+    response = client.post("/api/admin/webai2api/login/start", json={"providerId": "chatgpt", "newAccount": False})
+
+    assert response.status_code == 502
+    assert "未找到 WebAI2API sidecar" in response.text
+
+
 def test_webai2api_login_finish_restores_api_mode(tmp_path: Path) -> None:
     restart_payloads: list[Any] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            return httpx.Response(200, json=[], request=request)
         if request.url.path == "/admin/restart" and request.method == "POST":
             restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
             return httpx.Response(200, json={"success": True}, request=request)
@@ -12774,6 +12851,8 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/api/admin/web-auth/browser/start" in bridge_source
     assert "/api/admin/webai2api/login/start" in bridge_source
     assert "/api/admin/webai2api/login/finish" in bridge_source
+    assert "const newAccount = Boolean(options.newAccount);" in bridge_source
+    assert "options.newAccount || !workerName" not in bridge_source
     assert "新增网页账号" in bridge_source
     assert "切换并检测" in bridge_source
     assert "网页文本通路" in bridge_source

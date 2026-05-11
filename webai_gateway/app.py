@@ -5,8 +5,11 @@ from collections import OrderedDict, deque
 from datetime import datetime, timezone
 import inspect
 import json
+import os
 import re
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -192,6 +195,7 @@ def create_app(
     qwen_coder_client_factory: Any | None = None,
     native_ui_dir: str | Path | None = None,
     auto_research_fixture_dir: str | Path | None = None,
+    webai2api_sidecar_starter: Any | None = None,
     run_auth_jobs_inline: bool = False,
 ) -> FastAPI:
     config_file = Path(config_path)
@@ -212,6 +216,8 @@ def create_app(
     app.state.tool_call_registry = OrderedDict()
     app.state.media_generations = OrderedDict()
     app.state.auto_research_fixture_dir = Path(auto_research_fixture_dir) if auto_research_fixture_dir is not None else _default_auto_research_fixture_dir()
+    app.state.gateway_root = config_file.parent.resolve()
+    app.state.webai2api_sidecar_starter = webai2api_sidecar_starter
     app.state.runtime_started_at = utc_now()
     app.state.runtime_started_epoch = datetime.now(timezone.utc).timestamp()
     app.state.deepseek_ds2api_bearer_gate = None
@@ -844,6 +850,12 @@ def create_app(
         if provider.route == "direct":
             raise HTTPException(status_code=400, detail="该 Provider 使用 Gateway 直连授权，不需要 WebAI2API 登录模式")
         cfg = current_config()
+        sidecar_ready = await run_in_threadpool(_ensure_webai2api_sidecar_available, app, client, cfg)
+        if not sidecar_ready.get("available"):
+            raise HTTPException(
+                status_code=502,
+                detail=sidecar_ready.get("message") or "WebAI2API sidecar 未启动或无法连接",
+            )
         instances = _load_webai2api_instances(client, cfg)
         if not instances:
             raise HTTPException(status_code=502, detail="WebAI2API 工作池为空或不可读取，无法启动登录模式")
@@ -889,6 +901,8 @@ def create_app(
             "workerName": worker_name,
             "accountId": account_id,
             "newAccount": create_account,
+            "sidecarStarted": bool(sidecar_ready.get("started")),
+            "sidecarPid": sidecar_ready.get("pid"),
             "message": (
                 f"已为 {provider.name} 创建独立浏览器 Profile 并进入登录模式"
                 if create_account
@@ -900,6 +914,12 @@ def create_app(
     async def admin_webai2api_login_finish(request: Request) -> dict[str, Any]:
         require_local_admin(request)
         cfg = current_config()
+        sidecar_ready = await run_in_threadpool(_ensure_webai2api_sidecar_available, app, client, cfg)
+        if not sidecar_ready.get("available"):
+            raise HTTPException(
+                status_code=502,
+                detail=sidecar_ready.get("message") or "WebAI2API sidecar 未启动或无法连接",
+            )
         restarted = _restart_webai2api_api_mode(client, cfg)
         if not restarted:
             raise HTTPException(status_code=502, detail="WebAI2API 未能恢复普通 API 模式，请在缓存与重启页面手动重启")
@@ -2350,6 +2370,76 @@ def _sidecar_root_from_base_url(base_url: str) -> str:
         path = path[:-3]
     root = urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
     return root.rstrip("/")
+
+
+def _wait_for_webai2api_config_instances(
+    client: httpx.Client,
+    cfg: GatewayConfig,
+    *,
+    timeout_seconds: float = 0.0,
+) -> bool:
+    url = f"{_sidecar_root_from_base_url(cfg.upstream.base_url)}/admin/config/instances"
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            response = client.get(url, headers=upstream_headers(cfg))
+            if response.status_code == 200:
+                return True
+            if response.status_code not in {502, 503, 504}:
+                return False
+        except httpx.HTTPError:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _default_webai2api_sidecar_dir(gateway_root: Path) -> Path:
+    configured = os.environ.get("WEBAI2API_SIDECAR_DIR")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return gateway_root.parent / "WebAI2API-sidecar"
+
+
+def _start_webai2api_sidecar_process(gateway_root: Path) -> dict[str, Any]:
+    sidecar_dir = _default_webai2api_sidecar_dir(gateway_root).resolve()
+    if not (sidecar_dir / "package.json").exists():
+        raise RuntimeError(f"未找到 WebAI2API sidecar：{sidecar_dir}")
+    corepack = shutil.which("corepack.cmd") or shutil.which("corepack")
+    if not corepack:
+        raise RuntimeError("未找到 corepack，请先安装 Node.js/Corepack 后再启动 WebAI2API sidecar")
+    log_dir = gateway_root / ".webai-gateway" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with (log_dir / "webai2api-out.log").open("ab") as stdout, (log_dir / "webai2api-err.log").open("ab") as stderr:
+        process = subprocess.Popen(
+            [corepack, "pnpm", "start"],
+            cwd=sidecar_dir,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    return {"started": True, "pid": process.pid, "sidecarDir": str(sidecar_dir)}
+
+
+def _ensure_webai2api_sidecar_available(app: FastAPI, client: httpx.Client, cfg: GatewayConfig) -> dict[str, Any]:
+    if _wait_for_webai2api_config_instances(client, cfg, timeout_seconds=0.0):
+        return {"available": True, "started": False}
+    gateway_root = Path(getattr(app.state, "gateway_root", Path.cwd())).resolve()
+    starter = getattr(app.state, "webai2api_sidecar_starter", None) or _start_webai2api_sidecar_process
+    try:
+        start_result = starter(gateway_root)
+    except Exception as exc:
+        return {"available": False, "started": False, "message": str(exc)}
+    if not isinstance(start_result, dict):
+        start_result = {"started": bool(start_result)}
+    if _wait_for_webai2api_config_instances(client, cfg, timeout_seconds=45.0):
+        return {"available": True, **start_result}
+    message = start_result.get("message")
+    if not message:
+        message = "WebAI2API sidecar 已尝试启动，但 45 秒内仍无法读取工作池；请检查 .webai-gateway/logs/webai2api-err.log"
+    return {"available": False, **start_result, "message": message}
 
 
 def _safe_webai2api_name_part(value: str) -> str:
