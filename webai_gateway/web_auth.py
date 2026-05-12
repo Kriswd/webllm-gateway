@@ -655,6 +655,7 @@ class DeepSeekWebAuthService:
                 progress(message)
 
         bearer_seen = ""
+        cookie_only_notice_sent = False
         started_at = time.monotonic()
         notify("正在连接授权浏览器")
         async with async_playwright() as playwright:
@@ -691,18 +692,32 @@ class DeepSeekWebAuthService:
                     )
                 else:
                     credential = await _read_deepseek_credential(context, page, bearer_seen)
-                if credential:
+                if credential and is_credential_authorized(provider.id, credential):
                     if provider.id in QWEN_DIRECT_PROVIDER_IDS:
                         notify(f"已检测到 {provider.name} 登录态")
                     else:
                         notify(f"已捕获 {provider.name} 登录态")
                     await browser.close()
                     return credential
+                if (
+                    provider.id == "deepseek-web"
+                    and credential
+                    and credential.get("cookie")
+                    and not credential.get("bearer")
+                    and not cookie_only_notice_sent
+                ):
+                    notify("已看到 DeepSeek 登录 cookie，正在继续等待 bearer token；请保持聊天页打开，必要时刷新 chat.deepseek.com。")
+                    cookie_only_notice_sent = True
                 await asyncio.sleep(2)
 
             await browser.close()
         if provider.id in QWEN_DIRECT_PROVIDER_IDS:
             raise TimeoutError(f"等待 {provider.name} 登录态超时，请确认已经在 {provider.login_url} 登录成功后重试")
+        if provider.id == "deepseek-web":
+            raise TimeoutError(
+                "等待 DeepSeek Web bearer token 超时；请确认 chat.deepseek.com 已进入聊天页，"
+                "保持授权浏览器打开，然后点击“重新检测登录态”。"
+            )
         raise TimeoutError(f"等待 {provider.name} 登录超时，请确认网页已经登录成功后重试")
 
 

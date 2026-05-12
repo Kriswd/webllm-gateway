@@ -252,7 +252,7 @@ const selectedProviderAccountStatus = computed(() => {
     tone: 'direct',
     title: '需要授权',
     description: `点击“打开授权浏览器”完成 ${provider.name} 登录后，Gateway 会自动检测账号和模型。`,
-    note: '如果刚完成登录，请先刷新模型；如果仍为空，再重新打开授权浏览器检测登录态。',
+    note: '如果刚完成登录但还没捕获，点弹窗里的“重新检测登录态”；普通刷新只会刷新已保存结果。',
     action: '登录信息只保存在本机。',
   };
 });
@@ -497,20 +497,44 @@ async function startDirectAuth(provider) {
       window.open(browserData.loginUrl, '_blank', 'noopener,noreferrer');
     }
 
-    appendLog('正在检测网页登录状态');
-    const jobRes = await fetch('/api/admin/web-auth/jobs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: provider.id, cdpUrl: cdpUrl.value }),
-    });
-    const job = await jobRes.json();
-    if (!jobRes.ok) throw new Error(job.detail || `HTTP ${jobRes.status}`);
-    await pollAuthJob(job.id);
+    await captureDirectAuth(provider);
     message.success(`${provider.name} 授权完成`);
     await loadOnboarding();
   } catch (error) {
     actionError.value = error.message || String(error);
     appendLog(`授权失败：${actionError.value}`);
+    message.error(actionError.value);
+  } finally {
+    actionLoading.value = false;
+  }
+}
+
+async function captureDirectAuth(provider) {
+  appendLog('正在检测网页登录状态');
+  const jobRes = await fetch('/api/admin/web-auth/jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider.id, cdpUrl: cdpUrl.value }),
+  });
+  const job = await jobRes.json();
+  if (!jobRes.ok) throw new Error(job.detail || `HTTP ${jobRes.status}`);
+  await pollAuthJob(job.id);
+}
+
+async function retryDirectAuthCapture(provider = selectedProvider.value) {
+  if (!provider) return;
+  actionKind.value = 'direct';
+  actionError.value = '';
+  progressVisible.value = true;
+  actionLoading.value = true;
+  try {
+    appendLog(`正在重新检测 ${provider.name} 登录态`);
+    await captureDirectAuth(provider);
+    message.success(`${provider.name} 授权完成`);
+    await loadOnboarding();
+  } catch (error) {
+    actionError.value = error.message || String(error);
+    appendLog(`重新检测登录态失败：${actionError.value}`);
     message.error(actionError.value);
   } finally {
     actionLoading.value = false;
@@ -1278,11 +1302,11 @@ onMounted(loadOnboarding);
       </div>
       <div class="modal-actions">
         <a-button
-          :loading="actionLoading && actionKind === 'webai2api'"
-          @click="actionKind === 'webai2api' ? finishWebAI2APILogin() : loadOnboarding()"
+          :loading="actionLoading"
+          @click="actionKind === 'webai2api' ? finishWebAI2APILogin() : retryDirectAuthCapture(selectedProvider)"
         >
           <template #icon><ReloadOutlined /></template>
-          {{ actionKind === 'webai2api' ? '恢复 API 并刷新' : '刷新模型' }}
+          {{ actionKind === 'webai2api' ? '恢复 API 并刷新' : '重新检测登录态' }}
         </a-button>
         <a-button
           type="primary"

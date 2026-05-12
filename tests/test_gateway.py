@@ -13034,6 +13034,9 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "Gateway 地址" not in bridge_source
     assert "本机地址" not in bridge_source
     assert "config-grid" not in bridge_source
+    assert "retryDirectAuthCapture" in bridge_source
+    assert "重新检测登录态" in bridge_source
+    assert "actionKind === 'webai2api' ? finishWebAI2APILogin() : retryDirectAuthCapture(selectedProvider)" in bridge_source
     assert "登录 Worker" not in bridge_source
     assert "项目架构" not in bridge_source
     assert "工具桥" not in bridge_source
@@ -14341,6 +14344,89 @@ def test_qwen_coder_auth_service_captures_browser_login(monkeypatch: pytest.Monk
     assert credential["userAgent"] == "Chrome Test"
     assert seen["closed"] is True
     assert any("Qwen Coder" in item for item in progress)
+
+
+def test_deepseek_auth_service_waits_for_bearer_after_cookie_only_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {"user_calls": 0}
+
+    async def immediate_sleep(_seconds: float) -> None:
+        return None
+
+    class FakeResponse:
+        def __init__(self, token: str = "") -> None:
+            self.ok = bool(token)
+            self._token = token
+
+        async def json(self) -> dict[str, Any]:
+            return {"data": {"biz_data": {"token": self._token}}}
+
+    class FakeRequest:
+        async def get(self, url: str, headers: dict[str, str]) -> FakeResponse:
+            seen["user_calls"] += 1
+            assert url == "https://chat.deepseek.com/api/v0/users/current"
+            assert "ds_session_id=session-secret" in headers["Cookie"]
+            if seen["user_calls"] == 1:
+                return FakeResponse()
+            return FakeResponse("deepseek-bearer-secret")
+
+    class FakePage:
+        def on(self, event: str, handler: Any) -> None:
+            seen["event"] = event
+
+        async def goto(self, url: str) -> None:
+            seen["goto"] = url
+
+        async def evaluate(self, script: str) -> str:
+            return "Chrome Test"
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [FakePage()]
+            self.request = FakeRequest()
+
+        async def cookies(self, url: str) -> list[dict[str, str]]:
+            assert url == "https://chat.deepseek.com"
+            return [{"name": "ds_session_id", "value": "session-secret"}]
+
+    class FakeBrowser:
+        def __init__(self) -> None:
+            self.contexts = [FakeContext()]
+
+        async def new_context(self) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            seen["closed"] = True
+
+    class FakeChromium:
+        async def connect_over_cdp(self, cdp_url: str) -> FakeBrowser:
+            seen["cdp_url"] = cdp_url
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        async def __aenter__(self) -> Any:
+            return types.SimpleNamespace(chromium=FakeChromium())
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+    fake_async_api = types.SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    monkeypatch.setitem(sys.modules, "playwright", types.SimpleNamespace(async_api=fake_async_api))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+    monkeypatch.setattr("webai_gateway.web_auth.asyncio.sleep", immediate_sleep)
+
+    credential = asyncio.run(
+        DeepSeekWebAuthService().capture(
+            "deepseek-web",
+            "http://127.0.0.1:9222",
+            timeout_seconds=3,
+        )
+    )
+
+    assert seen["goto"] == "https://chat.deepseek.com/"
+    assert seen["user_calls"] == 2
+    assert credential["bearer"] == "deepseek-bearer-secret"
+    assert seen["closed"] is True
 
 
 class _FakeAuthService:
