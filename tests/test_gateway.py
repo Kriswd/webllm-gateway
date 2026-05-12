@@ -12915,7 +12915,11 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "新增网页账号" not in bridge_source
     assert "添加授权账号" in bridge_source
     assert "切换并检测" in bridge_source
-    assert "把网页账号变成可调用 API" in bridge_source
+    assert "把网页账号变成可工具调用的 API，实现养虾养马自由！" in bridge_source
+    assert "支持在 OpenClaw、Hermes、Claude Code、Codex 或其它兼容 OpenAI 和 Anthropic API 的客户端调用。" in bridge_source
+    assert "Gateway 地址" not in bridge_source
+    assert "本机地址" not in bridge_source
+    assert "config-grid" not in bridge_source
     assert "登录 Worker" not in bridge_source
     assert "项目架构" not in bridge_source
     assert "工具桥" not in bridge_source
@@ -12933,7 +12937,6 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/v1/images/generations" in bridge_source
     assert "gpt-image-2" in bridge_source
     assert "response_format" in bridge_source
-    assert "http://127.0.0.1:8610/v1" in bridge_source
     assert "Claude Code" in bridge_source
     assert "const configProfile = ref('cc-switch');" in bridge_source
     assert "cc-switch 专用配置" in bridge_source

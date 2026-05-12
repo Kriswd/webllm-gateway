@@ -38,7 +38,6 @@ const imageModel = ref('gpt-image-2');
 const imageGenerating = ref(false);
 const imageError = ref('');
 const imageResultUrl = ref('');
-const tokenVisible = ref(false);
 const cdpUrl = ref('http://127.0.0.1:9222');
 const configProfile = ref('cc-switch');
 const accountEditOpen = ref(false);
@@ -50,8 +49,6 @@ const accountEditForm = ref({
   note: '',
 });
 const diagnosticsOpen = ref(false);
-
-const localExampleBaseUrl = 'http://127.0.0.1:8610/v1';
 
 const onboarding = ref({
   gateway: {
@@ -77,11 +74,6 @@ const onboarding = ref({
 const gatewayBaseUrl = computed(() => `${window.location.origin}${onboarding.value.gateway?.baseUrl || '/v1'}`);
 const gatewayRootUrl = computed(() => gatewayBaseUrl.value.replace(/\/v1\/?$/, ''));
 const gatewayToken = computed(() => onboarding.value.gateway?.apiKey || '');
-const maskedToken = computed(() => {
-  if (!gatewayToken.value) return '未配置';
-  if (tokenVisible.value) return gatewayToken.value;
-  return `${gatewayToken.value.slice(0, 7)}...${gatewayToken.value.slice(-6)}`;
-});
 
 const providerPriority = ['deepseek-web', 'qwen', 'qwen-coder', 'chatgpt'];
 const providers = computed(() => {
@@ -803,22 +795,6 @@ function openAdvanced(path) {
   window.location.href = path;
 }
 
-function rotateToken() {
-  Modal.confirm({
-    title: '重新生成网关令牌？',
-    content: '旧令牌会立即失效，需要同步更新 KrisAI、OpenClaw、Hermes 或 Claude Code 里的 API Key。',
-    okText: '重新生成',
-    cancelText: '取消',
-    async onOk() {
-      const res = await fetch('/api/admin/token/rotate', { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-      message.success('网关令牌已更新');
-      await loadOnboarding();
-    },
-  });
-}
-
 watch(selectedProviderId, () => {
   modelScope.value = 'selected';
 });
@@ -831,8 +807,8 @@ onMounted(loadOnboarding);
     <section class="hero-panel">
       <div class="hero-copy">
         <a-tag color="blue">Local WebAI Access</a-tag>
-        <h1>把网页账号变成可调用 API</h1>
-        <p>登录网页账号，自动检测可用模型，然后把地址、Key 和模型填到 KrisAI、Claude Code 或其它客户端里。</p>
+        <h1>把网页账号变成可工具调用的 API，实现养虾养马自由！</h1>
+        <p>登录网页账号，自动检测可用模型，支持在 OpenClaw、Hermes、Claude Code、Codex 或其它兼容 OpenAI 和 Anthropic API 的客户端调用。</p>
         <div class="hero-actions">
           <a-button type="primary" size="large" :loading="actionLoading" @click="handleStartLogin">
             <template #icon><LoginOutlined /></template>
@@ -1197,32 +1173,9 @@ onMounted(loadOnboarding);
         <div class="panel-heading compact">
           <div>
             <h2>接入客户端</h2>
-            <p>把下面三项复制到客户端：API 地址、API Key 和模型 ID。</p>
+            <p>按客户端类型复制配置，填入兼容 OpenAI 或 Anthropic API 的客户端即可调用。</p>
           </div>
           <ApiOutlined />
-        </div>
-
-        <div class="config-grid">
-          <div class="config-item">
-            <span>Gateway 地址</span>
-            <a-typography-text copyable>{{ gatewayBaseUrl }}</a-typography-text>
-          </div>
-          <div class="config-item">
-            <span>本机地址</span>
-            <a-typography-text copyable>{{ localExampleBaseUrl }}</a-typography-text>
-          </div>
-          <div class="config-item token-item">
-            <span>API Key</span>
-            <strong>{{ maskedToken }}</strong>
-            <a-space>
-              <a-button size="small" @click="tokenVisible = !tokenVisible">{{ tokenVisible ? '隐藏' : '显示' }}</a-button>
-              <a-button size="small" @click="copyText(gatewayToken, 'API Key 已复制')">
-                <template #icon><CopyOutlined /></template>
-                复制
-              </a-button>
-              <a-button size="small" danger @click="rotateToken">重新生成</a-button>
-            </a-space>
-          </div>
         </div>
 
         <div class="code-header">
@@ -1401,7 +1354,6 @@ onMounted(loadOnboarding);
 
 .stat-item span,
 .detail-row span,
-.config-item span,
 .field-block label {
   color: var(--muted);
   display: block;
@@ -1769,33 +1721,6 @@ onMounted(loadOnboarding);
   overflow-wrap: anywhere;
 }
 
-.config-grid {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin-bottom: 16px;
-}
-
-.config-item {
-  background: var(--soft);
-  border: 1px solid #e2ece9;
-  border-radius: 8px;
-  min-width: 0;
-  padding: 12px;
-}
-
-.config-item strong,
-.config-item :deep(.ant-typography) {
-  display: block;
-  margin-top: 6px;
-  overflow-wrap: anywhere;
-}
-
-.token-item {
-  display: grid;
-  gap: 8px;
-}
-
 .code-header {
   align-items: center;
   display: flex;
@@ -1844,8 +1769,7 @@ onMounted(loadOnboarding);
 @media (max-width: 980px) {
   .hero-panel,
   .workspace-grid,
-  .media-test-grid,
-  .config-grid {
+  .media-test-grid {
     grid-template-columns: 1fr;
   }
 }
