@@ -1200,7 +1200,11 @@ def create_app(
         if not parsed_account.instance_name or not parsed_account.worker_name:
             return False
         active_provider_workers: list[tuple[str, str]] = []
-        provider_dict = {"adapters": list(getattr(provider, "adapters", ()))}
+        provider_dict = {
+            "id": getattr(provider, "id", ""),
+            "loginUrl": getattr(provider, "login_url", ""),
+            "adapters": list(getattr(provider, "adapters", ())),
+        }
         for instance in instances:
             if not isinstance(instance, dict):
                 continue
@@ -1212,7 +1216,16 @@ def create_app(
                 worker_name = str(worker.get("name") or "")
                 if instance_name and worker_name:
                     active_provider_workers.append((instance_name, worker_name))
-        return active_provider_workers == [(parsed_account.instance_name, parsed_account.worker_name)]
+        if active_provider_workers != [(parsed_account.instance_name, parsed_account.worker_name)]:
+            return False
+        return _webai2api_runtime_instance_loaded(provider_dict, parsed_account.instance_name)
+
+    def _webai2api_runtime_instance_loaded(provider: dict[str, Any], instance_name: str) -> bool:
+        domains = _webai2api_auth_domains(provider)
+        if not domains:
+            return True
+        cookie_names = _load_webai2api_cookie_names(client, current_config(), instance_name, domains[0])
+        return cookie_names is not None
 
     def _sync_webai2api_selected_account(provider: Any, parsed_account: Any) -> None:
         if not parsed_account.instance_name or not parsed_account.worker_name:

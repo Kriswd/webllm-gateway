@@ -12192,6 +12192,71 @@ def test_onboarding_marks_google_flow_authorized_from_google_account_cookies_and
     assert chat_calls == []
 
 
+def test_account_model_validation_restarts_when_selected_webai2api_worker_is_not_loaded(tmp_path: Path) -> None:
+    runtime_worker_ready = False
+    posted_instances: list[Any] = []
+    restart_payloads: list[Any] = []
+    chat_calls: list[str] = []
+    instances = [
+        {
+            "name": "flow_profile",
+            "workers": [{"name": "flow", "type": "google_flow", "mergeTypes": []}],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal runtime_worker_ready
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"object": "list", "data": []}, request=request)
+        if request.url.path == "/admin/config/instances" and request.method == "GET":
+            return httpx.Response(200, json=instances, request=request)
+        if request.url.path == "/admin/config/instances" and request.method == "POST":
+            posted_instances.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/admin/restart" and request.method == "POST":
+            restart_payloads.append(json.loads(request.content.decode("utf-8") or "{}"))
+            runtime_worker_ready = True
+            return httpx.Response(200, json={"success": True}, request=request)
+        if request.url.path == "/v1/cookies":
+            if not runtime_worker_ready:
+                return httpx.Response(
+                    500,
+                    json={"error": {"message": "浏览器实例不存在: flow_profile"}},
+                    request=request,
+                )
+            return httpx.Response(200, json={"cookies": [{"name": "__Secure-1PSID", "value": "ok"}]}, request=request)
+        if request.url.path == "/v1/chat/completions":
+            chat_calls.append(json.loads(request.content.decode("utf-8"))["model"])
+            return httpx.Response(500, json={"error": {"message": "media probe should not use chat"}}, request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    client = TestClient(
+        create_app(
+            config=replace(_config(), upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant")),
+            config_path=tmp_path / "config.json",
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+    account_id = webai2api_account_id("google-flow", "flow_profile", "flow")
+
+    response = client.post(
+        "/api/admin/accounts/validate",
+        json={
+            "providerId": "google-flow",
+            "accountId": account_id,
+            "modelIds": ["gemini-3-pro-image-preview"],
+            "force": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["validation"]["gemini-3-pro-image-preview"]["status"] == "available"
+    assert restart_payloads == [{"loginMode": False}]
+    assert posted_instances
+    assert chat_calls == []
+
+
 def test_onboarding_returns_claude_code_connection_profiles_for_web_providers(tmp_path: Path) -> None:
     store = CredentialStore(tmp_path / "credentials")
     store.save(
