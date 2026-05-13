@@ -8005,7 +8005,7 @@ def _is_file_discovery_alias(name: str) -> bool:
 
 def _is_directory_listing_alias(name: str) -> bool:
     compact = re.sub(r"[^a-z0-9]+", "", (name or "").strip().lower())
-    return compact in {"dir", "ls", "list", "listdir", "listdirectory", "tree"}
+    return compact in {"dir", "ls", "list", "listdir", "listdirectory", "listfiles", "tree"}
 
 
 def _normalized_directory_listing_input(input_value: dict[str, Any]) -> dict[str, Any]:
@@ -8130,10 +8130,14 @@ def _shell_tool_command_error(call: ToolCallDraft, canonical_name: str, context:
     shell_tool = _tool_by_name(context.tools, canonical_name) or _tool_by_name(list(context.hidden_tools), canonical_name)
     if not _is_shell_execution_tool(shell_tool, canonical_name):
         return None
-    if _allows_ds2api_style_shell_passthrough(context):
-        return None
     command_key = _shell_command_key(shell_tool) if shell_tool else "command"
     command = call.input.get(command_key)
+    if _allows_ds2api_style_shell_passthrough(context):
+        if isinstance(command, str) and command.strip():
+            readonly_review_error = _unsafe_readonly_review_shell_command_error(command, context)
+            if readonly_review_error:
+                return readonly_review_error
+        return None
     if not isinstance(command, str) or not command.strip():
         return BridgeError("incomplete_shell_command", "Shell command is empty; provide a complete command string.", repairable=True)
     return (

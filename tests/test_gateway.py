@@ -3748,6 +3748,39 @@ def test_tool_bridge_accepts_mutating_bash_call_like_ds2api_when_declared() -> N
     assert result.tool_calls[0].input == {"command": "pip install pytest pytest-cov && pytest"}
 
 
+def test_tool_bridge_all_profile_blocks_python_script_for_readonly_review_task() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+    context = prefer_local_tools_for_local_agent_task(
+        context,
+        [{"role": "user", "content": "你熟悉下当前项目代码并给出详细的改进计划"}],
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"Bash","input":{"command":"python3 /d/ProjectX/mindcraft/fetch_wechat.py"}}]}\n```',
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is not None
+    assert result.error.kind == "unsafe_review_shell_command"
+
+
 def test_openai_tool_controller_recovers_repeated_off_task_scope_question() -> None:
     requests: list[dict[str, Any]] = []
     off_task_question = (
@@ -8453,6 +8486,36 @@ def test_tool_bridge_uses_readonly_budget_for_safe_shell_discovery_batch() -> No
     assert result.error is None
     assert [call.name for call in result.tool_calls] == ["Read", "Read", "Bash", "Glob", "Grep"]
     assert result.tool_calls[2].input["command"].startswith("find /d/ProjectX/mindcraft")
+
+
+def test_tool_bridge_maps_list_files_alias_to_glob_directory_listing() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Glob",
+                    "description": "Find files by pattern.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+                        "required": ["pattern"],
+                    },
+                },
+            }
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    result = parse_tool_response(
+        '```tool_json\n{"calls":[{"id":"call_1","name":"list_files","input":{"path":"."}}]}\n```',
+        context,
+    )
+
+    assert result.error is None
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        ("call_1", "Glob", {"pattern": "*", "path": "."})
+    ]
 
 
 def test_anthropic_tool_bridge_normalizes_provider_search_markup_to_allowed_search_tool() -> None:
