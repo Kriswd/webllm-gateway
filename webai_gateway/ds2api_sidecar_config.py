@@ -18,6 +18,10 @@ def build_ds2api_sidecar_config(config: GatewayConfig) -> dict[str, Any]:
             "global_max_inflight": global_max_inflight,
             "account_max_inflight": account_max_inflight,
         },
+        "current_input_file": {
+            "enabled": bool(config.provider_runtime.deepseek_ds2api_current_input_file_enabled),
+            "min_chars": max(0, int(config.provider_runtime.deepseek_ds2api_current_input_file_min_chars)),
+        },
     }
 
 

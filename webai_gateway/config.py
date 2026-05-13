@@ -34,6 +34,8 @@ DEFAULT_DEEPSEEK_DS2API_ACCOUNT_MAX_INFLIGHT = 2
 DEFAULT_DEEPSEEK_DS2API_GLOBAL_MAX_INFLIGHT = 4
 DEFAULT_DEEPSEEK_DS2API_BEARER_MAX_INFLIGHT = 1
 DEFAULT_DEEPSEEK_DS2API_RATE_LIMIT_COOLDOWN_SECONDS = 6.0
+DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_ENABLED = False
+DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_MIN_CHARS = 0
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ class ProviderRuntimeConfig:
     deepseek_ds2api_global_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_GLOBAL_MAX_INFLIGHT
     deepseek_ds2api_bearer_max_inflight: int = DEFAULT_DEEPSEEK_DS2API_BEARER_MAX_INFLIGHT
     deepseek_ds2api_rate_limit_cooldown_seconds: float = DEFAULT_DEEPSEEK_DS2API_RATE_LIMIT_COOLDOWN_SECONDS
+    deepseek_ds2api_current_input_file_enabled: bool = DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_ENABLED
+    deepseek_ds2api_current_input_file_min_chars: int = DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_MIN_CHARS
     qwen_web_backend: str = "direct"
     gpt_thinking_backend: str = "webai2api"
 
@@ -163,6 +167,25 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
         minimum=0.0,
         maximum=300.0,
     )
+    deepseek_ds2api_current_input_file_enabled = _bool_value(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiCurrentInputFileEnabled",
+            "deepseek_ds2api_current_input_file_enabled",
+            default=default_provider_runtime.deepseek_ds2api_current_input_file_enabled,
+        )
+    )
+    deepseek_ds2api_current_input_file_min_chars = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiCurrentInputFileMinChars",
+            "deepseek_ds2api_current_input_file_min_chars",
+            default=default_provider_runtime.deepseek_ds2api_current_input_file_min_chars,
+        ),
+        default=default_provider_runtime.deepseek_ds2api_current_input_file_min_chars,
+        minimum=0,
+        maximum=100_000_000,
+    )
     allowed_tool_names = tool_bridge_raw.get("allowedToolNames", tool_bridge_raw.get("allowed_tool_names", ()))
     if not isinstance(allowed_tool_names, list):
         allowed_tool_names = []
@@ -205,6 +228,8 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
             deepseek_ds2api_global_max_inflight=deepseek_ds2api_global_max_inflight,
             deepseek_ds2api_bearer_max_inflight=deepseek_ds2api_bearer_max_inflight,
             deepseek_ds2api_rate_limit_cooldown_seconds=deepseek_ds2api_rate_limit_cooldown_seconds,
+            deepseek_ds2api_current_input_file_enabled=deepseek_ds2api_current_input_file_enabled,
+            deepseek_ds2api_current_input_file_min_chars=deepseek_ds2api_current_input_file_min_chars,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend") or provider_runtime_raw.get("qwen_web_backend") or "direct"
             ),
@@ -256,6 +281,8 @@ def config_to_public(config: GatewayConfig) -> dict[str, Any]:
             "deepseekDs2apiGlobalMaxInflight": config.provider_runtime.deepseek_ds2api_global_max_inflight,
             "deepseekDs2apiBearerMaxInflight": config.provider_runtime.deepseek_ds2api_bearer_max_inflight,
             "deepseekDs2apiRateLimitCooldownSeconds": config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
+            "deepseekDs2apiCurrentInputFileEnabled": config.provider_runtime.deepseek_ds2api_current_input_file_enabled,
+            "deepseekDs2apiCurrentInputFileMinChars": config.provider_runtime.deepseek_ds2api_current_input_file_min_chars,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
@@ -302,6 +329,8 @@ def config_to_admin(config: GatewayConfig) -> dict[str, Any]:
             "deepseekDs2apiGlobalMaxInflight": config.provider_runtime.deepseek_ds2api_global_max_inflight,
             "deepseekDs2apiBearerMaxInflight": config.provider_runtime.deepseek_ds2api_bearer_max_inflight,
             "deepseekDs2apiRateLimitCooldownSeconds": config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds,
+            "deepseekDs2apiCurrentInputFileEnabled": config.provider_runtime.deepseek_ds2api_current_input_file_enabled,
+            "deepseekDs2apiCurrentInputFileMinChars": config.provider_runtime.deepseek_ds2api_current_input_file_min_chars,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
         },
@@ -388,6 +417,25 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
         minimum=0.0,
         maximum=300.0,
     )
+    deepseek_ds2api_current_input_file_enabled = _bool_value(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiCurrentInputFileEnabled",
+            "deepseek_ds2api_current_input_file_enabled",
+            default=config.provider_runtime.deepseek_ds2api_current_input_file_enabled,
+        )
+    )
+    deepseek_ds2api_current_input_file_min_chars = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "deepseekDs2apiCurrentInputFileMinChars",
+            "deepseek_ds2api_current_input_file_min_chars",
+            default=config.provider_runtime.deepseek_ds2api_current_input_file_min_chars,
+        ),
+        default=config.provider_runtime.deepseek_ds2api_current_input_file_min_chars,
+        minimum=0,
+        maximum=100_000_000,
+    )
     allowed_tool_names = (
         tool_bridge_raw.get("allowedToolNames")
         if "allowedToolNames" in tool_bridge_raw
@@ -458,6 +506,8 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
             deepseek_ds2api_global_max_inflight=deepseek_ds2api_global_max_inflight,
             deepseek_ds2api_bearer_max_inflight=deepseek_ds2api_bearer_max_inflight,
             deepseek_ds2api_rate_limit_cooldown_seconds=deepseek_ds2api_rate_limit_cooldown_seconds,
+            deepseek_ds2api_current_input_file_enabled=deepseek_ds2api_current_input_file_enabled,
+            deepseek_ds2api_current_input_file_min_chars=deepseek_ds2api_current_input_file_min_chars,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend")
                 if "qwenWebBackend" in provider_runtime_raw

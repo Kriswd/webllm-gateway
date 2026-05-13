@@ -13539,6 +13539,8 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "deepseekDs2apiGlobalMaxInflight" in index_response.text
     assert "deepseekDs2apiBearerMaxInflight" in index_response.text
     assert "deepseekDs2apiRateLimitCooldownSeconds" in index_response.text
+    assert "deepseekDs2apiCurrentInputFileEnabled" in index_response.text
+    assert "deepseekDs2apiCurrentInputFileMinChars" in index_response.text
     assert "qwenWebBackendSelect" in index_response.text
     assert "gptThinkingBackendSelect" in index_response.text
     assert "responseLanguage" in script_response.text
@@ -13547,6 +13549,8 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "deepseekDs2apiGlobalMaxInflight" in script_response.text
     assert "deepseekDs2apiBearerMaxInflight" in script_response.text
     assert "deepseekDs2apiRateLimitCooldownSeconds" in script_response.text
+    assert "deepseekDs2apiCurrentInputFileEnabled" in script_response.text
+    assert "deepseekDs2apiCurrentInputFileMinChars" in script_response.text
     assert "qwenWebBackend" in script_response.text
     assert "gptThinkingBackend" in script_response.text
     assert "providerRuntime" in script_response.text
@@ -13643,6 +13647,8 @@ def test_provider_runtime_deepseek_ds2api_concurrency_round_trips_config(tmp_pat
                 "deepseekDs2apiGlobalMaxInflight": 6,
                 "deepseekDs2apiBearerMaxInflight": 1,
                 "deepseekDs2apiRateLimitCooldownSeconds": 7,
+                "deepseekDs2apiCurrentInputFileEnabled": True,
+                "deepseekDs2apiCurrentInputFileMinChars": 12345,
             }
         },
     )
@@ -13653,21 +13659,29 @@ def test_provider_runtime_deepseek_ds2api_concurrency_round_trips_config(tmp_pat
     assert body["deepseekDs2apiGlobalMaxInflight"] == 6
     assert body["deepseekDs2apiBearerMaxInflight"] == 1
     assert body["deepseekDs2apiRateLimitCooldownSeconds"] == 7.0
+    assert body["deepseekDs2apiCurrentInputFileEnabled"] is True
+    assert body["deepseekDs2apiCurrentInputFileMinChars"] == 12345
     saved = json.loads(config_path.read_text(encoding="utf-8"))["providerRuntime"]
     assert saved["deepseekDs2apiAccountMaxInflight"] == 3
     assert saved["deepseekDs2apiGlobalMaxInflight"] == 6
     assert saved["deepseekDs2apiBearerMaxInflight"] == 1
     assert saved["deepseekDs2apiRateLimitCooldownSeconds"] == 7.0
+    assert saved["deepseekDs2apiCurrentInputFileEnabled"] is True
+    assert saved["deepseekDs2apiCurrentInputFileMinChars"] == 12345
     loaded = load_config(config_path)
     assert loaded.provider_runtime.deepseek_ds2api_account_max_inflight == 3
     assert loaded.provider_runtime.deepseek_ds2api_global_max_inflight == 6
     assert loaded.provider_runtime.deepseek_ds2api_bearer_max_inflight == 1
     assert loaded.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds == 7.0
+    assert loaded.provider_runtime.deepseek_ds2api_current_input_file_enabled is True
+    assert loaded.provider_runtime.deepseek_ds2api_current_input_file_min_chars == 12345
     health = client.get("/health", headers=_headers()).json()["config"]["providerRuntime"]
     assert health["deepseekDs2apiAccountMaxInflight"] == 3
     assert health["deepseekDs2apiGlobalMaxInflight"] == 6
     assert health["deepseekDs2apiBearerMaxInflight"] == 1
     assert health["deepseekDs2apiRateLimitCooldownSeconds"] == 7.0
+    assert health["deepseekDs2apiCurrentInputFileEnabled"] is True
+    assert health["deepseekDs2apiCurrentInputFileMinChars"] == 12345
 
 
 def test_deepseek_ds2api_sidecar_config_uses_provider_runtime_concurrency() -> None:
@@ -13686,6 +13700,22 @@ def test_deepseek_ds2api_sidecar_config_uses_provider_runtime_concurrency() -> N
     assert sidecar["accounts"] == []
     assert sidecar["runtime"]["account_max_inflight"] == 3
     assert sidecar["runtime"]["global_max_inflight"] == 6
+    assert sidecar["current_input_file"] == {"enabled": False, "min_chars": 0}
+
+
+def test_deepseek_ds2api_sidecar_config_can_enable_current_input_file() -> None:
+    from webai_gateway.ds2api_sidecar_config import build_ds2api_sidecar_config
+
+    sidecar = build_ds2api_sidecar_config(
+        GatewayConfig(
+            provider_runtime=ProviderRuntimeConfig(
+                deepseek_ds2api_current_input_file_enabled=True,
+                deepseek_ds2api_current_input_file_min_chars=12345,
+            )
+        )
+    )
+
+    assert sidecar["current_input_file"] == {"enabled": True, "min_chars": 12345}
 
 
 def test_start_script_uses_configured_ds2api_concurrency() -> None:

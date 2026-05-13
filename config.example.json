@@ -20,6 +20,8 @@
     "deepseekDs2apiGlobalMaxInflight": 4,
     "deepseekDs2apiBearerMaxInflight": 1,
     "deepseekDs2apiRateLimitCooldownSeconds": 6,
+    "deepseekDs2apiCurrentInputFileEnabled": false,
+    "deepseekDs2apiCurrentInputFileMinChars": 0,
     "qwenWebBackend": "direct",
     "gptThinkingBackend": "webai2api"
   },
