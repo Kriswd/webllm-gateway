@@ -6637,11 +6637,145 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
             return [], soft_non_progress_errors[0]
         return [], BridgeError("empty_tool_call", "工具调用为空")
     max_calls = context.options.max_calls_per_turn
-    if all(specs_by_name.get(call.name, ToolSpec(call.name, "", {}, False)).read_only for call in out):
+    if all(_tool_call_uses_readonly_budget(call, specs_by_name, context) for call in out):
         max_calls = context.options.max_readonly_calls_per_turn
     if len(out) > max_calls:
         return [], BridgeError("too_many_tool_calls", f"本轮工具调用过多：{len(out)} > {max_calls}")
     return out, None
+
+
+def _tool_call_uses_readonly_budget(
+    call: ToolCallDraft,
+    specs_by_name: dict[str, ToolSpec],
+    context: ToolBridgeContext,
+) -> bool:
+    spec = specs_by_name.get(call.name) or ToolSpec(call.name, "", {"type": "object"}, False)
+    if _is_profile_readonly_tool(spec, context.options):
+        return True
+    return _shell_tool_call_uses_readonly_budget(call, spec, context)
+
+
+def _shell_tool_call_uses_readonly_budget(
+    call: ToolCallDraft,
+    spec: ToolSpec,
+    context: ToolBridgeContext,
+) -> bool:
+    shell_tool = spec if _is_shell_execution_tool(spec, call.name) else _tool_by_name(context.tools, call.name)
+    if not _is_shell_execution_tool(shell_tool, call.name):
+        return False
+    command_key = _shell_command_key(shell_tool) if shell_tool else "command"
+    command = call.input.get(command_key)
+    if not isinstance(command, str) or not command.strip():
+        return False
+    normalized = _normalize_windows_paths_for_bash(_normalize_shell_command_syntax(command))
+    if (
+        _invalid_shell_dialect_error(normalized, call.name)
+        or _invalid_shell_command_artifact_error(normalized)
+        or _incomplete_shell_command_error(normalized)
+        or _shell_command_has_high_risk_segment(normalized)
+        or _unsafe_contextual_shell_command_error(normalized, context)
+    ):
+        return False
+    return _is_readonly_inspection_shell_command(normalized)
+
+
+def _is_readonly_inspection_shell_command(command: str) -> bool:
+    if "||" in (command or ""):
+        return False
+    segments = [segment.strip() for segment in _SHELL_COMMAND_SPLIT_RE.split(command or "") if segment.strip()]
+    if not segments:
+        return False
+    for segment in segments:
+        if _shell_segment_has_unsafe_readonly_budget_metacharacters(segment):
+            return False
+        words = _shell_words(segment)
+        if not words:
+            return False
+        if "|" in segment and "|" not in words:
+            return False
+        pipeline_chunks = _split_shell_pipeline_words(words)
+        if not pipeline_chunks:
+            return False
+        for pipeline_words in pipeline_chunks:
+            if not _is_readonly_inspection_shell_segment(pipeline_words):
+                return False
+    return True
+
+
+def _split_shell_pipeline_words(words: list[str]) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        if word == "|":
+            if not current:
+                return []
+            chunks.append(current)
+            current = []
+        else:
+            current.append(word)
+    if not current:
+        return []
+    chunks.append(current)
+    return chunks
+
+
+def _shell_segment_has_unsafe_readonly_budget_metacharacters(segment: str) -> bool:
+    if re.search(r"(?<!\\)(?:`|\$\()", segment or ""):
+        return True
+    words = _shell_words(segment)
+    return any(word in {"&", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>"} for word in words)
+
+
+def _is_readonly_inspection_shell_segment(words: list[str]) -> bool:
+    if not words:
+        return False
+    lowered_words = [word.lower() for word in words]
+    if _has_shell_output_redirection(lowered_words):
+        return False
+    if _is_cd_shell_segment(words) or _is_readonly_git_shell_segment(words):
+        return True
+    command = lowered_words[0]
+    if command in {"ls", "dir", "pwd", "tree"}:
+        return True
+    if command in {"find", "gfind"}:
+        return _is_readonly_find_shell_segment(lowered_words)
+    if command in {"rg", "grep", "egrep", "fgrep"}:
+        return _is_readonly_search_shell_segment(lowered_words)
+    if command in {"cat", "head", "tail", "wc", "sort", "uniq"}:
+        return _is_readonly_filter_shell_segment(lowered_words)
+    if command in {
+        "get-childitem",
+        "gci",
+        "get-content",
+        "gc",
+        "select-string",
+        "sls",
+        "select-object",
+        "sort-object",
+        "measure-object",
+    }:
+        return True
+    return False
+
+
+def _is_readonly_find_shell_segment(lowered_words: list[str]) -> bool:
+    blocked = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprint0", "-fprintf"}
+    return not any(word in blocked or any(word.startswith(f"{flag}=") for flag in blocked) for word in lowered_words[1:])
+
+
+def _is_readonly_search_shell_segment(lowered_words: list[str]) -> bool:
+    blocked_prefixes = ("--pre=",)
+    blocked = {"--pre"}
+    return not any(word in blocked or word.startswith(blocked_prefixes) for word in lowered_words[1:])
+
+
+def _is_readonly_filter_shell_segment(lowered_words: list[str]) -> bool:
+    command = lowered_words[0]
+    if command == "sort":
+        return not any(word == "-o" or word.startswith("--output") for word in lowered_words[1:])
+    if command == "tail":
+        return not any(word in {"-f", "--follow"} or word.startswith("--follow=") for word in lowered_words[1:])
+    return True
 
 
 def _hidden_local_agent_shell_tool_error(name: str, context: ToolBridgeContext) -> BridgeError | None:

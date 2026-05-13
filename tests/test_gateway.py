@@ -8373,6 +8373,88 @@ def test_anthropic_tool_bridge_allows_code_review_batch_read_calls() -> None:
     assert [block["name"] for block in body["content"]] == ["Read"] * 9
 
 
+def test_tool_bridge_uses_readonly_budget_for_safe_shell_discovery_batch() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read files",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Glob",
+                    "description": "Find files by pattern",
+                    "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Grep",
+                    "description": "Search file contents",
+                    "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                },
+            },
+        ],
+        ToolBridgeConfig(
+            exposure_policy="all",
+            tool_profile="all",
+            max_calls_per_turn=4,
+            max_readonly_calls_per_turn=32,
+        ),
+    )
+    calls = {
+        "calls": [
+            {"id": "call_1", "name": "Read", "input": {"file_path": "/d/ProjectX/mindcraft/CLAUDE.md"}},
+            {
+                "id": "call_2",
+                "name": "Read",
+                "input": {"file_path": "/d/ProjectX/mindcraft/CONFIGURATION.md"},
+            },
+            {
+                "id": "call_3",
+                "name": "Bash",
+                "input": {
+                    "command": (
+                        'find /d/ProjectX/mindcraft -type f -name "*.py" '
+                        '! -path "*/.venv/*" ! -path "*/.test_venv/*" '
+                        '! -path "*/__pycache__/*" | sort'
+                    )
+                },
+            },
+            {"id": "call_4", "name": "Glob", "input": {"path": "/d/ProjectX/mindcraft", "pattern": "*.md"}},
+            {"id": "call_5", "name": "Grep", "input": {"path": "/d/ProjectX/mindcraft", "pattern": "config"}},
+        ]
+    }
+
+    result = parse_tool_response(f"```tool_json\n{json.dumps(calls, ensure_ascii=False)}\n```", context)
+
+    assert result.error is None
+    assert [call.name for call in result.tool_calls] == ["Read", "Read", "Bash", "Glob", "Grep"]
+    assert result.tool_calls[2].input["command"].startswith("find /d/ProjectX/mindcraft")
+
+
 def test_anthropic_tool_bridge_normalizes_provider_search_markup_to_allowed_search_tool() -> None:
     seen: dict[str, Any] = {}
 
