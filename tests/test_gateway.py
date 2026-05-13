@@ -446,6 +446,47 @@ def test_tool_bridge_accepts_ds2api_canonical_xml_tool_calls() -> None:
     assert [(call.name, call.input) for call in result.tool_calls] == [("Read", {"file_path": "README.md"})]
 
 
+def test_tool_bridge_extracts_direct_tool_xml_tags_from_local_agent_text() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "TaskCreate",
+                    "description": "Track a task",
+                    "parameters": {"type": "object"},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            },
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+
+    result = parse_tool_response(
+        "我将对 Mindcraft 项目进行代码审计。首先，让我了解项目的整体结构和关键文件。\n"
+        "<task_create><description>Code audit for Mindcraft project</description><status>in_progress</status></task_create>\n"
+        '<bash><command>find /d/ProjectX/mindcraft -type f -name "*.py" | head -30</command></bash>',
+        context,
+    )
+
+    assert result.error is None
+    assert result.content == ""
+    assert [(call.name, call.input) for call in result.tool_calls] == [
+        ("Bash", {"command": 'find /d/ProjectX/mindcraft -type f -name "*.py" | head -30'}),
+    ]
+
+
 def test_tool_bridge_accepts_ds2api_full_width_pipe_alias() -> None:
     context = _controller_context_with_tools(["Read"])
 
@@ -11031,6 +11072,78 @@ def test_anthropic_messages_streams_batch_readonly_tool_events_for_qwen_web(tmp_
     assert {event["content_block"]["name"] for event in tool_starts} == {"Glob"}
     assert not any(
         event.get("delta", {}).get("type") == "text_delta" and "\"calls\"" in event["delta"].get("text", "")
+        for event in events
+    )
+    assert events[-2]["delta"]["stop_reason"] == "tool_use"
+
+
+def test_anthropic_messages_streams_direct_tool_xml_tags_for_qwen_web(tmp_path: Path) -> None:
+    class DirectXmlQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            assert payload["model"] == "qwen-web/qwen3.6-plus"
+            return _openai_response(
+                "我将对 Mindcraft 项目进行代码审计。首先，让我了解项目的整体结构和关键文件。\n"
+                "<task_create><description>Code audit for Mindcraft project</description><status>in_progress</status></task_create>\n"
+                '<bash><command>find /d/ProjectX/mindcraft -type f -name "*.py" | head -30</command></bash>'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=DirectXmlQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [{"role": "user", "content": "先代码审计吧"}],
+            "tools": [
+                {"name": "TaskCreate", "description": "Track progress", "input_schema": {"type": "object"}},
+                {
+                    "name": "Bash",
+                    "description": "Run shell",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            ],
+            "max_tokens": 1024,
+            "stream": True,
+        },
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    events = _sse_events(body)
+    tool_starts = [
+        event
+        for event in events
+        if event["_event"] == "content_block_start" and event["content_block"]["type"] == "tool_use"
+    ]
+    assert [(event["content_block"]["name"], event["content_block"]["input"]) for event in tool_starts] == [
+        ("Bash", {})
+    ]
+    assert any(
+        event.get("delta") == {
+            "type": "input_json_delta",
+            "partial_json": '{"command":"find /d/ProjectX/mindcraft -type f -name \\"*.py\\" | head -30"}',
+        }
         for event in events
     )
     assert events[-2]["delta"]["stop_reason"] == "tool_use"

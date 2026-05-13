@@ -2785,6 +2785,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
 
     candidates: list[Any] = []
     unfenced_raw = _without_fenced_code_blocks(raw)
+    direct_tool_marker_seen = _has_direct_tool_tag_syntax(unfenced_raw, context)
     marker_seen = bool(
         _FENCED_TOOL_RE.search(raw)
         or _INCOMPLETE_FENCED_TOOL_RE.search(raw)
@@ -2792,6 +2793,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
         or _XML_TOOL_RE.search(raw)
         or _has_dsml_tool_call_syntax(raw)
         or _looks_like_ds2api_xml_tool_markup(unfenced_raw)
+        or direct_tool_marker_seen
         or _LEGACY_FUNCTION_CALLS_RE.search(raw)
         or _TOOL_CODE_RE.search(raw)
     )
@@ -2821,6 +2823,13 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
         if xml_function_candidates:
             candidates.extend(xml_function_candidates)
             used_xml_function_equals = True
+            malformed_seen = False
+    used_direct_tool_tags = False
+    if not candidates:
+        direct_tool_tag_candidates = _extract_direct_tool_tag_candidates(raw, context)
+        if direct_tool_tag_candidates:
+            candidates.extend(direct_tool_tag_candidates)
+            used_direct_tool_tags = True
             malformed_seen = False
     stripped = raw.strip()
     used_bare = False
@@ -3160,6 +3169,7 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
         or marker_seen
         or used_dsml_tool_calls
         or used_xml_function_equals
+        or used_direct_tool_tags
         or used_summary
         or used_legacy_function_calls
         or used_tool_code
@@ -4419,6 +4429,146 @@ def _extract_xml_function_equals_candidates(text: str) -> list[dict[str, Any]]:
                 }
             )
     return candidates
+
+
+def _has_direct_tool_tag_syntax(text: str, context: ToolBridgeContext) -> bool:
+    if not context.allowed_names:
+        return False
+    lookup = _direct_tool_tag_lookup(context)
+    if not lookup:
+        return False
+    for match in _XML_CHILD_START_RE.finditer(text or ""):
+        tag = str(match.group("tag") or "")
+        if _compact_tool_name(tag) in lookup:
+            return True
+    return False
+
+
+def _extract_direct_tool_tag_candidates(text: str, context: ToolBridgeContext) -> list[dict[str, Any]]:
+    lookup = _direct_tool_tag_lookup(context)
+    if not lookup:
+        return []
+    raw = _without_fenced_code_blocks(text or "")
+    candidates: list[dict[str, Any]] = []
+    pos = 0
+    while True:
+        start_match = _find_regex_outside_cdata(_XML_CHILD_START_RE, raw, pos)
+        if start_match is None:
+            break
+        tag = str(start_match.group("tag") or "")
+        canonical_name = lookup.get(_compact_tool_name(tag))
+        if not canonical_name:
+            pos = start_match.end()
+            continue
+        close_re = re.compile(rf"</{re.escape(tag)}\s*>", re.IGNORECASE | re.DOTALL)
+        close_match = _find_regex_outside_cdata(close_re, raw, start_match.end())
+        if close_match is None:
+            pos = start_match.end()
+            continue
+        body = raw[start_match.end() : close_match.start()]
+        input_value = _direct_tool_tag_input(body, canonical_name, context)
+        candidates.append(
+            {
+                "id": f"toolu_direct_xml_{len(candidates) + 1}",
+                "name": canonical_name,
+                "input": input_value,
+            }
+        )
+        pos = close_match.end()
+    return _drop_direct_progress_tags_when_actionable(candidates)
+
+
+def _drop_direct_progress_tags_when_actionable(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(candidates) <= 1:
+        return candidates
+    progress_tags = {"taskcreate", "taskupdate", "tasklist", "taskget", "todowrite", "todo"}
+    actionable = [
+        candidate
+        for candidate in candidates
+        if _compact_tool_name(str(candidate.get("name") or "")) not in progress_tags
+    ]
+    return actionable or candidates
+
+
+def _direct_tool_tag_lookup(context: ToolBridgeContext) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    reserved = {"toolcalls", "toolcall", "tools", "invoke", "parameter", "param"}
+    for tool in context.tools:
+        name = str(tool.name or "").strip()
+        if not name or name not in context.allowed_names:
+            continue
+        compact = _compact_tool_name(name)
+        if compact and compact not in reserved:
+            lookup.setdefault(compact, name)
+        snake = _snake_case_tool_name(name)
+        compact_snake = _compact_tool_name(snake)
+        if compact_snake and compact_snake not in reserved:
+            lookup.setdefault(compact_snake, name)
+    return lookup
+
+
+def _snake_case_tool_name(name: str) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name or "")
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
+
+
+def _direct_tool_tag_input(body: str, tool_name: str, context: ToolBridgeContext) -> dict[str, Any]:
+    raw = (body or "").strip()
+    params = _xml_invoke_input(_normalize_dsml_tool_tags(raw))
+    if params:
+        return params
+    if raw.startswith("{"):
+        parsed = _loads(raw)
+        if isinstance(parsed, dict):
+            nested = parsed.get("input")
+            return nested if isinstance(nested, dict) else parsed
+    child_params: dict[str, Any] = {}
+    pos = 0
+    while True:
+        child_match = _find_regex_outside_cdata(_XML_CHILD_START_RE, raw, pos)
+        if child_match is None:
+            break
+        child_tag = str(child_match.group("tag") or "").strip()
+        close_re = re.compile(rf"</{re.escape(child_tag)}\s*>", re.IGNORECASE | re.DOTALL)
+        close_match = _find_regex_outside_cdata(close_re, raw, child_match.end())
+        if close_match is None:
+            break
+        value = _parse_xml_parameter_value(child_tag, raw[child_match.end() : close_match.start()])
+        if child_tag in child_params:
+            previous = child_params[child_tag]
+            if isinstance(previous, list):
+                previous.append(value)
+            else:
+                child_params[child_tag] = [previous, value]
+        else:
+            child_params[child_tag] = value
+        pos = close_match.end()
+    if child_params:
+        return child_params
+    fallback_key = _single_text_input_key_for_tool(tool_name, context)
+    if fallback_key and raw:
+        return {fallback_key: _parse_scalar_xml_text(_strip_xml_tags(raw))}
+    return {}
+
+
+def _single_text_input_key_for_tool(tool_name: str, context: ToolBridgeContext) -> str:
+    schema = _schema_for_tool_name(tool_name, context)
+    if not isinstance(schema, dict):
+        return ""
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = [str(key) for key in schema.get("required", []) if isinstance(key, str)]
+    candidates = required or list(properties)
+    if len(candidates) != 1:
+        return ""
+    key = candidates[0]
+    prop_schema = properties.get(key)
+    if isinstance(prop_schema, dict):
+        raw_type = prop_schema.get("type")
+        schema_type = str(raw_type[0] if isinstance(raw_type, list) and raw_type else raw_type or "").lower()
+        if schema_type and schema_type != "string":
+            return ""
+    return key
 
 
 def _extract_tool_code_candidates(text: str, context: ToolBridgeContext) -> list[dict[str, Any]]:
