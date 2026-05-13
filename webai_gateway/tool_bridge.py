@@ -2910,7 +2910,6 @@ def parse_tool_response(text: str, context: ToolBridgeContext) -> BridgeResult:
             not marker_seen
             and not malformed_seen
             and _allows_ds2api_style_agent_guard_passthrough(context)
-            and not _plain_text_requires_tool_recovery_before_ds2api_passthrough(raw, context, fenced_shell_commands)
         ):
             return finish(content=raw, tool_calls=[], warning=warning, raw_content=raw)
         if echoed_tool_history:
@@ -6809,38 +6808,6 @@ def _allows_ds2api_style_progress_passthrough(context: ToolBridgeContext) -> boo
 
 def _allows_ds2api_style_agent_guard_passthrough(context: ToolBridgeContext) -> bool:
     return _allows_ds2api_style_progress_passthrough(context)
-
-
-def _plain_text_requires_tool_recovery_before_ds2api_passthrough(
-    raw: str,
-    context: ToolBridgeContext,
-    fenced_shell_commands: Sequence[str],
-) -> bool:
-    if not (raw or "").strip() or not context.allowed_names:
-        return False
-    if _is_allowed_tool_denial(raw, context):
-        return True
-    if _is_deferred_named_tool_action_without_call(raw, context):
-        return True
-    if _is_deferred_local_file_inspection_without_call(raw, context):
-        return True
-    if _looks_like_optional_local_action_confirmation(raw, context):
-        return True
-    if _looks_like_optional_local_method_selection(raw, context):
-        return True
-    if _is_unverified_code_change_completion(raw, context):
-        return True
-    if _is_unexecuted_verification_command_after_write(raw, context):
-        return True
-    if _is_prose_shell_command_intent_without_call(raw, context):
-        return True
-    if fenced_shell_commands and (context.has_tool_loop or _looks_like_local_agent_task(context.task_text)):
-        return True
-    if context.allowed_names and _DEFERRED_TOOL_ACTION_RE.search(raw):
-        return True
-    if context.allowed_names and _has_code_change_tool(context) and _DEFERRED_CODE_CHANGE_ACTION_RE.search(raw):
-        return not _allows_plain_review_or_plan_text(context)
-    return False
 
 
 def _allows_ds2api_style_rejected_markup_passthrough(context: ToolBridgeContext, raw: str) -> bool:

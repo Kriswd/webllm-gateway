@@ -187,6 +187,9 @@ def classify_bridge_result(
             )
         return ControllerDecision("FINAL", reason="non_repairable_error", bridge_result=result, retry_state=state)
 
+    if _allows_ds2api_style_controller_passthrough(context):
+        return ControllerDecision("FINAL", bridge_result=result, retry_state=state)
+
     if _is_history_summary_final_without_task_answer(context, result.content):
         if state.repair_attempts >= max_repair_attempts:
             return ControllerDecision(
@@ -291,9 +294,6 @@ def classify_bridge_result(
                 ask_user_attempts=state.ask_user_attempts,
             ),
         )
-
-    if _allows_ds2api_style_controller_passthrough(context):
-        return ControllerDecision("FINAL", bridge_result=result, retry_state=state)
 
     if _requires_final_evidence(context, result.content) and not _has_required_final_evidence(context, result.content):
         repair_limit = _final_evidence_repair_limit(context, max_repair_attempts)

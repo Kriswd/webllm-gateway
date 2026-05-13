@@ -886,7 +886,7 @@ def test_tool_controller_retries_no_task_final_after_tool_result() -> None:
     assert decision.reason == "status_only_final_without_task_answer"
 
 
-def test_tool_controller_retries_no_task_final_in_all_profile_after_tool_loop() -> None:
+def test_tool_controller_all_profile_passes_no_task_final_like_ds2api() -> None:
     text = "当前无明确任务，系统处于等待状态。请提供具体指令以继续工作。"
     result = BridgeResult(content=text, tool_calls=[], raw_content=text)
     context = _controller_context_with_tools(
@@ -898,11 +898,11 @@ def test_tool_controller_retries_no_task_final_in_all_profile_after_tool_loop() 
 
     decision = classify_bridge_result(result, context, RetryState())
 
-    assert decision.state == "RETRY"
-    assert decision.reason == "status_only_final_without_task_answer"
+    assert decision.state == "FINAL"
+    assert decision.reason == ""
 
 
-def test_tool_controller_retries_context_missing_no_task_final_in_all_profile_after_tool_loop() -> None:
+def test_tool_controller_all_profile_passes_context_missing_final_like_ds2api() -> None:
     text = "因上下文缺失且无明确任务，请提供具体需求。我将直接执行新指令或回答您的问题。"
     result = BridgeResult(content=text, tool_calls=[], raw_content=text)
     context = _controller_context_with_tools(
@@ -914,11 +914,11 @@ def test_tool_controller_retries_context_missing_no_task_final_in_all_profile_af
 
     decision = classify_bridge_result(result, context, RetryState())
 
-    assert decision.state == "RETRY"
-    assert decision.reason == "status_only_final_without_task_answer"
+    assert decision.state == "FINAL"
+    assert decision.reason == ""
 
 
-def test_tool_controller_retries_ds2api_history_summary_final_in_all_profile() -> None:
+def test_tool_controller_all_profile_passes_ds2api_history_summary_final_like_ds2api() -> None:
     text = (
         "根据提供的 `DS2API_HISTORY.txt` 上下文，当前的工作状态如下："
         "用户之前正在探索如何为 Claude 创建 Skills，助手读取了相关文档。"
@@ -934,11 +934,11 @@ def test_tool_controller_retries_ds2api_history_summary_final_in_all_profile() -
 
     decision = classify_bridge_result(result, context, RetryState())
 
-    assert decision.state == "RETRY"
-    assert decision.reason == "history_summary_final_without_task_answer"
+    assert decision.state == "FINAL"
+    assert decision.reason == ""
 
 
-def test_tool_controller_retries_guard_history_summary_final_in_all_profile() -> None:
+def test_tool_controller_all_profile_passes_guard_history_summary_final_like_ds2api() -> None:
     text = (
         "根据提供的 `DS2API_HISTORY.txt` 上下文，特别是最后几条关于工具循环保护"
         "（Tool loop guard）和技能进度保护（Skill progress guard）的指令：状态分析。"
@@ -955,11 +955,11 @@ def test_tool_controller_retries_guard_history_summary_final_in_all_profile() ->
 
     decision = classify_bridge_result(result, context, RetryState())
 
-    assert decision.state == "RETRY"
-    assert decision.reason == "history_summary_final_without_task_answer"
+    assert decision.state == "FINAL"
+    assert decision.reason == ""
 
 
-def test_tool_controller_retries_unknown_project_structure_final_in_all_profile() -> None:
+def test_tool_controller_all_profile_passes_unknown_project_structure_final_like_ds2api() -> None:
     text = (
         "项目结构未知。Glob 结果截断。需要具体文件列表或目录结构才能审查代码。"
         "请提供：1. 项目根目录路径 2. 主要编程语言/框架 3. 或直接粘贴关键代码文件内容。"
@@ -974,11 +974,11 @@ def test_tool_controller_retries_unknown_project_structure_final_in_all_profile(
 
     decision = classify_bridge_result(result, context, RetryState())
 
-    assert decision.state == "RETRY"
-    assert decision.reason == "unknown_project_structure_final_without_task_answer"
+    assert decision.state == "FINAL"
+    assert decision.reason == ""
 
 
-def test_tool_controller_retries_review_doc_next_step_menu_final_in_all_profile() -> None:
+def test_tool_controller_all_profile_passes_review_doc_next_step_menu_final_like_ds2api() -> None:
     text = (
         "根据 `CONFIGURATION.md` 的配置总结，当前系统已配置好 Tu-Zi API 和飞书多维表格。"
         "文档中列出的“下一步”操作建议如下："
@@ -995,8 +995,8 @@ def test_tool_controller_retries_review_doc_next_step_menu_final_in_all_profile(
 
     decision = classify_bridge_result(result, context, RetryState())
 
-    assert decision.state == "RETRY"
-    assert decision.reason == "review_next_step_menu_final_without_task_answer"
+    assert decision.state == "FINAL"
+    assert decision.reason == ""
 
 
 def test_tool_controller_all_profile_keeps_substantive_review_final_with_next_steps() -> None:
@@ -2388,7 +2388,7 @@ def test_webai2api_gpt_thinking_repairs_chinese_setup_confirmation_to_tool_use()
             config=GatewayConfig(
                 server=ServerConfig(api_key="local-dev-key"),
                 upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
-                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="agent"),
             ),
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
@@ -2458,7 +2458,7 @@ def test_webai2api_gpt_thinking_repairs_terse_chinese_confirmation_to_tool_use()
             config=GatewayConfig(
                 server=ServerConfig(api_key="local-dev-key"),
                 upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
-                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="agent"),
             ),
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
@@ -2527,7 +2527,7 @@ def test_webai2api_gpt_thinking_repairs_minimal_chinese_confirmation_fragment_to
             config=GatewayConfig(
                 server=ServerConfig(api_key="local-dev-key"),
                 upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
-                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="agent"),
             ),
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
@@ -2751,7 +2751,7 @@ def test_webai2api_repairs_method_question_then_tool_json_tail_to_tool_use() -> 
             config=GatewayConfig(
                 server=ServerConfig(api_key="local-dev-key"),
                 upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-instant"),
-                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="agent"),
             ),
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
@@ -2850,7 +2850,7 @@ def test_webai2api_gpt_thinking_repairs_method_selection_question_to_tool_use() 
             config=GatewayConfig(
                 server=ServerConfig(api_key="local-dev-key"),
                 upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1", model="gpt-thinking"),
-                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+                tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="agent"),
             ),
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
@@ -4699,7 +4699,7 @@ def test_parse_chat_response_flags_no_bridge_realtime_web_denial_when_search_too
     assert result.error.repairable is True
 
 
-def test_tool_bridge_all_profile_flags_realtime_web_denial_when_search_tool_available() -> None:
+def test_tool_bridge_all_profile_passes_realtime_web_denial_text_like_ds2api() -> None:
     context = build_context(
         [
             {
@@ -4720,9 +4720,8 @@ def test_tool_bridge_all_profile_flags_realtime_web_denial_when_search_tool_avai
     )
 
     assert result.tool_calls == []
-    assert result.error is not None
-    assert result.error.kind == "tool_denial_without_call"
-    assert result.error.repairable is True
+    assert result.error is None
+    assert "cannot access real-time" in result.content
 
 
 def test_strict_tool_bridge_repairs_chinese_permission_denial_text() -> None:
@@ -20295,6 +20294,48 @@ def test_tool_bridge_all_profile_passes_unproven_plain_text_like_ds2api() -> Non
     assert result.content == "Need a better project map before proceeding. Continue with another file path."
 
 
+def test_tool_bridge_all_profile_passes_plan_text_mentioning_tools_like_ds2api() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in ["TaskCreate", "Read", "Glob", "Grep", "Bash"]
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all", max_tools_in_prompt=32),
+    )
+    context = prefer_local_tools_for_local_agent_task(
+        context,
+        [
+            {"role": "user", "content": "你熟悉下当前项目的代码并给出详细的改进计划"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_1", "name": "Read", "input": {"file_path": "README.md"}}],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "README exists"}]},
+        ],
+    )
+
+    result = parse_tool_response(
+        (
+            "Improvement plan:\n"
+            "1. Use the existing Read and Glob evidence to map module boundaries.\n"
+            "2. If you want implementation later, I will use TaskCreate to split tasks and Bash to run tests.\n"
+            "This response is only the requested plan."
+        ),
+        context,
+    )
+
+    assert result.tool_calls == []
+    assert result.error is None
+    assert "Improvement plan" in result.content
+
+
 def test_tool_bridge_rejects_chinese_unproven_review_next_step_without_tool_call() -> None:
     context = build_context(
         [
@@ -20523,7 +20564,7 @@ def test_tool_bridge_treats_chinese_short_confirmation_as_task_continuation(late
     assert "Edit" in context.allowed_names
 
 
-def test_tool_bridge_all_profile_retries_deferred_named_tool_after_direct_modify_followup() -> None:
+def test_tool_bridge_all_profile_passes_deferred_named_tool_text_like_ds2api() -> None:
     context = build_context(
         [
             {
@@ -20564,9 +20605,8 @@ def test_tool_bridge_all_profile_retries_deferred_named_tool_after_direct_modify
     )
 
     assert result.tool_calls == []
-    assert result.error is not None
-    assert result.error.kind in {"deferred_named_tool_action_without_call", "deferred_code_change_without_call"}
-    assert result.error.repairable is True
+    assert result.error is None
+    assert result.content.startswith("我将使用 update-config Skill")
 
 
 def test_tool_bridge_allows_complete_review_summary_without_tool_call() -> None:
@@ -23031,7 +23071,7 @@ def test_qwen_web_auto_activation_keeps_tool_bridge_for_local_agent_task(tmp_pat
     assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
 
 
-def test_qwen_web_all_profile_retries_no_task_final_after_tool_loop(tmp_path: Path) -> None:
+def test_qwen_web_all_profile_passes_no_task_final_like_ds2api(tmp_path: Path) -> None:
     seen_payloads: list[dict[str, Any]] = []
 
     class NoTaskThenToolQwenClient:
@@ -23092,13 +23132,11 @@ def test_qwen_web_all_profile_retries_no_task_final_after_tool_loop(tmp_path: Pa
     )
 
     assert response.status_code == 200
-    assert len(seen_payloads) == 2
+    assert len(seen_payloads) == 1
+    body = response.json()
+    assert body["content"][0]["type"] == "text"
+    assert body["content"][0]["text"]
     assert "审查当前项目的代码" in str(seen_payloads[0].get("_webai_current_task_text") or "")
-    assert "审查当前项目的代码" in str(seen_payloads[1].get("_webai_current_task_text") or "")
-    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
-    assert "status_only_final_without_task_answer" in retry_prompt
-    assert "审查当前项目的代码" in retry_prompt
-    assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
 
 
 def test_qwen_web_local_agent_keeps_tool_loop_when_claude_status_text_follows_tool_result(tmp_path: Path) -> None:
@@ -23362,22 +23400,14 @@ def test_qwen_web_all_profile_preserves_task_after_direct_modify_followup(tmp_pa
     )
 
     assert response.status_code == 200
-    assert len(seen_payloads) == 2
+    assert len(seen_payloads) == 1
     assert prior_task in str(seen_payloads[0].get("_webai_current_task_text") or "")
+    body = response.json()
+    assert body["content"][0]["type"] == "text"
+    assert body["content"][0]["text"]
     assert "你直接修改" in str(seen_payloads[0].get("_webai_current_task_text") or "")
     initial_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[0]["messages"])
     assert "New user task boundary" not in initial_prompt
-    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
-    assert "deferred" in retry_prompt
-    assert prior_task in retry_prompt
-    assert response.json()["content"] == [
-        {
-            "type": "tool_use",
-            "id": "toolu_read_settings",
-            "name": "Read",
-            "input": {"file_path": ".claude/settings.json"},
-        }
-    ]
 
 
 def test_qwen_web_all_profile_passes_repeated_read_loop_like_ds2api(tmp_path: Path) -> None:
