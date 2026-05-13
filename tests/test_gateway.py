@@ -11149,6 +11149,210 @@ def test_anthropic_messages_streams_direct_tool_xml_tags_for_qwen_web(tmp_path: 
     assert events[-2]["delta"]["stop_reason"] == "tool_use"
 
 
+def test_anthropic_messages_streams_plain_standalone_grep_command_for_qwen_web(tmp_path: Path) -> None:
+    class PlainStandaloneGrepQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            assert payload["model"] == "qwen-web/qwen3.6-plus"
+            return _openai_response(
+                "The file /d/ProjectX/mindcraft/skills/feishu/client.py does not exist.\n\n"
+                "Based on the preserved task state, the Feishu client implementation may be elsewhere.\n\n"
+                "Let's verify the actual location of the Feishu client code by searching for the class definition.\n\n"
+                'grep -r "class FeishuClient" /d/ProjectX/mindcraft/ --include="*.py"'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=PlainStandaloneGrepQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [
+                {"role": "user", "content": "Audit the Mindcraft project code."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_missing",
+                            "name": "Read",
+                            "input": {"file_path": "/d/ProjectX/mindcraft/skills/feishu/client.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_missing",
+                            "content": "The file /d/ProjectX/mindcraft/skills/feishu/client.py does not exist.",
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {
+                    "name": "Bash",
+                    "description": "Run shell",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            ],
+            "max_tokens": 1024,
+            "stream": True,
+        },
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    events = _sse_events(body)
+    tool_starts = [
+        event
+        for event in events
+        if event["_event"] == "content_block_start" and event["content_block"]["type"] == "tool_use"
+    ]
+    assert [(event["content_block"]["name"], event["content_block"]["input"]) for event in tool_starts] == [
+        ("Bash", {})
+    ]
+    assert any(
+        event.get("delta") == {
+            "type": "input_json_delta",
+            "partial_json": '{"command":"grep -r \\"class FeishuClient\\" /d/ProjectX/mindcraft/ --include=\\"*.py\\""}',
+        }
+        for event in events
+    )
+    assert not any(
+        event.get("delta", {}).get("type") == "text_delta"
+        and "grep -r" in event["delta"].get("text", "")
+        for event in events
+    )
+    assert events[-2]["delta"]["stop_reason"] == "tool_use"
+
+
+def test_anthropic_messages_dedupes_reused_tool_ids_across_turns_for_claude_code(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class ReusedToolIdQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response(
+                    '```tool_json\n'
+                    '{"calls":[{"id":"call_1","name":"Read",'
+                    '"input":{"file_path":"D:/ProjectX/mindcraft/skills/feishu/client_missing.py"}}]}'
+                    "\n```"
+                )
+            return _openai_response(
+                '```tool_json\n'
+                '{"calls":[{"id":"call_1","name":"Bash",'
+                '"input":{"command":"rg \\"class FeishuClient\\" D:/ProjectX/mindcraft -g \\"*.py\\""}}]}'
+                "\n```"
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=ReusedToolIdQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    tools = [
+        {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+        {
+            "name": "Bash",
+            "description": "Run shell",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    ]
+
+    first = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [{"role": "user", "content": "Find FeishuClient after a missing read."}],
+            "tools": tools,
+            "max_tokens": 1024,
+        },
+    )
+
+    assert first.status_code == 200
+    first_tool = first.json()["content"][0]
+    assert first_tool == {
+        "type": "tool_use",
+        "id": "toolu_call_1",
+        "name": "Read",
+        "input": {"file_path": "D:/ProjectX/mindcraft/skills/feishu/client_missing.py"},
+    }
+
+    second = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.6-plus",
+            "messages": [
+                {"role": "user", "content": "Find FeishuClient after a missing read."},
+                {"role": "assistant", "content": [first_tool]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": first_tool["id"],
+                            "content": "File does not exist.",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+            "tools": tools,
+            "max_tokens": 1024,
+        },
+    )
+
+    assert second.status_code == 200
+    second_tool = second.json()["content"][0]
+    assert second_tool["type"] == "tool_use"
+    assert second_tool["name"] == "Bash"
+    assert second_tool["id"] == "toolu_call_2"
+    assert second_tool["id"] != first_tool["id"]
+    assert second_tool["input"] == {"command": 'rg "class FeishuClient" D:/ProjectX/mindcraft -g "*.py"'}
+
+
 def test_streaming_tool_json_becomes_openai_tool_call_chunk() -> None:
     content = '```tool_json\n{"name":"read_file","args":{"path":"README.md"}}\n```'
     event = json.dumps({"choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
@@ -19096,6 +19300,78 @@ def test_qwen_coder_repairs_unwrapped_shell_command_block_without_tool_call(tmp_
                 "command": 'git -C "E:/ProjectX/mindcraft/MediaCrawler" reset --hard origin/main && git -C "E:/ProjectX/mindcraft/MediaCrawler" pull origin main'
             },
         }
+    ]
+
+
+def test_tool_bridge_converts_plain_standalone_grep_command_after_failed_read() -> None:
+    context = build_context(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read files",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ],
+        ToolBridgeConfig(exposure_policy="all", tool_profile="all"),
+    )
+    context = prefer_local_tools_for_local_agent_task(
+        context,
+        [
+            {"role": "user", "content": "Audit the Mindcraft project code."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_read_missing",
+                        "name": "Read",
+                        "input": {"file_path": "/d/ProjectX/mindcraft/skills/feishu/client.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read_missing",
+                        "content": "The file /d/ProjectX/mindcraft/skills/feishu/client.py does not exist.",
+                    }
+                ],
+            },
+        ],
+    )
+
+    result = parse_tool_response(
+        "The file /d/ProjectX/mindcraft/skills/feishu/client.py does not exist.\n\n"
+        "Let's verify the actual location of the Feishu client code by searching for the class definition.\n\n"
+        'grep -r "class FeishuClient" /d/ProjectX/mindcraft/ --include="*.py"',
+        context,
+    )
+
+    assert result.error is None
+    assert result.content == ""
+    assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
+        (
+            "call_web_shell_1",
+            "Bash",
+            {"command": 'grep -r "class FeishuClient" /d/ProjectX/mindcraft/ --include="*.py"'},
+        )
     ]
 
 

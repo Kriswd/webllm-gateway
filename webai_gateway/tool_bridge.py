@@ -303,21 +303,21 @@ _UNQUOTED_WINDOWS_PATH_RE = re.compile(r"(?<![\w/])(?P<path>[A-Za-z]:[\\/][^\s&|
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"(?<![\w/])(?P<path>[A-Za-z]:[\\/][^\s\"'&|;<>]*)")
 _SHELL_COMMAND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _SHELL_COMMAND_LINE_RE = re.compile(
-    r"(?m)^\s*(?P<command>(?:cd|dir|ls|git|gh|bash|cmd|powershell|pwsh|python|python3|uv|npm|pnpm|npx|node|yarn|pytest|pip|pip3|ruff)\b[^\r\n]*)\s*$"
+    r"(?m)^\s*(?P<command>(?:cd|dir|ls|pwd|tree|git|gh|bash|cmd|powershell|pwsh|python|python3|uv|npm|pnpm|npx|node|yarn|pytest|pip|pip3|ruff|find|gfind|rg|grep|egrep|fgrep|cat|head|tail|wc|sort|uniq|get-childitem|gci|get-content|gc|select-string|sls|select-object|sort-object|measure-object)\b[^\r\n]*)\s*$"
 )
 _SHELL_COMMAND_INTENT_RE = re.compile(
-    r"\b(?:i(?:'ll| will)|let me|this will|execute|run|update|pull|reset|stash|discard|apply|merge|push|commit|local changes|modifications)\b"
+    r"\b(?:i(?:'ll| will)|let me|let's|this will|execute|run|update|pull|reset|stash|discard|apply|merge|push|commit|verify|check|inspect|search|locate|examine|local changes|modifications)\b"
     r"|(?:执行|运行|更新|拉取|重置|删除|本地修改)",
     re.IGNORECASE,
 )
 _PROSE_SHELL_COMMAND_INTENT_RE = re.compile(
     r"\b(?:running|executing|execute|run|will\s+run|need\s+to\s+run|going\s+to\s+run|"
-    r"about\s+to\s+run|using)\b.{0,80}\b"
+    r"about\s+to\s+run|using|verifying|checking|inspecting|searching|locating|examining)\b.{0,80}\b"
     r"(?:git\s+(?:diff|status|log|show|remote|branch|rev-parse|fetch|pull|add|commit|stash|reset|clean)|"
-    r"ls(?:\s|$)|dir(?:\s|$)|pytest|python(?:3)?|pip(?:3)?|npm|pnpm|node|ruff)\b"
+    r"ls(?:\s|$)|dir(?:\s|$)|(?:rg|grep|find|cat|head|tail)(?:\s|$)|pytest|python(?:3)?|pip(?:3)?|npm|pnpm|node|ruff)\b"
     r"|(?:执行|运行|用|使用).{0,40}"
     r"(?:git\s+(?:diff|status|log|show|remote|branch|rev-parse|fetch|pull|add|commit|stash|reset|clean)|"
-    r"ls(?:\s|$)|dir(?:\s|$)|pytest|python(?:3)?|pip(?:3)?|npm|pnpm|node|ruff)\b",
+    r"ls(?:\s|$)|dir(?:\s|$)|(?:rg|grep|find|cat|head|tail)(?:\s|$)|pytest|python(?:3)?|pip(?:3)?|npm|pnpm|node|ruff)\b",
     re.IGNORECASE | re.DOTALL,
 )
 _OFF_TASK_ENV_CONFIG_QUESTION_RE = re.compile(
@@ -707,6 +707,7 @@ class ToolBridgeContext:
     task_text: str = ""
     has_tool_loop: bool = False
     recent_tool_call_names: tuple[str, ...] = ()
+    recent_tool_call_ids: tuple[str, ...] = ()
     recent_tool_call_summaries: tuple[str, ...] = ()
     recent_skill_names: tuple[str, ...] = ()
     recent_successful_tool_result_names: tuple[str, ...] = ()
@@ -922,6 +923,7 @@ def prefer_local_tools_for_local_agent_task(
         for call in recent_call_drafts
     ]
     recent_tool_call_names = tuple(name for name, _, _ in recent_calls[-8:])
+    recent_tool_call_ids = tuple(call.id for call in recent_call_drafts[-16:] if call.id)
     recent_tool_call_summaries = tuple(summary for _, _, summary in recent_calls[-8:])
     recent_skill_names = tuple(
         skill_name
@@ -991,6 +993,7 @@ def prefer_local_tools_for_local_agent_task(
                 task_text=latest,
                 has_tool_loop=has_tool_loop,
                 recent_tool_call_names=recent_tool_call_names,
+                recent_tool_call_ids=recent_tool_call_ids,
                 recent_tool_call_summaries=recent_tool_call_summaries,
                 recent_skill_names=recent_skill_names,
                 recent_successful_tool_result_names=recent_successful_tool_result_names,
@@ -1022,6 +1025,7 @@ def prefer_local_tools_for_local_agent_task(
             task_text=task_text,
             has_tool_loop=has_tool_loop,
             recent_tool_call_names=recent_tool_call_names,
+            recent_tool_call_ids=recent_tool_call_ids,
             recent_tool_call_summaries=recent_tool_call_summaries,
             recent_skill_names=recent_skill_names,
             recent_successful_tool_result_names=recent_successful_tool_result_names,
@@ -1091,6 +1095,7 @@ def prefer_local_tools_for_local_agent_task(
                 task_text=latest,
                 has_tool_loop=has_tool_loop,
                 recent_tool_call_names=recent_tool_call_names,
+                recent_tool_call_ids=recent_tool_call_ids,
                 recent_tool_call_summaries=recent_tool_call_summaries,
                 recent_skill_names=recent_skill_names,
                 recent_successful_tool_result_names=recent_successful_tool_result_names,
@@ -1121,6 +1126,7 @@ def prefer_local_tools_for_local_agent_task(
             task_text=latest,
             has_tool_loop=has_tool_loop,
             recent_tool_call_names=recent_tool_call_names,
+            recent_tool_call_ids=recent_tool_call_ids,
             recent_tool_call_summaries=recent_tool_call_summaries,
             recent_skill_names=recent_skill_names,
             recent_successful_tool_result_names=recent_successful_tool_result_names,
@@ -1157,6 +1163,7 @@ def prefer_local_tools_for_local_agent_task(
         task_text=latest,
         has_tool_loop=has_tool_loop,
         recent_tool_call_names=recent_tool_call_names,
+        recent_tool_call_ids=recent_tool_call_ids,
         recent_tool_call_summaries=recent_tool_call_summaries,
         recent_skill_names=recent_skill_names,
         recent_successful_tool_result_names=recent_successful_tool_result_names,
@@ -6596,6 +6603,7 @@ def build_repair_messages(messages: list[dict[str, Any]], bad_text: str, error: 
 def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> tuple[list[ToolCallDraft], BridgeError | None]:
     out: list[ToolCallDraft] = []
     seen_ids: set[str] = set()
+    historical_ids = {tool_id for tool_id in context.recent_tool_call_ids if tool_id}
     soft_non_progress_errors: list[BridgeError] = []
     allowed = context.allowed_names
     canonical_by_lower: dict[str, str] = {}
@@ -6779,6 +6787,7 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
             call_id = normalized.id or _new_tool_call_id()
             if call_id in seen_ids:
                 return [], BridgeError("duplicate_tool_call_id", f"重复的工具调用 id：{call_id}")
+            call_id = _dedupe_historical_tool_call_id(call_id, historical_ids, seen_ids)
             seen_ids.add(call_id)
             out.append(ToolCallDraft(id=call_id, name=canonical_name, input=normalized.input))
     if not out:
@@ -6791,6 +6800,45 @@ def _normalize_candidates(candidates: list[Any], context: ToolBridgeContext) -> 
     if len(out) > max_calls:
         return [], BridgeError("too_many_tool_calls", f"本轮工具调用过多：{len(out)} > {max_calls}")
     return out, None
+
+
+def _dedupe_historical_tool_call_id(call_id: str, historical_ids: set[str], current_ids: set[str]) -> str:
+    if not _tool_call_id_conflicts(call_id, historical_ids, current_ids):
+        return call_id
+    prefix = _tool_call_id_prefix(call_id)
+    for index in range(1, 1000):
+        candidate = f"{prefix}_{index}"
+        if not _tool_call_id_conflicts(candidate, historical_ids, current_ids):
+            return candidate
+    return _new_tool_call_id()
+
+
+def _tool_call_id_conflicts(call_id: str, historical_ids: set[str], current_ids: set[str]) -> bool:
+    return (
+        call_id in current_ids
+        or call_id in historical_ids
+        or _anthropic_visible_tool_call_id(call_id) in historical_ids
+    )
+
+
+def _tool_call_id_prefix(call_id: str) -> str:
+    raw = str(call_id or "").strip()
+    if raw.startswith("toolu_"):
+        raw = raw[len("toolu_") :]
+    match = re.match(r"^(?P<prefix>.+?)_\d+$", raw)
+    prefix = match.group("prefix") if match else raw
+    prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", prefix).strip("_")
+    return prefix or "call"
+
+
+def _anthropic_visible_tool_call_id(call_id: str) -> str:
+    raw = str(call_id or "").strip()
+    if raw.startswith("toolu_"):
+        return raw
+    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in raw).strip("_")
+    if not safe:
+        return ""
+    return f"toolu_{safe[:64]}"
 
 
 def _tool_call_uses_readonly_budget(
