@@ -37,6 +37,7 @@ DEFAULT_DEEPSEEK_DS2API_RATE_LIMIT_COOLDOWN_SECONDS = 6.0
 DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_ENABLED = True
 DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_MIN_CHARS = 0
 DEFAULT_QWEN_DIRECT_MAX_INFLIGHT = 1
+DEFAULT_QWEN_DIRECT_MAX_QUEUE = 1
 DEFAULT_QWEN_DIRECT_RATE_LIMIT_COOLDOWN_SECONDS = 6.0
 
 
@@ -77,6 +78,7 @@ class ProviderRuntimeConfig:
     deepseek_ds2api_current_input_file_enabled: bool = DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_ENABLED
     deepseek_ds2api_current_input_file_min_chars: int = DEFAULT_DEEPSEEK_DS2API_CURRENT_INPUT_FILE_MIN_CHARS
     qwen_direct_max_inflight: int = DEFAULT_QWEN_DIRECT_MAX_INFLIGHT
+    qwen_direct_max_queue: int = DEFAULT_QWEN_DIRECT_MAX_QUEUE
     qwen_direct_rate_limit_cooldown_seconds: float = DEFAULT_QWEN_DIRECT_RATE_LIMIT_COOLDOWN_SECONDS
     qwen_web_backend: str = "direct"
     gpt_thinking_backend: str = "webai2api"
@@ -201,6 +203,17 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
         minimum=1,
         maximum=256,
     )
+    qwen_direct_max_queue = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "qwenDirectMaxQueue",
+            "qwen_direct_max_queue",
+            default=default_provider_runtime.qwen_direct_max_queue,
+        ),
+        default=default_provider_runtime.qwen_direct_max_queue,
+        minimum=0,
+        maximum=200_000,
+    )
     qwen_direct_rate_limit_cooldown_seconds = _bounded_float(
         _raw_first(
             provider_runtime_raw,
@@ -257,6 +270,7 @@ def load_config(path: str | Path = "config.json") -> GatewayConfig:
             deepseek_ds2api_current_input_file_enabled=deepseek_ds2api_current_input_file_enabled,
             deepseek_ds2api_current_input_file_min_chars=deepseek_ds2api_current_input_file_min_chars,
             qwen_direct_max_inflight=qwen_direct_max_inflight,
+            qwen_direct_max_queue=qwen_direct_max_queue,
             qwen_direct_rate_limit_cooldown_seconds=qwen_direct_rate_limit_cooldown_seconds,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend") or provider_runtime_raw.get("qwen_web_backend") or "direct"
@@ -312,6 +326,7 @@ def config_to_public(config: GatewayConfig) -> dict[str, Any]:
             "deepseekDs2apiCurrentInputFileEnabled": config.provider_runtime.deepseek_ds2api_current_input_file_enabled,
             "deepseekDs2apiCurrentInputFileMinChars": config.provider_runtime.deepseek_ds2api_current_input_file_min_chars,
             "qwenDirectMaxInflight": config.provider_runtime.qwen_direct_max_inflight,
+            "qwenDirectMaxQueue": config.provider_runtime.qwen_direct_max_queue,
             "qwenDirectRateLimitCooldownSeconds": config.provider_runtime.qwen_direct_rate_limit_cooldown_seconds,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
@@ -362,6 +377,7 @@ def config_to_admin(config: GatewayConfig) -> dict[str, Any]:
             "deepseekDs2apiCurrentInputFileEnabled": config.provider_runtime.deepseek_ds2api_current_input_file_enabled,
             "deepseekDs2apiCurrentInputFileMinChars": config.provider_runtime.deepseek_ds2api_current_input_file_min_chars,
             "qwenDirectMaxInflight": config.provider_runtime.qwen_direct_max_inflight,
+            "qwenDirectMaxQueue": config.provider_runtime.qwen_direct_max_queue,
             "qwenDirectRateLimitCooldownSeconds": config.provider_runtime.qwen_direct_rate_limit_cooldown_seconds,
             "qwenWebBackend": config.provider_runtime.qwen_web_backend,
             "gptThinkingBackend": config.provider_runtime.gpt_thinking_backend,
@@ -479,6 +495,17 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
         minimum=1,
         maximum=256,
     )
+    qwen_direct_max_queue = _bounded_int(
+        _raw_first(
+            provider_runtime_raw,
+            "qwenDirectMaxQueue",
+            "qwen_direct_max_queue",
+            default=config.provider_runtime.qwen_direct_max_queue,
+        ),
+        default=config.provider_runtime.qwen_direct_max_queue,
+        minimum=0,
+        maximum=200_000,
+    )
     qwen_direct_rate_limit_cooldown_seconds = _bounded_float(
         _raw_first(
             provider_runtime_raw,
@@ -563,6 +590,7 @@ def update_config(config: GatewayConfig, payload: dict[str, Any]) -> GatewayConf
             deepseek_ds2api_current_input_file_enabled=deepseek_ds2api_current_input_file_enabled,
             deepseek_ds2api_current_input_file_min_chars=deepseek_ds2api_current_input_file_min_chars,
             qwen_direct_max_inflight=qwen_direct_max_inflight,
+            qwen_direct_max_queue=qwen_direct_max_queue,
             qwen_direct_rate_limit_cooldown_seconds=qwen_direct_rate_limit_cooldown_seconds,
             qwen_web_backend=str(
                 provider_runtime_raw.get("qwenWebBackend")

@@ -14051,6 +14051,7 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "deepseekDs2apiCurrentInputFileEnabled" in index_response.text
     assert "deepseekDs2apiCurrentInputFileMinChars" in index_response.text
     assert "qwenDirectMaxInflight" in index_response.text
+    assert "qwenDirectMaxQueue" in index_response.text
     assert "qwenDirectRateLimitCooldownSeconds" in index_response.text
     assert "qwenWebBackendSelect" in index_response.text
     assert "gptThinkingBackendSelect" in index_response.text
@@ -14063,6 +14064,7 @@ def test_static_management_ui_exposes_observation_policy_controls() -> None:
     assert "deepseekDs2apiCurrentInputFileEnabled" in script_response.text
     assert "deepseekDs2apiCurrentInputFileMinChars" in script_response.text
     assert "qwenDirectMaxInflight" in script_response.text
+    assert "qwenDirectMaxQueue" in script_response.text
     assert "qwenDirectRateLimitCooldownSeconds" in script_response.text
     assert "qwenWebBackend" in script_response.text
     assert "gptThinkingBackend" in script_response.text
@@ -14279,6 +14281,7 @@ def test_provider_runtime_qwen_direct_gate_round_trips_config(tmp_path: Path) ->
         json={
             "providerRuntime": {
                 "qwenDirectMaxInflight": 2,
+                "qwenDirectMaxQueue": 5,
                 "qwenDirectRateLimitCooldownSeconds": 8,
             }
         },
@@ -14287,15 +14290,19 @@ def test_provider_runtime_qwen_direct_gate_round_trips_config(tmp_path: Path) ->
     assert response.status_code == 200
     body = response.json()["providerRuntime"]
     assert body["qwenDirectMaxInflight"] == 2
+    assert body["qwenDirectMaxQueue"] == 5
     assert body["qwenDirectRateLimitCooldownSeconds"] == 8.0
     saved = json.loads(config_path.read_text(encoding="utf-8"))["providerRuntime"]
     assert saved["qwenDirectMaxInflight"] == 2
+    assert saved["qwenDirectMaxQueue"] == 5
     assert saved["qwenDirectRateLimitCooldownSeconds"] == 8.0
     loaded = load_config(config_path)
     assert loaded.provider_runtime.qwen_direct_max_inflight == 2
+    assert loaded.provider_runtime.qwen_direct_max_queue == 5
     assert loaded.provider_runtime.qwen_direct_rate_limit_cooldown_seconds == 8.0
     health = client.get("/health", headers=_headers()).json()["config"]["providerRuntime"]
     assert health["qwenDirectMaxInflight"] == 2
+    assert health["qwenDirectMaxQueue"] == 5
     assert health["qwenDirectRateLimitCooldownSeconds"] == 8.0
 
 
@@ -15958,6 +15965,58 @@ def test_qwen_direct_limits_inflight_requests(tmp_path: Path) -> None:
 
     assert statuses == [200, 200]
     assert max_active == 1
+
+
+def test_qwen_direct_returns_429_when_wait_queue_is_full(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            entered.set()
+            assert release.wait(timeout=2)
+            return _openai_response("ok")
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                provider_runtime=ProviderRuntimeConfig(
+                    qwen_direct_max_inflight=1,
+                    qwen_direct_max_queue=0,
+                    qwen_direct_rate_limit_cooldown_seconds=0,
+                ),
+            ),
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=BlockingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client.post,
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "hold"}]},
+        )
+        assert entered.wait(timeout=2)
+        second = executor.submit(
+            client.post,
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "overflow"}]},
+        )
+        second_response = second.result(timeout=2)
+        release.set()
+        first_response = first.result(timeout=2)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 429
+    assert "Qwen direct" in second_response.json()["detail"]
 
 
 def test_qwen_direct_cools_down_after_provider_rate_limit(tmp_path: Path) -> None:

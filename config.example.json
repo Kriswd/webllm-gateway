@@ -23,6 +23,7 @@
     "deepseekDs2apiCurrentInputFileEnabled": true,
     "deepseekDs2apiCurrentInputFileMinChars": 0,
     "qwenDirectMaxInflight": 1,
+    "qwenDirectMaxQueue": 1,
     "qwenDirectRateLimitCooldownSeconds": 6,
     "qwenWebBackend": "direct",
     "gptThinkingBackend": "webai2api"

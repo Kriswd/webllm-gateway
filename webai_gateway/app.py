@@ -184,21 +184,31 @@ _GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
 
 
 class _ProviderRateLimitGate:
-    def __init__(self, *, max_inflight: int, cooldown_seconds: float) -> None:
+    def __init__(self, *, max_inflight: int, cooldown_seconds: float, max_queue: int | None = None) -> None:
         self.max_inflight = max(1, int(max_inflight))
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self.max_queue = None if max_queue is None else max(0, int(max_queue))
         self._condition = threading.Condition()
         self._inflight = 0
+        self._waiting = 0
         self._cooldown_until = 0.0
 
-    def acquire(self) -> None:
+    def acquire(self) -> bool:
         with self._condition:
+            queued = False
             while True:
                 now = time.monotonic()
                 cooldown_wait = max(0.0, self._cooldown_until - now)
                 if self._inflight < self.max_inflight and cooldown_wait <= 0:
                     self._inflight += 1
-                    return
+                    if queued:
+                        self._waiting = max(0, self._waiting - 1)
+                    return True
+                if self.max_queue is not None and not queued:
+                    if self._waiting >= self.max_queue:
+                        return False
+                    self._waiting += 1
+                    queued = True
                 self._condition.wait(timeout=cooldown_wait if cooldown_wait > 0 else 0.1)
 
     def release(self) -> None:
@@ -5526,6 +5536,7 @@ def _qwen_direct_gate(app: FastAPI, config: GatewayConfig, route: str) -> _Provi
     gate_config = (
         route,
         max(1, int(config.provider_runtime.qwen_direct_max_inflight)),
+        max(0, int(config.provider_runtime.qwen_direct_max_queue)),
         max(0.0, float(config.provider_runtime.qwen_direct_rate_limit_cooldown_seconds)),
     )
     lock = getattr(app.state, "qwen_direct_gate_lock", None)
@@ -5544,7 +5555,8 @@ def _qwen_direct_gate(app: FastAPI, config: GatewayConfig, route: str) -> _Provi
         if route not in gates or gate_configs.get(route) != gate_config:
             gates[route] = _ProviderRateLimitGate(
                 max_inflight=gate_config[1],
-                cooldown_seconds=gate_config[2],
+                max_queue=gate_config[2],
+                cooldown_seconds=gate_config[3],
             )
             gate_configs[route] = gate_config
         return gates[route]
@@ -5578,7 +5590,8 @@ def _call_qwen_direct_with_gate(
     config: GatewayConfig,
 ) -> dict[str, Any]:
     gate = _qwen_direct_gate(app, config, route)
-    gate.acquire()
+    if not gate.acquire():
+        raise HTTPException(status_code=429, detail="Qwen direct 请求过多：当前登录账号的等待队列已满，请稍后重试或降低客户端并发。")
     try:
         return web_client.chat_completions(payload)
     except Exception as exc:
