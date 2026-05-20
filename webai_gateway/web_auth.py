@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from webai_gateway.deepseek_web import DEEPSEEK_WEB_CATALOG_MODELS
 
@@ -470,6 +470,10 @@ class CredentialStore:
     def _path(self, provider_id: str) -> Path:
         return self.root / f"{provider_id}.json"
 
+    def _profile_path(self, provider_id: str, profile_id: str) -> Path:
+        safe_profile = quote(str(profile_id or "default"), safe="")
+        return self.root / "direct" / provider_id / f"{safe_profile}.json"
+
     def save(self, provider_id: str, credential: dict[str, Any]) -> dict[str, Any]:
         get_provider(provider_id)
         existing = self.get(provider_id) or {}
@@ -499,6 +503,37 @@ class CredentialStore:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
+        if provider_id in QWEN_DIRECT_PROVIDER_IDS or provider_id == "deepseek-web":
+            self.save_profile(provider_id, "default", credential)
+        return data
+
+    def save_profile(self, provider_id: str, profile_id: str, credential: dict[str, Any]) -> dict[str, Any]:
+        get_provider(provider_id)
+        profile = str(profile_id or "default").strip() or "default"
+        existing = self.get_profile(provider_id, profile) or {}
+        cookie = str(credential.get("cookie") or "")
+        bearer = str(credential.get("bearer") or "")
+        user_agent = str(credential.get("userAgent") or credential.get("user_agent") or "")
+        if not cookie and not bearer:
+            raise ValueError("没有捕获到可用的网页登录凭据，请重新完成授权")
+        now = utc_now()
+        data = {
+            "provider": provider_id,
+            "profileId": profile,
+            "cookie": cookie,
+            "bearer": bearer,
+            "userAgent": user_agent,
+            "metadata": credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {},
+            "createdAt": str(existing.get("createdAt") or now),
+            "updatedAt": now,
+        }
+        if not is_credential_authorized(provider_id, data):
+            raise ValueError("没有捕获到可用的网页登录态，请重新完成授权")
+        path = self._profile_path(provider_id, profile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
         return data
 
     def get(self, provider_id: str) -> dict[str, Any] | None:
@@ -509,6 +544,27 @@ class CredentialStore:
         if not isinstance(data, dict):
             return None
         return data
+
+    def get_profile(self, provider_id: str, profile_id: str) -> dict[str, Any] | None:
+        profile = str(profile_id or "default").strip() or "default"
+        path = self._profile_path(provider_id, profile)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        if profile == "default":
+            return self.get(provider_id)
+        return None
+
+    def list_profile_ids(self, provider_id: str) -> list[str]:
+        ids: list[str] = []
+        root = self.root / "direct" / provider_id
+        if root.exists():
+            for path in sorted(root.glob("*.json")):
+                ids.append(unquote(path.stem))
+        if self.get(provider_id) is not None and "default" not in ids:
+            ids.insert(0, "default")
+        return ids
 
     def delete(self, provider_id: str) -> None:
         path = self._path(provider_id)

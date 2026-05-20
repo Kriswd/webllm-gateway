@@ -16019,6 +16019,323 @@ def test_qwen_direct_returns_429_when_wait_queue_is_full(tmp_path: Path) -> None
     assert "Qwen direct" in second_response.json()["detail"]
 
 
+def test_qwen_direct_uses_selected_direct_profile_credential(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+    store = CredentialStore(tmp_path / "credentials")
+    store.save_profile(
+        "qwen",
+        "default",
+        {
+            "cookie": "qwen_session=default-session",
+            "bearer": "default-bearer",
+            "userAgent": "Chrome Default",
+        },
+    )
+    store.save_profile(
+        "qwen",
+        "alt",
+        {
+            "cookie": "qwen_session=alt-session",
+            "bearer": "alt-bearer",
+            "userAgent": "Chrome Alt",
+        },
+    )
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    registry.update_metadata("direct:qwen:default", {"providerId": "qwen", "displayName": "Default"})
+    registry.update_metadata("direct:qwen:alt", {"providerId": "qwen", "displayName": "Alt"})
+    registry.set_current("qwen", "direct:qwen:alt")
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            seen["credential"] = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            return _openai_response("ok")
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    client.app.state.account_registry = registry
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert seen["credential"]["bearer"] == "alt-bearer"
+
+
+def test_qwen_direct_accepts_ds2_target_account_header(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+    store = CredentialStore(tmp_path / "credentials")
+    store.save_profile(
+        "qwen",
+        "default",
+        {
+            "cookie": "qwen_session=default-session",
+            "bearer": "default-bearer",
+            "userAgent": "Chrome Default",
+        },
+    )
+    store.save_profile(
+        "qwen",
+        "alt",
+        {
+            "cookie": "qwen_session=alt-session",
+            "bearer": "alt-bearer",
+            "userAgent": "Chrome Alt",
+        },
+    )
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    registry.update_metadata("direct:qwen:default", {"providerId": "qwen", "displayName": "Default"})
+    registry.update_metadata("direct:qwen:alt", {"providerId": "qwen", "displayName": "Alt"})
+    registry.set_current("qwen", "direct:qwen:default")
+
+    class CapturingQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            seen["credential"] = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            return _openai_response("ok")
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            qwen_client_factory=CapturingQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    client.app.state.account_registry = registry
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Ds2-Target-Account": "direct:qwen:alt"},
+        json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert seen["credential"]["bearer"] == "alt-bearer"
+
+
+def test_qwen_direct_allows_parallel_slots_for_distinct_profiles(tmp_path: Path) -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    store = CredentialStore(tmp_path / "credentials")
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    for profile_id in ("default", "alt"):
+        store.save_profile(
+            "qwen",
+            profile_id,
+            {
+                "cookie": f"qwen_session={profile_id}-session",
+                "bearer": f"{profile_id}-bearer",
+                "userAgent": "Chrome Test",
+            },
+        )
+        registry.update_metadata(f"direct:qwen:{profile_id}", {"providerId": "qwen", "displayName": profile_id})
+
+    class SlowQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return _openai_response("ok")
+            finally:
+                with lock:
+                    active -= 1
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                provider_runtime=ProviderRuntimeConfig(
+                    qwen_direct_max_inflight=1,
+                    qwen_direct_max_queue=2,
+                    qwen_direct_rate_limit_cooldown_seconds=0,
+                ),
+            ),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            qwen_client_factory=SlowQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    client.app.state.account_registry = registry
+
+    def post_to(account_id: str) -> int:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={**_headers(), "X-Ds2-Target-Account": account_id},
+            json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        return response.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = list(executor.map(post_to, ["direct:qwen:default", "direct:qwen:alt"]))
+
+    assert statuses == [200, 200]
+    assert max_active == 2
+
+
+def test_qwen_direct_queue_status_uses_ds2api_shape(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "credentials")
+    for profile_id in ("default", "alt"):
+        store.save_profile(
+            "qwen",
+            profile_id,
+            {
+                "cookie": f"qwen_session={profile_id}-session",
+                "bearer": f"{profile_id}-bearer",
+                "userAgent": "Chrome Test",
+            },
+        )
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    for profile_id in ("default", "alt"):
+        registry.update_metadata(f"direct:qwen:{profile_id}", {"providerId": "qwen", "displayName": profile_id})
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                provider_runtime=ProviderRuntimeConfig(qwen_direct_max_inflight=2, qwen_direct_max_queue=4),
+            ),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            qwen_client_factory=_FakeQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    client.app.state.account_registry = registry
+
+    response = client.get("/api/admin/providers/qwen/queue/status", headers=_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["available"] == 2
+    assert body["in_use"] == 0
+    assert body["total"] == 2
+    assert body["available_accounts"] == ["direct:qwen:default", "direct:qwen:alt"]
+    assert body["in_use_accounts"] == []
+    assert body["max_inflight_per_account"] == 2
+    assert body["global_max_inflight"] == 4
+    assert body["recommended_concurrency"] == 4
+    assert body["waiting"] == 0
+    assert body["max_queue_size"] == 4
+
+
+def test_qwen_direct_switches_unpinned_profile_after_rate_limit(tmp_path: Path) -> None:
+    attempts: list[str] = []
+    store = CredentialStore(tmp_path / "credentials")
+    registry = AccountRegistry(tmp_path / ".webai-gateway" / "accounts.json")
+    for profile_id in ("default", "alt"):
+        store.save_profile(
+            "qwen",
+            profile_id,
+            {
+                "cookie": f"qwen_session={profile_id}-session",
+                "bearer": f"{profile_id}-bearer",
+                "userAgent": "Chrome Test",
+            },
+        )
+        registry.update_metadata(f"direct:qwen:{profile_id}", {"providerId": "qwen", "displayName": profile_id})
+    registry.set_current("qwen", "direct:qwen:default")
+
+    class RateLimitedDefaultQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(str(self.credential.get("bearer") or ""))
+            if self.credential.get("bearer") == "default-bearer":
+                request = httpx.Request("POST", "https://chat.qwen.ai/api/v2/chat/completions")
+                response = httpx.Response(429, json={"error": {"message": "rate limited"}}, request=request)
+                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+            return _openai_response("ok")
+
+    client = TestClient(
+        create_app(
+            config=GatewayConfig(
+                server=ServerConfig(api_key="local-dev-key"),
+                provider_runtime=ProviderRuntimeConfig(qwen_direct_max_inflight=1, qwen_direct_max_queue=2),
+            ),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            qwen_client_factory=RateLimitedDefaultQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    client.app.state.account_registry = registry
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert attempts == ["default-bearer", "alt-bearer"]
+
+
+def test_qwen_direct_does_not_switch_pinned_profile_after_rate_limit(tmp_path: Path) -> None:
+    attempts: list[str] = []
+    store = CredentialStore(tmp_path / "credentials")
+    for profile_id in ("default", "alt"):
+        store.save_profile(
+            "qwen",
+            profile_id,
+            {
+                "cookie": f"qwen_session={profile_id}-session",
+                "bearer": f"{profile_id}-bearer",
+                "userAgent": "Chrome Test",
+            },
+        )
+
+    class RateLimitedQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(str(self.credential.get("bearer") or ""))
+            request = httpx.Request("POST", "https://chat.qwen.ai/api/v2/chat/completions")
+            response = httpx.Response(429, json={"error": {"message": "rate limited"}}, request=request)
+            raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            qwen_client_factory=RateLimitedQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Ds2-Target-Account": "direct:qwen:default"},
+        json={"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 429
+    assert attempts == ["default-bearer"]
+
+
 def test_qwen_direct_cools_down_after_provider_rate_limit(tmp_path: Path) -> None:
     starts: list[float] = []
 
