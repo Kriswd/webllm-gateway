@@ -167,6 +167,7 @@ WEBAI2API_MODEL_UNAVAILABLE_MARKERS = (
     "no selectable models",
 )
 REQUEST_DIAGNOSTIC_LIMIT = 200
+QWEN_LIVE_MODEL_CATALOG_CACHE_SECONDS = 120
 TOOL_CALL_REGISTRY_LIMIT = 512
 OFF_TASK_QUESTION_ERROR_KINDS = {
     "off_task_environment_configuration_question",
@@ -362,6 +363,7 @@ def create_app(
     app.state.request_diagnostics = deque(maxlen=REQUEST_DIAGNOSTIC_LIMIT)
     app.state.request_diagnostic_sequence = 0
     app.state.request_diagnostic_lock = threading.Lock()
+    app.state.qwen_live_model_catalog_cache = {}
     app.state.tool_call_registry = OrderedDict()
     app.state.media_generations = OrderedDict()
     app.state.auto_research_fixture_dir = Path(auto_research_fixture_dir) if auto_research_fixture_dir is not None else _default_auto_research_fixture_dir()
@@ -380,6 +382,9 @@ def create_app(
 
     def current_config() -> GatewayConfig:
         return app.state.config
+
+    def load_gateway_models_with_direct_catalog(cfg: GatewayConfig) -> dict[str, Any]:
+        return _append_qwen_live_model_catalog(app, client, _load_gateway_models(client, cfg), cfg)
 
     def auth_value_matches(value: str | None, expected: str) -> bool:
         if value is None:
@@ -467,7 +472,7 @@ def create_app(
     def admin_onboarding(request: Request) -> dict[str, Any]:
         require_local_admin(request)
         cfg = current_config()
-        models_payload = _load_gateway_models(client, cfg)
+        models_payload = load_gateway_models_with_direct_catalog(cfg)
         models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
         provider_data = provider_payload(app.state.credential_store)["providers"]
         webai2api_instances = _load_webai2api_instances(client, cfg)
@@ -698,6 +703,16 @@ def create_app(
                 add_model(model_id)
 
         if provider.get("route") == "direct":
+            provider_id = str(provider.get("id") or "")
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                model_id = item.get("id")
+                if not isinstance(model_id, str):
+                    continue
+                owner = str(item.get("owned_by") or "")
+                if _direct_catalog_model_belongs_to_provider(provider_id, model_id, owner):
+                    add_model(model_id)
             return provider_models
 
         provider_id = str(provider.get("id") or "")
@@ -1004,7 +1019,7 @@ def create_app(
         require_local_admin(request)
         cfg = current_config()
         provider_data = provider_payload(app.state.credential_store)["providers"]
-        models_payload = _load_gateway_models(client, cfg)
+        models_payload = load_gateway_models_with_direct_catalog(cfg)
         models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
         model_ids = {item.get("id") for item in models if isinstance(item, dict)}
         instances = _load_webai2api_instances(client, cfg)
@@ -1077,7 +1092,7 @@ def create_app(
                     raise HTTPException(status_code=502, detail="WebAI2API 正在重启，请稍后再检测模型")
                 instances = _load_webai2api_instances(client, cfg)
             app.state.account_registry.set_current(provider.id, account_id)
-        models_payload = _load_gateway_models(client, cfg)
+        models_payload = load_gateway_models_with_direct_catalog(cfg)
         models = models_payload.get("data") if isinstance(models_payload.get("data"), list) else []
         provider_payloads = provider_payload(app.state.credential_store)["providers"]
         models = _with_onboarding_provider_catalog_models(models, provider_payloads, instances)
@@ -1727,15 +1742,18 @@ def create_app(
     ) -> JSONResponse:
         require_auth(authorization, x_api_key, api_key)
         cfg = current_config()
+        data: dict[str, Any] | None = None
         try:
             response = client.get(cfg.upstream.base_url.rstrip("/") + "/models", headers=upstream_headers(cfg))
             if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict) and isinstance(data.get("data"), list):
-                    return JSONResponse(_append_web_models(data))
+                upstream_data = response.json()
+                if isinstance(upstream_data, dict) and isinstance(upstream_data.get("data"), list):
+                    data = _append_web_models(upstream_data)
         except Exception:
             pass
-        return JSONResponse(_append_web_models({"object": "list", "data": [{"id": cfg.upstream.model, "object": "model"}]}))
+        if data is None:
+            data = _append_web_models({"object": "list", "data": [{"id": cfg.upstream.model, "object": "model"}]})
+        return JSONResponse(_append_qwen_live_model_catalog(app, client, data, cfg))
 
     @app.post("/v1/images/generations")
     async def image_generations(
@@ -4594,6 +4612,121 @@ def _load_gateway_models(client: httpx.Client, cfg: GatewayConfig) -> dict[str, 
     except Exception:
         pass
     return _append_web_models({"object": "list", "data": [{"id": cfg.upstream.model, "object": "model"}]})
+
+
+def _append_qwen_live_model_catalog(
+    app: FastAPI,
+    client: httpx.Client,
+    data: dict[str, Any],
+    cfg: GatewayConfig,
+) -> dict[str, Any]:
+    return _append_extra_model_payloads(data, _qwen_live_model_payloads(app, client, cfg))
+
+
+def _append_extra_model_payloads(data: dict[str, Any], payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    if not payloads:
+        return data
+    items = data.get("data") if isinstance(data.get("data"), list) else []
+    out: list[Any] = []
+    seen: set[Any] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        model_id = normalize_model_id(item.get("id"))
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        out.append(_enrich_model_payload({**item, "id": model_id}))
+    for item in payloads:
+        if not isinstance(item, dict):
+            continue
+        model_id = normalize_model_id(item.get("id"))
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        out.append(_enrich_model_payload({**item, "id": model_id}))
+    return {**data, "object": data.get("object") or "list", "data": out}
+
+
+def _qwen_live_model_payloads(app: FastAPI, client: httpx.Client, cfg: GatewayConfig) -> list[dict[str, Any]]:
+    if app.state.qwen_client_factory is QwenWebClient and _http_client_uses_mock_transport(client):
+        return []
+    cache_key = _qwen_live_model_catalog_cache_key(app)
+    if not cache_key:
+        return []
+    now = time.time()
+    cache = getattr(app.state, "qwen_live_model_catalog_cache", {})
+    if (
+        isinstance(cache, dict)
+        and cache.get("key") == cache_key
+        and float(cache.get("expiresAt") or 0) > now
+        and isinstance(cache.get("models"), list)
+    ):
+        return [dict(item) for item in cache["models"] if isinstance(item, dict)]
+
+    last_error = ""
+    for account_id in _authorized_direct_account_ids(app, "qwen"):
+        credential = _direct_credential_for_account(app, "qwen", account_id)
+        if not isinstance(credential, dict) or not is_credential_authorized("qwen", credential):
+            continue
+        try:
+            web_client = _build_qwen_web_client(app.state.qwen_client_factory, credential, client, cfg)
+            if not hasattr(web_client, "list_models"):
+                continue
+            models = web_client.list_models()
+            if not isinstance(models, list):
+                continue
+            payloads = [dict(item) for item in models if isinstance(item, dict) and normalize_model_id(item.get("id"))]
+            app.state.qwen_live_model_catalog_cache = {
+                "key": cache_key,
+                "expiresAt": now + QWEN_LIVE_MODEL_CATALOG_CACHE_SECONDS,
+                "models": payloads,
+                "accountId": account_id,
+            }
+            app.state.qwen_live_model_catalog_last_error = ""
+            return payloads
+        except Exception as exc:
+            last_error = _preview_text(_redact_sensitive_text(str(exc)), max_chars=240)
+            continue
+    if last_error:
+        app.state.qwen_live_model_catalog_last_error = last_error
+    return []
+
+
+def _http_client_uses_mock_transport(client: httpx.Client) -> bool:
+    return isinstance(getattr(client, "_transport", None), httpx.MockTransport)
+
+
+def _qwen_live_model_catalog_cache_key(app: FastAPI) -> tuple[str, ...]:
+    parts: list[str] = []
+    for account_id in _authorized_direct_account_ids(app, "qwen"):
+        credential = _direct_credential_for_account(app, "qwen", account_id)
+        if not isinstance(credential, dict) or not is_credential_authorized("qwen", credential):
+            continue
+        metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+        parts.append(
+            ":".join(
+                (
+                    account_id,
+                    str(credential.get("updatedAt") or credential.get("createdAt") or ""),
+                    "bearer" if credential.get("bearer") else "",
+                    "session" if metadata.get("sessionToken") else "",
+                )
+            )
+        )
+    return tuple(parts)
+
+
+def _direct_catalog_model_belongs_to_provider(provider_id: str, model_id: str, owner: str = "") -> bool:
+    model = normalize_model_id(model_id)
+    provider = str(provider_id or "").strip()
+    owned_by = str(owner or "").strip()
+    if provider == "qwen":
+        return owned_by == "qwen" or model.startswith("qwen-web/")
+    if provider == "qwen-coder":
+        return owned_by == "qwen-coder" or model.startswith("qwen-coder/")
+    return False
 
 
 def _build_direct_payload(

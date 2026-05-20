@@ -22,6 +22,7 @@ from .prompt_compaction import (
 
 QWEN_MODEL_PREFIX = "qwen-web/"
 QWEN_BASE_URL = "https://chat.qwen.ai"
+QWEN_MODELS_PATH = "/api/v2/models/"
 DEFAULT_QWEN_REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_QWEN_PROMPT_MAX_CHARS = 32000
 QWEN_TOOL_BRIDGE_RUNAWAY_OUTPUT_CHARS = 12000
@@ -79,6 +80,7 @@ class QwenWebClient:
         self.request_timeout_seconds = max(30.0, float(request_timeout_seconds or DEFAULT_QWEN_REQUEST_TIMEOUT_SECONDS))
         self.prompt_max_chars = max(4000, int(prompt_max_chars or DEFAULT_QWEN_PROMPT_MAX_CHARS))
         self.last_diagnostic: dict[str, Any] = {}
+        self._model_alias_cache: dict[str, str] | None = None
         self.http_client = http_client or httpx.Client(timeout=self.request_timeout_seconds, trust_env=False)
 
     def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -100,12 +102,16 @@ class QwenWebClient:
         if files:
             raise RuntimeError("Qwen Web 直连暂不支持 multimodal 附件上传；请改用 WebAI2API Qwen 适配器或支持多模态的上游。")
         model = str(payload.get("model") or f"{QWEN_MODEL_PREFIX}qwen3.5-plus")
+        upstream_model = self.resolve_model_alias(model)
+        if upstream_model != normalize_qwen_model(model):
+            self.last_diagnostic["model_alias_resolved"] = True
+            self.last_diagnostic["upstream_model"] = upstream_model
         chat = self.create_chat_session()
         try:
             content = self.send_chat(
                 chat_id=str(chat.get("chatId") or chat.get("chat_id") or chat.get("id") or ""),
                 prompt=prompt,
-                model=normalize_qwen_model(model),
+                model=upstream_model,
                 files=files,
                 enable_web_search=bool(payload.get("_webai_native_web_search")),
             )
@@ -116,7 +122,7 @@ class QwenWebClient:
                 content = self.send_chat(
                     chat_id=str(chat.get("chatId") or chat.get("chat_id") or chat.get("id") or ""),
                     prompt=prompt.rstrip() + QWEN_WEB_METADATA_RETRY_INSTRUCTION,
-                    model=normalize_qwen_model(model),
+                    model=upstream_model,
                     files=files,
                     enable_web_search=bool(payload.get("_webai_native_web_search")),
                 )
@@ -146,6 +152,41 @@ class QwenWebClient:
                 }
             ],
         }
+
+    def list_models(self) -> list[dict[str, Any]]:
+        response = self.http_client.get(
+            f"{QWEN_BASE_URL}{QWEN_MODELS_PATH}",
+            headers=self.headers(accept="application/json"),
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        _raise_for_qwen_response_error(response)
+        return parse_qwen_model_catalog(response.json())
+
+    def resolve_model_alias(self, model: str) -> str:
+        requested = normalize_qwen_model(model)
+        alias_map = self._live_model_alias_map()
+        return alias_map.get(requested, requested)
+
+    def _live_model_alias_map(self) -> dict[str, str]:
+        if self._model_alias_cache is not None:
+            return self._model_alias_cache
+        aliases: dict[str, str] = {}
+        try:
+            for item in self.list_models():
+                if not isinstance(item, dict):
+                    continue
+                model_id = normalize_qwen_model(str(item.get("id") or ""))
+                if not model_id:
+                    continue
+                upstream_model = normalize_qwen_model(str(item.get("upstream_model") or model_id))
+                if upstream_model:
+                    aliases[model_id] = upstream_model
+                    aliases[upstream_model] = upstream_model
+        except Exception:
+            aliases = {}
+        self._model_alias_cache = aliases
+        return aliases
 
     def create_chat_session(self) -> dict[str, Any]:
         response = self.http_client.post(
@@ -239,6 +280,105 @@ class QwenWebClient:
         if bearer:
             headers["Authorization"] = f"Bearer {bearer}"
         return headers
+
+
+def parse_qwen_model_catalog(data: Any) -> list[dict[str, Any]]:
+    models: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _qwen_model_catalog_items(data):
+        if not isinstance(item, dict):
+            continue
+        raw_model_id = str(
+            item.get("id")
+            or item.get("model")
+            or item.get("modelId")
+            or item.get("model_id")
+            or ""
+        ).strip()
+        if not raw_model_id:
+            continue
+        normalized_raw = normalize_model_id(raw_model_id).removeprefix(QWEN_MODEL_PREFIX)
+        if not normalized_raw or not normalized_raw.lower().startswith("qwen"):
+            continue
+        name = item.get("name") or item.get("label") or item.get("displayName") or item.get("display_name")
+        payload = _qwen_model_catalog_payload(normalized_raw, name, availability_source="qwen_live_catalog")
+        if payload["id"] not in seen:
+            seen.add(payload["id"])
+            models.append(payload)
+        alias = _qwen_model_alias_from_name(name)
+        if alias and alias != normalized_raw:
+            alias_payload = _qwen_model_catalog_payload(
+                alias,
+                name,
+                availability_source="qwen_live_catalog_alias",
+                upstream_model=normalized_raw,
+            )
+            if alias_payload["id"] not in seen:
+                seen.add(alias_payload["id"])
+                models.append(alias_payload)
+    return models
+
+
+def _qwen_model_catalog_payload(
+    model: str,
+    name: Any,
+    *,
+    availability_source: str,
+    upstream_model: str | None = None,
+) -> dict[str, Any]:
+    normalized = normalize_model_id(model).removeprefix(QWEN_MODEL_PREFIX)
+    payload: dict[str, Any] = {
+        "id": f"{QWEN_MODEL_PREFIX}{normalized}",
+        "object": "model",
+        "owned_by": "qwen",
+        "availability_source": availability_source,
+        "type": "text",
+        "capabilities": {
+            "tool_bridge": True,
+            "supports_native_tools": False,
+            "preferred_protocol": "openai",
+            "text": True,
+            "image": False,
+            "video": False,
+        },
+    }
+    if isinstance(name, str) and name.strip():
+        payload["name"] = name.strip()
+    if upstream_model:
+        payload["upstream_model"] = normalize_model_id(upstream_model).removeprefix(QWEN_MODEL_PREFIX)
+    return payload
+
+
+def _qwen_model_alias_from_name(name: Any) -> str:
+    if not isinstance(name, str):
+        return ""
+    alias = name.strip().lower()
+    if not alias:
+        return ""
+    alias = re.sub(r"\s+", "-", alias)
+    alias = re.sub(r"[^a-z0-9.]+", "-", alias)
+    alias = re.sub(r"-{2,}", "-", alias).strip("-")
+    return alias if alias.startswith("qwen") else ""
+
+
+def _qwen_model_catalog_items(data: Any) -> list[Any]:
+    if isinstance(data, list):
+        return list(data)
+    if not isinstance(data, dict):
+        return []
+    candidates: list[Any] = []
+    for key in ("data", "models", "items", "list", "result"):
+        if key in data:
+            candidates.append(data.get(key))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return list(candidate)
+        if isinstance(candidate, dict):
+            for key in ("data", "models", "items", "list", "result"):
+                nested = candidate.get(key)
+                if isinstance(nested, list):
+                    return list(nested)
+    return []
 
 
 def qwen_messages_to_prompt_and_files(

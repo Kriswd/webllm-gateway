@@ -53,6 +53,7 @@ from webai_gateway.qwen_web import (
     QwenWebClient,
     _collect_qwen_stream_lines,
     normalize_qwen_model,
+    parse_qwen_model_catalog,
     parse_qwen_stream_text,
     qwen_messages_to_prompt_and_files,
 )
@@ -1321,6 +1322,104 @@ def test_models_returns_configured_model_when_upstream_models_unavailable() -> N
     assert qwen_preview["capabilities"]["supports_native_tools"] is False
     assert "gpt-instant" not in model_ids
     assert "sora-2" not in model_ids
+
+
+def test_parse_qwen_model_catalog_prefixes_live_qwen_models() -> None:
+    models = parse_qwen_model_catalog(
+        {
+            "data": {
+                "data": [
+                    {"id": "qwen-latest-series-invite-beta-v24", "name": "Qwen3.7-Max-Preview"},
+                    {"id": "qwen3.7-max", "name": "Qwen3.7-Max"},
+                    {"id": "qwen-web/qwen3.7-max", "name": "duplicate"},
+                    {"id": "not-qwen-model", "name": "Other"},
+                    {"model_id": "qwen3.7-plus-preview", "displayName": "Qwen3.7-Plus-Preview"},
+                ]
+            }
+        }
+    )
+
+    ids = [item["id"] for item in models]
+    assert "qwen-web/qwen-latest-series-invite-beta-v24" in ids
+    assert "qwen-web/qwen3.7-max-preview" in ids
+    assert "qwen-web/qwen3.7-max" in ids
+    assert "qwen-web/qwen3.7-plus-preview" in ids
+    alias = next(item for item in models if item["id"] == "qwen-web/qwen3.7-max-preview")
+    assert alias["name"] == "Qwen3.7-Max-Preview"
+    assert alias["availability_source"] == "qwen_live_catalog_alias"
+    assert alias["upstream_model"] == "qwen-latest-series-invite-beta-v24"
+    assert alias["capabilities"]["tool_bridge"] is True
+    assert alias["capabilities"]["supports_native_tools"] is False
+    assert alias["capabilities"]["text"] is True
+
+
+def test_qwen_live_catalog_adds_new_account_models_to_models_and_onboarding(tmp_path: Path) -> None:
+    store = _credential_store(tmp_path)
+
+    class CatalogQwenClient:
+        def __init__(self, credential: dict[str, Any], **kwargs: Any) -> None:
+            assert credential["cookie"] == "qwen_session=session-secret"
+
+        def list_models(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "qwen-web/qwen-latest-series-invite-beta-v24",
+                    "object": "model",
+                    "owned_by": "qwen",
+                    "availability_source": "qwen_live_catalog",
+                    "type": "text",
+                    "capabilities": {
+                        "tool_bridge": True,
+                        "supports_native_tools": False,
+                        "preferred_protocol": "openai",
+                        "text": True,
+                        "image": False,
+                        "video": False,
+                    },
+                },
+                {
+                    "id": "qwen-web/qwen3.7-max-preview",
+                    "object": "model",
+                    "owned_by": "qwen",
+                    "availability_source": "qwen_live_catalog_alias",
+                    "type": "text",
+                    "upstream_model": "qwen-latest-series-invite-beta-v24",
+                    "capabilities": {
+                        "tool_bridge": True,
+                        "supports_native_tools": False,
+                        "preferred_protocol": "openai",
+                        "text": True,
+                        "image": False,
+                        "video": False,
+                    },
+                },
+            ]
+
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            http_client=_not_found_client(),
+            qwen_client_factory=CatalogQwenClient,
+        )
+    )
+
+    response = client.get("/v1/models", headers=_headers())
+
+    assert response.status_code == 200
+    model_ids = {item["id"] for item in response.json()["data"]}
+    assert "qwen-web/qwen-latest-series-invite-beta-v24" in model_ids
+    assert "qwen-web/qwen3.7-max-preview" in model_ids
+    qwen37 = next(item for item in response.json()["data"] if item["id"] == "qwen-web/qwen3.7-max-preview")
+    assert qwen37["availability_source"] == "qwen_live_catalog_alias"
+    assert qwen37["upstream_model"] == "qwen-latest-series-invite-beta-v24"
+    assert qwen37["capabilities"]["tool_bridge"] is True
+
+    onboarding = client.get("/api/admin/onboarding", params={"includeCandidates": "true"}).json()
+    qwen = next(item for item in onboarding["providers"] if item["id"] == "qwen")
+    assert "qwen-web/qwen3.7-max-preview" in qwen["availableModels"]
+    assert "qwen-web/qwen3.7-max-preview" in {item["id"] for item in onboarding["models"]}
 
 
 def test_model_id_normalization_strips_terminal_sgr_artifacts() -> None:
@@ -22891,6 +22990,52 @@ def test_qwen_web_route_normalizes_model_id_before_provider_dispatch(tmp_path: P
 
     assert response.status_code == 200
     assert seen_payloads[0]["model"] == "qwen-web/qwen3.6-max-preview"
+
+
+def test_qwen_web_client_resolves_live_display_name_alias_to_upstream_model() -> None:
+    attempts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/v2/models/"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "data": [
+                            {
+                                "id": "qwen-latest-series-invite-beta-v24",
+                                "name": "Qwen3.7-Max-Preview",
+                            }
+                        ]
+                    }
+                },
+                request=request,
+            )
+        if request.url.path.endswith("/api/v2/chats/new"):
+            return httpx.Response(200, json={"data": {"id": "chat-test"}}, request=request)
+        if request.url.path.endswith("/api/v2/chat/completions"):
+            attempts.append(json.loads(request.content.decode("utf-8")))
+            content = b'data: {"choices":[{"delta":{"content":"ok","phase":"answer"}}]}\n\ndata: [DONE]\n\n'
+            return httpx.Response(200, content=content, request=request, headers={"content-type": "text/event-stream"})
+        return httpx.Response(404, request=request)
+
+    qwen = QwenWebClient(
+        {"cookie": "qwen_session=session-secret", "bearer": "bearer-secret", "userAgent": "Chrome Test"},
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = qwen.chat_completions(
+        {
+            "model": "qwen-web/qwen3.7-max-preview",
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+    )
+
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert attempts[0]["model"] == "qwen-latest-series-invite-beta-v24"
+    assert attempts[0]["messages"][0]["models"] == ["qwen-latest-series-invite-beta-v24"]
+    assert qwen.last_diagnostic["model_alias_resolved"] is True
+    assert qwen.last_diagnostic["upstream_model"] == "qwen-latest-series-invite-beta-v24"
 
 
 def test_qwen_coder_client_retries_metadata_only_phase_response() -> None:
