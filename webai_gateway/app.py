@@ -183,7 +183,7 @@ _SMOKE_SENSITIVE_FIELD_RE = re.compile(r"(?i)\b(?:qwen_session|ds_session_id|hws
 _GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
 
 
-class _DeepSeekDs2apiBearerGate:
+class _ProviderRateLimitGate:
     def __init__(self, *, max_inflight: int, cooldown_seconds: float) -> None:
         self.max_inflight = max(1, int(max_inflight))
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
@@ -5500,7 +5500,7 @@ def _deepseek_ds2api_retry_delays(app: FastAPI) -> tuple[float, ...]:
         return ()
 
 
-def _deepseek_ds2api_bearer_gate(app: FastAPI, config: GatewayConfig) -> _DeepSeekDs2apiBearerGate:
+def _deepseek_ds2api_bearer_gate(app: FastAPI, config: GatewayConfig) -> _ProviderRateLimitGate:
     gate_config = (
         max(1, int(config.provider_runtime.deepseek_ds2api_bearer_max_inflight)),
         max(0.0, float(config.provider_runtime.deepseek_ds2api_rate_limit_cooldown_seconds)),
@@ -5514,12 +5514,79 @@ def _deepseek_ds2api_bearer_gate(app: FastAPI, config: GatewayConfig) -> _DeepSe
             getattr(app.state, "deepseek_ds2api_bearer_gate", None) is None
             or getattr(app.state, "deepseek_ds2api_bearer_gate_config", None) != gate_config
         ):
-            app.state.deepseek_ds2api_bearer_gate = _DeepSeekDs2apiBearerGate(
+            app.state.deepseek_ds2api_bearer_gate = _ProviderRateLimitGate(
                 max_inflight=gate_config[0],
                 cooldown_seconds=gate_config[1],
             )
-            app.state.deepseek_ds2api_bearer_gate_config = gate_config
+        app.state.deepseek_ds2api_bearer_gate_config = gate_config
         return app.state.deepseek_ds2api_bearer_gate
+
+
+def _qwen_direct_gate(app: FastAPI, config: GatewayConfig, route: str) -> _ProviderRateLimitGate:
+    gate_config = (
+        route,
+        max(1, int(config.provider_runtime.qwen_direct_max_inflight)),
+        max(0.0, float(config.provider_runtime.qwen_direct_rate_limit_cooldown_seconds)),
+    )
+    lock = getattr(app.state, "qwen_direct_gate_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        app.state.qwen_direct_gate_lock = lock
+    with lock:
+        gates = getattr(app.state, "qwen_direct_gates", None)
+        gate_configs = getattr(app.state, "qwen_direct_gate_configs", None)
+        if not isinstance(gates, dict):
+            gates = {}
+            app.state.qwen_direct_gates = gates
+        if not isinstance(gate_configs, dict):
+            gate_configs = {}
+            app.state.qwen_direct_gate_configs = gate_configs
+        if route not in gates or gate_configs.get(route) != gate_config:
+            gates[route] = _ProviderRateLimitGate(
+                max_inflight=gate_config[1],
+                cooldown_seconds=gate_config[2],
+            )
+            gate_configs[route] = gate_config
+        return gates[route]
+
+
+def _is_qwen_direct_rate_limit_exception(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        return True
+    text = str(exc).lower()
+    markers = (
+        "429",
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "too many request",
+        "quota",
+        "限流",
+        "频率",
+        "配额",
+        "请求过多",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _call_qwen_direct_with_gate(
+    app: FastAPI,
+    *,
+    route: str,
+    web_client: Any,
+    payload: dict[str, Any],
+    config: GatewayConfig,
+) -> dict[str, Any]:
+    gate = _qwen_direct_gate(app, config, route)
+    gate.acquire()
+    try:
+        return web_client.chat_completions(payload)
+    except Exception as exc:
+        if _is_qwen_direct_rate_limit_exception(exc):
+            gate.note_rate_limit()
+        raise
+    finally:
+        gate.release()
 
 
 def _is_deepseek_ds2api_upstream_empty_output_rate_limit(exc: DeepSeekDs2apiError) -> bool:
@@ -5796,7 +5863,7 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
     try:
         web_client = None
         web_client = _build_qwen_web_client(app.state.qwen_client_factory, credential, client, config)
-        data = web_client.chat_completions(payload)
+        data = _call_qwen_direct_with_gate(app, route="qwen-web", web_client=web_client, payload=payload, config=config)
     except HTTPException:
         raise
     except httpx.HTTPStatusError as exc:
@@ -5881,7 +5948,13 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
             allowed_tools=allowed_tools,
             bridge_context=bridge_context,
             model=model,
-            retry_chat=web_client.chat_completions,
+            retry_chat=lambda retry_payload: _call_qwen_direct_with_gate(
+                app,
+                route="qwen-web",
+                web_client=web_client,
+                payload=retry_payload,
+                config=config,
+            ),
             native_web_search=bool(payload.get("_webai_native_web_search")),
         )
     except HTTPException:
@@ -6005,7 +6078,7 @@ def _qwen_coder_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], c
     try:
         web_client = None
         web_client = _build_qwen_coder_client(app.state.qwen_coder_client_factory, credential, client, config)
-        data = web_client.chat_completions(payload)
+        data = _call_qwen_direct_with_gate(app, route="qwen-coder", web_client=web_client, payload=payload, config=config)
     except HTTPException:
         raise
     except httpx.HTTPStatusError as exc:
@@ -6090,7 +6163,13 @@ def _qwen_coder_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], c
             allowed_tools=allowed_tools,
             bridge_context=bridge_context,
             model=model,
-            retry_chat=web_client.chat_completions,
+            retry_chat=lambda retry_payload: _call_qwen_direct_with_gate(
+                app,
+                route="qwen-coder",
+                web_client=web_client,
+                payload=retry_payload,
+                config=config,
+            ),
             native_web_search=bool(payload.get("_webai_native_web_search")),
         )
     except HTTPException:

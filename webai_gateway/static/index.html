@@ -277,6 +277,14 @@
                 <input id="deepseekDs2apiCurrentInputFileMinChars" name="deepseekDs2apiCurrentInputFileMinChars" type="number" min="0" max="100000000" />
               </label>
               <label class="field">
+                <span>Qwen direct 并发上限</span>
+                <input id="qwenDirectMaxInflight" name="qwenDirectMaxInflight" type="number" min="1" max="256" />
+              </label>
+              <label class="field">
+                <span>Qwen 429 冷却时间（秒）</span>
+                <input id="qwenDirectRateLimitCooldownSeconds" name="qwenDirectRateLimitCooldownSeconds" type="number" min="0" max="300" step="0.5" />
+              </label>
+              <label class="field">
                 <span>Qwen Web 后端</span>
                 <select id="qwenWebBackendSelect" name="qwenWebBackendSelect">
                   <option value="direct">直连 Qwen Web</option>
