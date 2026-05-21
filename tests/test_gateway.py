@@ -1940,6 +1940,10 @@ def test_webai2api_upstream_required_tool_choice_retries_plain_text_without_nati
     assert {event.get("stage") for event in events if event.get("kind") == "tool_bridge_retry"} >= {
         "required_tool_choice_recovery"
     }
+    tool_events = [event for event in events if event.get("kind") == "tool_bridge_tool_calls"]
+    assert tool_events[-1]["requestFingerprint"]
+    assert tool_events[-1]["route"] == "upstream"
+    assert tool_events[-1]["requestLatestUserPreview"] == "Call get_weather for Beijing."
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     tool_call = choice["message"]["tool_calls"][0]
@@ -14628,6 +14632,12 @@ def test_response_language_guard_retries_english_final_answer() -> None:
     assert "Gateway response language retry" in seen_payloads[1]["messages"][-1]["content"]
     assert seen_payloads[1]["messages"][-2]["content"].startswith("# Project Architecture Analysis")
     assert response.json()["choices"][0]["message"]["content"].startswith("这是控制面源码分析")
+    events = client.get("/api/admin/tool-bridge-events").json()["events"]
+    retry_events = [event for event in events if event.get("kind") == "response_language_retry"]
+    assert retry_events[0]["requestFingerprint"]
+    assert retry_events[0]["route"] == "upstream"
+    assert retry_events[0]["requestLatestUserChars"] > 0
+    assert retry_events[0]["requestLatestUserPreview"]
 
 
 def test_response_language_guard_respects_explicit_english_request() -> None:

@@ -1969,6 +1969,14 @@ def create_app(
                     bridge_context=bridge_context,
                     model=model,
                     retry_chat=retry_upstream_stream,
+                    request_trace=_completion_request_trace_fields(
+                        endpoint="/v1/chat/completions",
+                        route="upstream",
+                        model=model,
+                        body=body,
+                        stream=bool(body.get("stream")),
+                        bridge=bridge,
+                    ),
                 )
                 tool_calls = _response_tool_calls(parsed)
                 if tool_calls:
@@ -2063,6 +2071,14 @@ def create_app(
             bridge_context=bridge_context,
             model=model,
             retry_chat=retry_upstream,
+            request_trace=_completion_request_trace_fields(
+                endpoint="/v1/chat/completions",
+                route="upstream",
+                model=model,
+                body=body,
+                stream=bool(body.get("stream")),
+                bridge=bridge,
+            ),
         )
         return _openai_json_response(
             app,
@@ -2247,6 +2263,14 @@ def create_app(
                     model=model,
                     bridge_context=bridge_context,
                     retry_chat=retry_upstream,
+                    request_trace=_completion_request_trace_fields(
+                        endpoint="/v1/messages",
+                        route="upstream",
+                        model=model,
+                        body=body,
+                        stream=bool(body.get("stream")),
+                        bridge=bridge,
+                    ),
                 )
         _remember_openai_tool_calls(app, parsed)
         anthropic_message = openai_response_to_anthropic(
@@ -2526,6 +2550,14 @@ def _webai2api_upstream_chat_payload(
         bridge_context=bridge_context,
         model=model,
         retry_chat=retry_chat,
+        request_trace=_completion_request_trace_fields(
+            endpoint="/v1/chat/completions",
+            route="upstream",
+            model=model,
+            body=body,
+            stream=bool(body.get("stream")),
+            bridge=bridge,
+        ),
     )
     return parsed
 
@@ -3253,6 +3285,52 @@ def _record_completion_diagnostic(
         **_request_body_diagnostic_fields(body),
         **response_fields,
     )
+
+
+_REQUEST_TRACE_FIELD_KEYS = (
+    "requestMessageCount",
+    "requestToolResultCount",
+    "requestToolErrorCount",
+    "requestLatestRole",
+    "requestLatestTextChars",
+    "requestLatestTextPreview",
+    "requestLatestUserChars",
+    "requestLatestUserPreview",
+    "requestLatestToolErrorPreview",
+    "requestToolChoice",
+)
+
+
+def _completion_request_trace_fields(
+    *,
+    endpoint: str,
+    route: str,
+    model: str,
+    body: dict[str, Any],
+    stream: bool,
+    bridge: bool,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "endpoint": endpoint,
+        "route": route,
+        "stream": bool(stream),
+        "bridge": bool(bridge),
+        "requestFingerprint": _completion_request_fingerprint(
+            endpoint=endpoint,
+            route=route,
+            model=model,
+            body=body,
+            stream=stream,
+            bridge=bridge,
+        ),
+    }
+    fields.update(_request_event_trace_fields(body))
+    return fields
+
+
+def _request_event_trace_fields(body: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = _request_body_diagnostic_fields(body)
+    return {key: diagnostics[key] for key in _REQUEST_TRACE_FIELD_KEYS if key in diagnostics}
 
 
 def _record_completion_started_diagnostic(
@@ -4241,6 +4319,7 @@ def _record_bridge_parse_event(
     allowed_tools: set[str],
     stage: str,
     bridge_context: Any | None = None,
+    request_trace: dict[str, Any] | None = None,
 ) -> None:
     if getattr(bridge_result, "error", None) is not None:
         kind = "tool_bridge_error"
@@ -4254,6 +4333,7 @@ def _record_bridge_parse_event(
         app,
         kind,
         stage=stage,
+        **(request_trace or {}),
         **_bridge_result_event_fields(
             bridge_result,
             model=model,
@@ -4270,12 +4350,14 @@ def _record_bridge_rejection_event(
     model: str,
     allowed_tools: set[str],
     bridge_context: Any | None = None,
+    request_trace: dict[str, Any] | None = None,
 ) -> None:
     if getattr(bridge_result, "error", None) is None:
         return
     _record_tool_bridge_event(
         app,
         "tool_bridge_rejection",
+        **(request_trace or {}),
         **_bridge_result_event_fields(
             bridge_result,
             model=model,
@@ -4901,7 +4983,9 @@ def _parse_bridge_chat_data(
     model: str,
     retry_chat: Any,
     native_web_search: bool = False,
+    request_trace: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any]:
+    trace_fields = dict(request_trace or _request_event_trace_fields(payload))
     retry_state = RetryState()
     if native_web_search and not bridge and should_retry_native_web_search_response(data):
         retry_data = retry_chat(build_native_web_search_retry_payload(payload, _openai_response_content(data)))
@@ -4930,12 +5014,14 @@ def _parse_bridge_chat_data(
             allowed_tools=allowed_tools,
             stage="initial",
             bridge_context=bridge_context,
+            request_trace=trace_fields,
         )
     if _should_retry_required_tool_choice_recovery(bridge_result):
         _record_tool_bridge_event(
             app,
             "tool_bridge_retry",
             stage="required_tool_choice_recovery",
+            **trace_fields,
             model=model,
             errorKind=bridge_result.error.kind,
             errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -4972,12 +5058,14 @@ def _parse_bridge_chat_data(
                     allowed_tools=allowed_tools,
                     stage="required_tool_choice_recovery",
                     bridge_context=bridge_context,
+                    request_trace=trace_fields,
                 )
     if bridge_result.error and bridge_result.error.repairable:
         _record_tool_bridge_event(
             app,
             "tool_bridge_retry",
             stage="repair",
+            **trace_fields,
             model=model,
             errorKind=bridge_result.error.kind,
             errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5007,6 +5095,7 @@ def _parse_bridge_chat_data(
                     allowed_tools=allowed_tools,
                     stage="repair",
                     bridge_context=bridge_context,
+                    request_trace=trace_fields,
                 )
         if bridge_result.error and bridge_result.error.kind == "unknown_tool":
             virtual_loader_recovery = should_retry_virtual_loader_tool_recovery(
@@ -5017,6 +5106,7 @@ def _parse_bridge_chat_data(
                 app,
                 "tool_bridge_retry",
                 stage=recovery_stage,
+                **trace_fields,
                 model=model,
                 errorKind=bridge_result.error.kind,
                 errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5051,12 +5141,14 @@ def _parse_bridge_chat_data(
                         allowed_tools=allowed_tools,
                         stage=recovery_stage,
                         bridge_context=bridge_context,
+                        request_trace=trace_fields,
                     )
         elif _should_retry_off_task_question_recovery(bridge_result):
             _record_tool_bridge_event(
                 app,
                 "tool_bridge_retry",
                 stage="off_task_question_recovery",
+                **trace_fields,
                 model=model,
                 errorKind=bridge_result.error.kind,
                 errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5088,12 +5180,14 @@ def _parse_bridge_chat_data(
                         allowed_tools=allowed_tools,
                         stage="off_task_question_recovery",
                         bridge_context=bridge_context,
+                        request_trace=trace_fields,
                     )
         elif _should_retry_missing_required_tool_input_recovery(bridge_result):
             _record_tool_bridge_event(
                 app,
                 "tool_bridge_retry",
                 stage="missing_required_tool_input_recovery",
+                **trace_fields,
                 model=model,
                 errorKind=bridge_result.error.kind,
                 errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5129,12 +5223,14 @@ def _parse_bridge_chat_data(
                         allowed_tools=allowed_tools,
                         stage="missing_required_tool_input_recovery",
                         bridge_context=bridge_context,
+                        request_trace=trace_fields,
                     )
         elif _should_retry_tool_refusal_recovery(bridge_result):
             _record_tool_bridge_event(
                 app,
                 "tool_bridge_retry",
                 stage="tool_refusal_recovery",
+                **trace_fields,
                 model=model,
                 errorKind=bridge_result.error.kind,
                 errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5166,6 +5262,7 @@ def _parse_bridge_chat_data(
                         allowed_tools=allowed_tools,
                         stage="tool_refusal_recovery",
                         bridge_context=bridge_context,
+                        request_trace=trace_fields,
                     )
         elif _should_retry_controller_final_repair(bridge_result):
             parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
@@ -5180,6 +5277,7 @@ def _parse_bridge_chat_data(
                 model=model,
                 retry_chat=retry_chat,
                 stage="post_repair_controller_final_repair",
+                request_trace=trace_fields,
             )
         elif _should_retry_malformed_tool_format_repair(bridge_result):
             parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
@@ -5194,9 +5292,16 @@ def _parse_bridge_chat_data(
                 model=model,
                 retry_chat=retry_chat,
                 stage="post_repair_malformed_tool_repair",
+                request_trace=trace_fields,
             )
     elif should_retry_incomplete_response(data):
-        _record_tool_bridge_event(app, "tool_bridge_retry", stage="incomplete_response", model=model)
+        _record_tool_bridge_event(
+            app,
+            "tool_bridge_retry",
+            stage="incomplete_response",
+            **trace_fields,
+            model=model,
+        )
         retry_data = retry_chat(
             build_incomplete_response_retry_payload(
                 payload,
@@ -5229,12 +5334,14 @@ def _parse_bridge_chat_data(
                     allowed_tools=allowed_tools,
                     stage="incomplete_response",
                     bridge_context=bridge_context,
+                    request_trace=trace_fields,
                 )
             if bridge_result.error and bridge_result.error.repairable:
                 _record_tool_bridge_event(
                     app,
                     "tool_bridge_retry",
                     stage="incomplete_repair",
+                    **trace_fields,
                     model=model,
                     errorKind=bridge_result.error.kind,
                     errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5264,12 +5371,14 @@ def _parse_bridge_chat_data(
                             allowed_tools=allowed_tools,
                             stage="incomplete_repair",
                             bridge_context=bridge_context,
+                            request_trace=trace_fields,
                         )
                 if _should_retry_tool_refusal_recovery(bridge_result):
                     _record_tool_bridge_event(
                         app,
                         "tool_bridge_retry",
                         stage="incomplete_tool_refusal_recovery",
+                        **trace_fields,
                         model=model,
                         errorKind=bridge_result.error.kind,
                         errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5301,12 +5410,14 @@ def _parse_bridge_chat_data(
                                 allowed_tools=allowed_tools,
                                 stage="incomplete_tool_refusal_recovery",
                                 bridge_context=bridge_context,
+                                request_trace=trace_fields,
                             )
                 elif _should_retry_off_task_question_recovery(bridge_result):
                     _record_tool_bridge_event(
                         app,
                         "tool_bridge_retry",
                         stage="incomplete_off_task_question_recovery",
+                        **trace_fields,
                         model=model,
                         errorKind=bridge_result.error.kind,
                         errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5338,12 +5449,14 @@ def _parse_bridge_chat_data(
                                 allowed_tools=allowed_tools,
                                 stage="incomplete_off_task_question_recovery",
                                 bridge_context=bridge_context,
+                                request_trace=trace_fields,
                             )
                 elif _should_retry_missing_required_tool_input_recovery(bridge_result):
                     _record_tool_bridge_event(
                         app,
                         "tool_bridge_retry",
                         stage="incomplete_missing_required_tool_input_recovery",
+                        **trace_fields,
                         model=model,
                         errorKind=bridge_result.error.kind,
                         errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5379,6 +5492,7 @@ def _parse_bridge_chat_data(
                                 allowed_tools=allowed_tools,
                                 stage="incomplete_missing_required_tool_input_recovery",
                                 bridge_context=bridge_context,
+                                request_trace=trace_fields,
                             )
                 elif _should_retry_controller_final_repair(bridge_result):
                     parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
@@ -5393,6 +5507,7 @@ def _parse_bridge_chat_data(
                         model=model,
                         retry_chat=retry_chat,
                         stage="incomplete_post_repair_controller_final_repair",
+                        request_trace=trace_fields,
                     )
                 elif _should_retry_malformed_tool_format_repair(bridge_result):
                     parsed, bridge_result, retry_state = _retry_repairable_bridge_error(
@@ -5407,6 +5522,7 @@ def _parse_bridge_chat_data(
                         model=model,
                         retry_chat=retry_chat,
                         stage="incomplete_post_repair_malformed_tool_repair",
+                        request_trace=trace_fields,
                     )
     if bridge:
         if _should_retry_no_progress_escalation(bridge_result):
@@ -5414,6 +5530,7 @@ def _parse_bridge_chat_data(
                 app,
                 "tool_bridge_retry",
                 stage="no_progress_escalation",
+                **trace_fields,
                 model=model,
                 errorKind=bridge_result.error.kind,
                 errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5449,6 +5566,7 @@ def _parse_bridge_chat_data(
                     allowed_tools=allowed_tools,
                     stage="no_progress_escalation",
                     bridge_context=bridge_context,
+                    request_trace=trace_fields,
                 )
         _record_bridge_rejection_event(
             app,
@@ -5456,6 +5574,7 @@ def _parse_bridge_chat_data(
             model=model,
             allowed_tools=allowed_tools,
             bridge_context=bridge_context,
+            request_trace=trace_fields,
         )
         parsed, bridge_result = _finalize_retry_exhausted_bridge_error(
             parsed,
@@ -5470,6 +5589,7 @@ def _parse_bridge_chat_data(
             app,
             "response_language_retry",
             stage="final_answer_language",
+            **trace_fields,
             model=model,
             responseLanguage=response_language,
             contentPreview=_preview_text(previous_content, max_chars=240),
@@ -5495,6 +5615,7 @@ def _parse_bridge_chat_data(
                     app,
                     "response_language_retry",
                     stage="final_answer_language_succeeded",
+                    **trace_fields,
                     model=model,
                     responseLanguage=response_language,
                 )
@@ -5503,6 +5624,7 @@ def _parse_bridge_chat_data(
                     app,
                     "response_language_retry",
                     stage="final_answer_language_ignored",
+                    **trace_fields,
                     model=model,
                     responseLanguage=response_language,
                 )
@@ -5522,11 +5644,13 @@ def _retry_repairable_bridge_error(
     model: str,
     retry_chat: Any,
     stage: str,
+    request_trace: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any, RetryState]:
     _record_tool_bridge_event(
         app,
         "tool_bridge_retry",
         stage=stage,
+        **(request_trace or {}),
         model=model,
         errorKind=bridge_result.error.kind,
         errorMessage=_preview_text(bridge_result.error.message, max_chars=360),
@@ -5557,6 +5681,7 @@ def _retry_repairable_bridge_error(
             allowed_tools=allowed_tools,
             stage=stage,
             bridge_context=bridge_context,
+            request_trace=request_trace,
         )
     return parsed, bridge_result, retry_state
 
@@ -6223,6 +6348,14 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             model=model,
             retry_chat=lambda retry_payload: _call_deepseek_ds2api_with_retry(app, web_client, retry_payload, config),
             native_web_search=bool(payload.get("_webai_native_web_search")),
+            request_trace=_completion_request_trace_fields(
+                endpoint="/v1/chat/completions",
+                route="deepseek-web",
+                model=model,
+                body=body,
+                stream=bool(body.get("stream")),
+                bridge=bridge,
+            ),
         )
     except HTTPException:
         raise
@@ -6467,6 +6600,14 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
                 config=config,
             ),
             native_web_search=bool(payload.get("_webai_native_web_search")),
+            request_trace=_completion_request_trace_fields(
+                endpoint="/v1/chat/completions",
+                route="qwen-web",
+                model=model,
+                body=body,
+                stream=bool(body.get("stream")),
+                bridge=bridge,
+            ),
         )
     except HTTPException:
         raise
@@ -6714,6 +6855,14 @@ def _qwen_coder_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], c
                 config=config,
             ),
             native_web_search=bool(payload.get("_webai_native_web_search")),
+            request_trace=_completion_request_trace_fields(
+                endpoint="/v1/chat/completions",
+                route="qwen-coder",
+                model=model,
+                body=body,
+                stream=bool(body.get("stream")),
+                bridge=bridge,
+            ),
         )
     except HTTPException:
         raise
