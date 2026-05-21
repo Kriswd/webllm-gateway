@@ -48,6 +48,7 @@ from webai_gateway.openai_api import (
     build_off_task_question_recovery_payload,
     build_preflight_chat_response,
     build_repair_payload,
+    build_response_language_retry_payload,
     build_required_tool_choice_recovery_payload,
     build_skill_loader_preflight_chat_response,
     build_tool_refusal_recovery_payload,
@@ -61,6 +62,7 @@ from webai_gateway.openai_api import (
     post_upstream,
     should_retry_incomplete_response,
     should_retry_native_web_search_response,
+    should_retry_response_language_response,
     should_retry_virtual_loader_tool_recovery,
     _with_response_language_instruction,
     upstream_headers,
@@ -2773,6 +2775,12 @@ def _response_message_text(data: dict[str, Any]) -> str:
     return str(message.get("content") or "")
 
 
+def _configured_response_language(app: FastAPI) -> str:
+    config = getattr(app.state, "config", None)
+    provider_runtime = getattr(config, "provider_runtime", None)
+    return str(getattr(provider_runtime, "response_language", "") or "")
+
+
 def _response_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
     choices = data.get("choices") if isinstance(data.get("choices"), list) else []
     message = choices[0].get("message") if choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict) else {}
@@ -5455,6 +5463,49 @@ def _parse_bridge_chat_data(
             bridge_context=bridge_context,
             model=model,
         )
+    response_language = _configured_response_language(app)
+    if should_retry_response_language_response(parsed, payload, response_language):
+        previous_content = _response_message_text(parsed)
+        _record_tool_bridge_event(
+            app,
+            "response_language_retry",
+            stage="final_answer_language",
+            model=model,
+            responseLanguage=response_language,
+            contentPreview=_preview_text(previous_content, max_chars=240),
+        )
+        retry_data = retry_chat(build_response_language_retry_payload(payload, previous_content, response_language))
+        if isinstance(retry_data, dict):
+            retry_parsed, retry_bridge_result = parse_chat_response(
+                retry_data,
+                bridge=bridge,
+                allowed_tools=allowed_tools,
+                model=model,
+                bridge_context=bridge_context,
+                return_bridge_result=True,
+            )
+            retry_content = _response_message_text(retry_parsed)
+            if (
+                retry_content.strip()
+                and not _response_tool_calls(retry_parsed)
+                and not should_retry_response_language_response(retry_parsed, payload, response_language)
+            ):
+                parsed, bridge_result = retry_parsed, retry_bridge_result
+                _record_tool_bridge_event(
+                    app,
+                    "response_language_retry",
+                    stage="final_answer_language_succeeded",
+                    model=model,
+                    responseLanguage=response_language,
+                )
+            else:
+                _record_tool_bridge_event(
+                    app,
+                    "response_language_retry",
+                    stage="final_answer_language_ignored",
+                    model=model,
+                    responseLanguage=response_language,
+                )
     return parsed, bridge_result
 
 

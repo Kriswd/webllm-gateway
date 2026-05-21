@@ -14593,6 +14593,69 @@ def test_provider_runtime_response_language_round_trips_config(tmp_path: Path) -
     assert health["config"]["providerRuntime"]["responseLanguage"] == "en-US"
 
 
+def test_response_language_guard_retries_english_final_answer() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    english_answer = (
+        "# Project Architecture Analysis\n\n"
+        "Based on the comprehensive file exploration, this project implements a gateway control plane with account "
+        "management, provider routing, model discovery, diagnostics, and web authentication. The implementation "
+        "contains several layers that coordinate request preparation, upstream communication, response parsing, "
+        "tool bridge recovery, and client compatibility. The control plane exposes health checks, configuration "
+        "updates, account state summaries, smoke tests, and model catalog endpoints. It also keeps provider runtime "
+        "settings separated from protocol conversion so downstream clients can call the gateway through standard "
+        "OpenAI or Anthropic compatible APIs without knowing browser session details."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return httpx.Response(200, json=_openai_response(english_answer))
+        return httpx.Response(200, json=_openai_response("这是控制面源码分析：网关把账号、模型、健康检查和协议转换拆成了独立模块。"))
+
+    client = _client(handler)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "web-model", "messages": [{"role": "user", "content": "源码你也仔细看下，比如控制面的实现"}]},
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert seen_payloads[1]["_webai_response_language_retry"] is True
+    assert seen_payloads[1]["stream"] is False
+    assert "Gateway response language retry" in seen_payloads[1]["messages"][-1]["content"]
+    assert seen_payloads[1]["messages"][-2]["content"].startswith("# Project Architecture Analysis")
+    assert response.json()["choices"][0]["message"]["content"].startswith("这是控制面源码分析")
+
+
+def test_response_language_guard_respects_explicit_english_request() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    english_answer = (
+        "This answer intentionally stays in English because the user explicitly requested English. It contains a "
+        "detailed architecture summary, explains the provider runtime, describes the request routing layer, and "
+        "outlines the diagnostics surface for operators. The response should not be retried by the gateway language "
+        "guard because the latest user instruction selected English as the response language."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json=_openai_response(english_answer))
+
+    client = _client(handler)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "web-model", "messages": [{"role": "user", "content": "Please answer in English: explain the control plane."}]},
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    assert response.json()["choices"][0]["message"]["content"] == english_answer
+
+
 def test_admin_config_returns_manageable_local_settings(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     client = TestClient(create_app(config=_config(), config_path=config_path, http_client=_not_found_client()))

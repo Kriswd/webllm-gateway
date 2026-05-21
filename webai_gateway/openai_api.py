@@ -62,9 +62,34 @@ NATIVE_WEB_SEARCH_RETRY_INSTRUCTION = (
 RESPONSE_LANGUAGE_POLICY_MARKER = "WebLLM Gateway response language policy"
 WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER = "WebLLM Gateway current turn tool-choice policy"
 RESPONSE_LANGUAGE_OFF_VALUES = {"", "off", "none", "false", "disabled"}
+RESPONSE_LANGUAGE_RETRY_PREVIOUS_MAX_CHARS = 12000
+RESPONSE_LANGUAGE_RETRY_INSTRUCTION = (
+    "Gateway response language retry: the previous assistant final answer did not follow the configured response "
+    "language policy.\n"
+    "Rewrite only the previous assistant final answer in Simplified Chinese (zh-CN). Do not add new facts, do not "
+    "browse, do not ask the user a question, and do not call or simulate tools.\n"
+    "Keep code blocks, code identifiers, file paths, commands, API paths, protocol names, model IDs, product names, "
+    "and quoted source text unchanged when translating them would reduce precision."
+)
 WEBAI2API_CHATGPT_TEXT_PROMPT_MAX_CHARS = 12000
 WEBAI2API_CHATGPT_TEXT_MODELS = {"gpt-instant", "gpt-thinking", "gpt-pro"}
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
+_RESPONSE_LANGUAGE_CODE_FENCE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+_RESPONSE_LANGUAGE_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_RESPONSE_LANGUAGE_ENGLISH_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'-]{2,}\b")
+_RESPONSE_LANGUAGE_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_RESPONSE_LANGUAGE_OTHER_LANGUAGE_RE = re.compile(
+    r"(?:answer|respond|reply|write|translate|rewrite|summari[sz]e)\s+(?:it\s+)?(?:in|to)\s+"
+    r"(?:english|japanese|korean|french|german|spanish|russian|arabic|portuguese|italian)\b",
+    re.IGNORECASE,
+)
+_RESPONSE_LANGUAGE_OTHER_LANGUAGE_ZH_RE = re.compile(
+    r"(?:请|麻烦|用|使用|改成|翻译成|输出|回答|回复).{0,12}"
+    r"(?:英文|英语|日文|日语|韩文|韩语|法文|法语|德文|德语|西班牙文|西班牙语|俄文|俄语)",
+)
+_RESPONSE_LANGUAGE_OTHER_LANGUAGE_NEGATIVE_RE = re.compile(
+    r"(?:不要|别|禁止|不要用|别用).{0,8}(?:英文|英语|english)", re.IGNORECASE
+)
 _NATIVE_SEARCH_PLACEHOLDER_RE = re.compile(
     r"^\s*(?:好的[，,]?\s*)?"
     r"(?:(?:我(?:来|会|将|可以)?|让我|让我们|帮你|为你|现在|正在).{0,24}(?:联网搜索|搜索|查询|查找|检索)"
@@ -1409,6 +1434,52 @@ def _with_response_language_instruction(messages: Any, response_language: str) -
     return _with_system_instruction(messages, instruction, RESPONSE_LANGUAGE_POLICY_MARKER)
 
 
+def should_retry_response_language_response(
+    data: dict[str, Any],
+    payload: dict[str, Any],
+    response_language: str,
+) -> bool:
+    if not _is_simplified_chinese_response_language(response_language):
+        return False
+    if bool(payload.get("_webai_response_language_retry")):
+        return False
+    if _latest_user_explicitly_requests_other_response_language(payload.get("messages")):
+        return False
+    if _openai_message_tool_calls(data):
+        return False
+    content = _openai_message_content(data)
+    return _looks_like_english_final_answer_for_zh_cn(content)
+
+
+def build_response_language_retry_payload(
+    payload: dict[str, Any],
+    previous_content: str,
+    response_language: str,
+) -> dict[str, Any]:
+    retry = dict(payload)
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    retry_messages = [dict(message) for message in messages if isinstance(message, dict)]
+    previous = (previous_content or "").strip()
+    if previous:
+        retry_messages.append(
+            {
+                "role": "assistant",
+                "content": previous[:RESPONSE_LANGUAGE_RETRY_PREVIOUS_MAX_CHARS],
+            }
+        )
+    instruction = RESPONSE_LANGUAGE_RETRY_INSTRUCTION
+    if not _is_simplified_chinese_response_language(response_language):
+        instruction = (
+            "Gateway response language retry: rewrite only the previous assistant final answer in the configured "
+            f"response language: {str(response_language or '').strip()}. Do not add new facts or call tools."
+        )
+    retry_messages.append({"role": "user", "content": instruction})
+    retry["messages"] = retry_messages
+    retry["stream"] = False
+    retry["_webai_response_language_retry"] = True
+    return retry
+
+
 def _response_language_instruction(response_language: str) -> str:
     language = str(response_language or "").strip()
     if language.lower() in RESPONSE_LANGUAGE_OFF_VALUES:
@@ -1435,6 +1506,64 @@ def _with_system_instruction(messages: Any, instruction: str, marker: str) -> li
         normalized[0] = {**normalized[0], "content": f"{existing}\n\n{instruction}".strip()}
         return normalized
     return [{"role": "system", "content": instruction}, *normalized]
+
+
+def _is_simplified_chinese_response_language(response_language: str) -> bool:
+    language = str(response_language or "").strip().lower()
+    return language in {"zh", "zh-cn", "zh_cn", "chinese", "simplified-chinese", "simplified_chinese"}
+
+
+def _latest_user_explicitly_requests_other_response_language(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    latest = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        latest = _as_text(message.get("content"))
+        if latest.strip():
+            break
+    if not latest:
+        return False
+    if _RESPONSE_LANGUAGE_OTHER_LANGUAGE_NEGATIVE_RE.search(latest):
+        return False
+    return bool(
+        _RESPONSE_LANGUAGE_OTHER_LANGUAGE_RE.search(latest)
+        or _RESPONSE_LANGUAGE_OTHER_LANGUAGE_ZH_RE.search(latest)
+    )
+
+
+def _looks_like_english_final_answer_for_zh_cn(content: str) -> bool:
+    text = str(content or "").strip()
+    if len(text) < 180:
+        return False
+    prose = _response_language_prose_sample(text)
+    if len(prose) < 120:
+        return False
+    english_words = _RESPONSE_LANGUAGE_ENGLISH_WORD_RE.findall(prose)
+    if len(english_words) < 36:
+        return False
+    letter_count = sum(1 for char in prose if ("a" <= char.lower() <= "z"))
+    cjk_count = len(_RESPONSE_LANGUAGE_CJK_RE.findall(prose))
+    if letter_count < 260:
+        return False
+    return cjk_count <= max(10, int(letter_count * 0.04))
+
+
+def _response_language_prose_sample(text: str) -> str:
+    without_fences = _RESPONSE_LANGUAGE_CODE_FENCE_RE.sub(" ", text or "")
+    without_inline_code = _RESPONSE_LANGUAGE_INLINE_CODE_RE.sub(" ", without_fences)
+    lines: list[str] = []
+    for line in without_inline_code.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("$ ", "> ", "|")):
+            continue
+        if re.fullmatch(r"[-+*/_=#`~{}\[\]().,:;\\/\s]+", stripped):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
 
 
 def parse_sse_text(text: str) -> tuple[str, str]:
