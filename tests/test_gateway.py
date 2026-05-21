@@ -4530,7 +4530,7 @@ def test_openai_tool_controller_fail_closes_repeated_qwen_tool_denial() -> None:
 
     config = GatewayConfig(
         server=ServerConfig(api_key="local-dev-key"),
-        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="qwen-web/qwen3.6-max-preview"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="webai2api-model"),
         tool_bridge=ToolBridgeConfig(exposure_policy="all", tool_profile="agent"),
     )
     client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
@@ -4539,7 +4539,7 @@ def test_openai_tool_controller_fail_closes_repeated_qwen_tool_denial() -> None:
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "qwen-web/qwen3.6-max-preview",
+            "model": "webai2api-model",
             "messages": [
                 {"role": "user", "content": "/superpowers:using-superpowers\nWhy is the slash command not loading?"},
                 {
@@ -4597,7 +4597,7 @@ def test_openai_tool_controller_fail_closes_repeated_ready_to_assist_after_tool_
 
     config = GatewayConfig(
         server=ServerConfig(api_key="local-dev-key"),
-        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="qwen-web/qwen3.6-max-preview"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="webai2api-model"),
         tool_bridge=ToolBridgeConfig(exposure_policy="all", tool_profile="agent"),
     )
     client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
@@ -4606,7 +4606,7 @@ def test_openai_tool_controller_fail_closes_repeated_ready_to_assist_after_tool_
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "qwen-web/qwen3.6-max-preview",
+            "model": "webai2api-model",
             "messages": [
                 {"role": "user", "content": "Review this local project and fix the failing setup."},
                 {
@@ -4650,7 +4650,7 @@ def test_anthropic_qwen_tool_controller_fail_closes_repeated_ready_to_assist_aft
 
     config = GatewayConfig(
         server=ServerConfig(api_key="local-dev-key"),
-        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="qwen-web/qwen3.6-max-preview"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="webai2api-model"),
         tool_bridge=ToolBridgeConfig(exposure_policy="all", tool_profile="agent"),
     )
     client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
@@ -4659,7 +4659,7 @@ def test_anthropic_qwen_tool_controller_fail_closes_repeated_ready_to_assist_aft
         "/v1/messages?beta=true",
         headers={**_headers(), "anthropic-version": "2023-06-01"},
         json={
-            "model": "qwen-web/qwen3.6-max-preview",
+            "model": "webai2api-model",
             "messages": [
                 {"role": "user", "content": "Review this local project and fix the failing setup."},
                 {

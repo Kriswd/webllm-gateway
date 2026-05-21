@@ -150,7 +150,7 @@ onUnmounted(() => {
 
     <div class="support-strip" role="note">
       <span class="support-badge">支持</span>
-      <span class="support-text">支持作者持续维护 WebLLM Gateway：本地 AI 工具、部署与服务咨询，欢迎了解</span>
+      <span class="support-text">如果 WebAI Gateway 帮你少踩坑，可以通过作者的小店支持，有稳定可靠有质保的plus成品账号、Claude代充等，欢迎选购。</span>
       <a
         class="support-link"
         href="https://pay.ldxp.cn/shop/FTIWLFHQ"

@@ -28,7 +28,7 @@ WebLLM Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、
 
 ## 支持作者
 
-如果 WebLLM Gateway 帮你少踩坑，可以通过作者的小店支持维护、文档和部署服务：
+如果 WebAI Gateway 帮你少踩坑，可以通过作者的小店支持，有稳定可靠有质保的plus成品账号、Claude代充等，欢迎选购。
 [支持作者 / 服务咨询](https://pay.ldxp.cn/shop/FTIWLFHQ)。交流群：1105908706。
 
 本项目不是 OpenAI、Anthropic、Qwen、DeepSeek、ChatGPT、WebAI2API 或 ds2api 的官方项目。使用网页登录模型和第三方 runtime 时，请遵守对应平台服务条款、账号规则和当地法律法规。
