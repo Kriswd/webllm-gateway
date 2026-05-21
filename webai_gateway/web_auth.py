@@ -17,7 +17,8 @@ from webai_gateway.deepseek_web import DEEPSEEK_WEB_CATALOG_MODELS
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DEEPSEEK_WEB_AVAILABLE_REASON = (
-    "DeepSeek Web 现通过本地 ds2api sidecar 接入。完成网页登录授权后，可直接使用已验证的 `deepseek-v4-pro`。"
+    "DeepSeek Web 现通过本地 ds2api sidecar 接入。完成网页登录授权并检测通过后，可使用 `deepseek-v4-pro`；"
+    "如果检测失败，请按页面提示检查本地 ds2api、网页账号状态或重新授权。"
 )
 QWEN_LOGIN_COOKIE_HINTS = ("session", "token", "auth", "login", "sso")
 QWEN_DIRECT_PROVIDER_IDS = {"qwen", "qwen-coder"}
@@ -381,7 +382,10 @@ PROVIDERS: dict[str, WebAuthProvider] = {
         name="DeepSeek Web",
         login_url="https://chat.deepseek.com/",
         status="available",
-        description="网关已内置本地网页登录授权；调用链路通过本地 ds2api sidecar 转到 DeepSeek Web，可用体验与 Qwen 直连保持一致。",
+        description=(
+            "网关已内置本地网页登录授权；调用链路通过本地 ds2api sidecar 转到 DeepSeek Web。"
+            "是否可用取决于本地 ds2api 是否运行、网页账号状态和当次模型检测结果。"
+        ),
         models=DEEPSEEK_WEB_CATALOG_MODELS,
         capabilities={"text": True, "image": False, "video": False},
         adapters=("deepseek_text",),

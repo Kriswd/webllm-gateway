@@ -39,7 +39,7 @@ from webai_gateway.deepseek_web import (
 )
 from webai_gateway.ds2api_oracle import DS2API_ORACLE_COMMIT, DS2API_ORACLE_VERSION
 from webai_gateway.model_ids import normalize_model_body, normalize_model_id
-from webai_gateway.runtime_supervisor import collect_supervisor_status
+from webai_gateway.runtime_supervisor import collect_supervisor_status, ensure_managed_runtimes
 from webai_gateway.openai_api import (
     bridge_error_headers,
     build_incomplete_response_retry_payload,
@@ -360,6 +360,7 @@ def create_app(
     app.state.tool_call_registry = OrderedDict()
     app.state.media_generations = OrderedDict()
     app.state.auto_research_fixture_dir = Path(auto_research_fixture_dir) if auto_research_fixture_dir is not None else _default_auto_research_fixture_dir()
+    app.state.config_file = config_file.resolve()
     app.state.gateway_root = config_file.parent.resolve()
     app.state.webai2api_sidecar_starter = webai2api_sidecar_starter
     app.state.runtime_started_at = utc_now()
@@ -1618,6 +1619,11 @@ def create_app(
 
     def _friendly_account_model_validation_message(provider_id: str, model_id: str, message: str) -> str:
         lower = message.lower()
+        if provider_id == "deepseek-web" and _is_deepseek_ds2api_local_connection_failure(message):
+            return _deepseek_ds2api_runtime_unavailable_detail(
+                current_config().provider_runtime.deepseek_ds2api_base_url,
+                reason=message,
+            )
         if provider_id == "deepseek-web" and (
             "invalid token" in lower
             or "http 401" in lower
@@ -1629,6 +1635,8 @@ def create_app(
                 "DeepSeek Web 的网页登录授权已过期或失效。请点击“打开授权浏览器”重新登录 DeepSeek，"
                 "完成后回到这里点“刷新模型”，再点“检测模型”。"
             )
+        if provider_id == "deepseek-web" and _is_deepseek_ds2api_upstream_unavailable(message):
+            return _deepseek_ds2api_upstream_unavailable_detail(model_id)
         if (
             "model invalid" in lower
             or "模型无效" in message
@@ -3326,6 +3334,88 @@ def _completion_request_trace_fields(
     }
     fields.update(_request_event_trace_fields(body))
     return fields
+
+
+def _runtime_service(supervisor: dict[str, Any], service_id: str) -> dict[str, Any]:
+    services = supervisor.get("services") if isinstance(supervisor.get("services"), list) else []
+    for service in services:
+        if isinstance(service, dict) and service.get("id") == service_id:
+            return service
+    return {}
+
+
+def _ensure_deepseek_ds2api_sidecar_available(app: FastAPI, config: GatewayConfig) -> dict[str, Any]:
+    if getattr(app.state, "deepseek_client_factory", None) is not DeepSeekWebClient:
+        return {"available": True, "status": "skipped"}
+    gateway_root = Path(getattr(app.state, "gateway_root", Path.cwd())).resolve()
+    config_file = Path(getattr(app.state, "config_file", gateway_root / "config.json")).resolve()
+    try:
+        current = collect_supervisor_status(config, gateway_root)
+        service = _runtime_service(current, "ds2api")
+        if service.get("status") == "running":
+            return {"available": True, "status": "running", "service": service}
+        ensure_managed_runtimes(config, config_file, gateway_root)
+        deadline = time.time() + 6.0
+        latest_service = service
+        while time.time() < deadline:
+            latest = collect_supervisor_status(config, gateway_root)
+            latest_service = _runtime_service(latest, "ds2api")
+            if latest_service.get("status") == "running":
+                return {"available": True, "status": "started", "service": latest_service}
+            time.sleep(0.25)
+        message = latest_service.get("message") or service.get("message") or latest_service.get("status") or "未能启动 ds2api runtime"
+        return {"available": False, "status": latest_service.get("status") or "unavailable", "message": message}
+    except Exception as exc:
+        return {"available": False, "status": "failed", "message": str(exc)}
+
+
+def _is_deepseek_ds2api_local_connection_failure(message: Any) -> bool:
+    lowered = str(message or "").lower()
+    markers = (
+        "winerror 10061",
+        "connection refused",
+        "actively refused",
+        "connectex",
+        "no connection could be made",
+        "all connection attempts failed",
+        "目标计算机积极拒绝",
+        "由于目标计算机积极拒绝",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _deepseek_ds2api_runtime_unavailable_detail(base_url: str, *, reason: Any = "") -> str:
+    _ = _preview_text(_redact_sensitive_text(str(reason or "")), max_chars=160)
+    return (
+        f"DeepSeek 本地运行时没有启动，Gateway 无法连接到 {base_url.rstrip('/') or '本地 ds2api 地址'}。"
+        "这不是 deepseek-v4-pro 模型本身无效，也通常不是重新网页登录能解决。"
+        "请使用 start_webai_gateway.bat 启动项目，或进入“通道设置”确认 ds2api runtime 已安装并监听 9331 端口；"
+        "启动后再点击“刷新模型 / 检测模型”。"
+    )
+
+
+def _is_deepseek_ds2api_upstream_unavailable(message: Any) -> bool:
+    lowered = str(message or "").lower()
+    markers = (
+        "upstream_unavailable",
+        "returned no output",
+        "upstream service is unavailable",
+        "service_unavailable_error",
+        "user is muted",
+        "biz_msg=\"user is muted\"",
+        "biz_msg=user is muted",
+        "没有返回有效输出",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _deepseek_ds2api_upstream_unavailable_detail(model_id: str) -> str:
+    model_hint = model_id or "deepseek-v4-pro"
+    return (
+        f"{model_hint} 已连到本地 ds2api，但 DeepSeek 网页账号/上游没有返回有效输出。"
+        "请先在 chat.deepseek.com 用同一账号手动发一句普通问题：如果网页也不回复或提示风控/禁言/额度问题，需要等待恢复或更换账号；"
+        "如果网页能正常回复，请回到 Gateway 点击“打开授权浏览器”重新捕获授权，再点“刷新模型 / 检测模型”。"
+    )
 
 
 def _request_event_trace_fields(body: dict[str, Any]) -> dict[str, Any]:
@@ -6285,6 +6375,15 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
     )
     web_client = None
     try:
+        sidecar_ready = _ensure_deepseek_ds2api_sidecar_available(app, config)
+        if not sidecar_ready.get("available"):
+            raise HTTPException(
+                status_code=502,
+                detail=_deepseek_ds2api_runtime_unavailable_detail(
+                    config.provider_runtime.deepseek_ds2api_base_url,
+                    reason=sidecar_ready.get("message") or sidecar_ready.get("status"),
+                ),
+            )
         web_client = _build_deepseek_web_client(app.state.deepseek_client_factory, credential, client, config)
         data = _call_deepseek_ds2api_with_retry(app, web_client, payload, config)
     except DeepSeekDs2apiError as exc:
@@ -6303,7 +6402,12 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             provider_diagnostic=getattr(web_client, "last_diagnostic", None),
             bridge_context=bridge_context,
         )
-        detail = _provider_auth_expired_detail("DeepSeek Web") if _is_provider_auth_failure(exc.status_code, exc) else str(exc)
+        if _is_provider_auth_failure(exc.status_code, exc):
+            detail = _provider_auth_expired_detail("DeepSeek Web")
+        elif _is_deepseek_ds2api_upstream_unavailable(exc):
+            detail = _deepseek_ds2api_upstream_unavailable_detail(model)
+        else:
+            detail = str(exc)
         raise HTTPException(status_code=status_code, detail=detail) from exc
     except HTTPException:
         raise
@@ -6322,7 +6426,14 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             provider_diagnostic=getattr(web_client, "last_diagnostic", None),
             bridge_context=bridge_context,
         )
-        raise HTTPException(status_code=502, detail=f"DeepSeek Web 调用失败：{exc}") from exc
+        if _is_deepseek_ds2api_local_connection_failure(exc):
+            detail = _deepseek_ds2api_runtime_unavailable_detail(
+                config.provider_runtime.deepseek_ds2api_base_url,
+                reason=exc,
+            )
+        else:
+            detail = f"DeepSeek Web 调用失败：{exc}"
+        raise HTTPException(status_code=502, detail=detail) from exc
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="DeepSeek Web 响应必须是 JSON 对象")
     if data.get("_webai_stream") and bool(body.get("stream")):

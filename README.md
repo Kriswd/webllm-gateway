@@ -184,7 +184,7 @@ qwen-web/qwen3.5-plus
 qwen-web/qwen3-max
 ```
 
-DeepSeek Web 已改为通过本地 `ds2api` sidecar 接入。完成浏览器网页登录授权后，前端和 `/v1/models` 只展示已经做过端到端验证的模型：
+DeepSeek Web 已改为通过本地 `ds2api` sidecar 接入。完成浏览器网页登录授权后，需要点击“检测模型”做一次真实请求验证；检测通过后，前端和 `/v1/models` 才应作为可用模型使用：
 
 ```text
 deepseek-v4-pro

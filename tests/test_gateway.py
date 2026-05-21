@@ -13878,6 +13878,172 @@ def test_direct_deepseek_account_validation_uses_relogin_hint_on_expired_auth(tm
     assert "config.keys" not in item["message"]
 
 
+def test_direct_deepseek_account_validation_maps_local_ds2api_connection_refused(tmp_path: Path) -> None:
+    class RefusedDeepSeekClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("[WinError 10061] 由于目标计算机积极拒绝，无法连接。")
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            deepseek_client_factory=RefusedDeepSeekClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/api/admin/accounts/validate",
+        json={
+            "providerId": "deepseek-web",
+            "accountId": "direct:deepseek-web:default",
+            "modelIds": ["deepseek-v4-pro"],
+            "force": True,
+        },
+    )
+
+    assert response.status_code == 200
+    item = response.json()["validation"]["deepseek-v4-pro"]
+    assert item["status"] == "unavailable"
+    assert "DeepSeek 本地运行时没有启动" in item["message"]
+    assert "start_webai_gateway.bat" in item["message"]
+    assert "9331" in item["message"]
+    assert "WinError" not in item["message"]
+
+
+def test_direct_deepseek_account_validation_maps_upstream_no_output_to_account_hint(tmp_path: Path) -> None:
+    class NoOutputDeepSeekClient:
+        def __init__(self, credential: dict[str, Any], **_: Any) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise DeepSeekDs2apiError(
+                503,
+                'ds2api DeepSeek 调用失败：HTTP 503 {"error":{"code":"upstream_unavailable","message":"Upstream service is unavailable and returned no output."}}',
+            )
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            deepseek_client_factory=NoOutputDeepSeekClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/api/admin/accounts/validate",
+        json={
+            "providerId": "deepseek-web",
+            "accountId": "direct:deepseek-web:default",
+            "modelIds": ["deepseek-v4-pro"],
+            "force": True,
+        },
+    )
+
+    assert response.status_code == 200
+    item = response.json()["validation"]["deepseek-v4-pro"]
+    assert item["status"] == "unavailable"
+    assert "DeepSeek 网页账号/上游没有返回有效输出" in item["message"]
+    assert "chat.deepseek.com" in item["message"]
+    assert "更换账号" in item["message"]
+    assert "upstream_unavailable" not in item["message"]
+
+
+def test_direct_deepseek_account_validation_auto_starts_local_ds2api_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import webai_gateway.app as gateway_app
+
+    ensure_calls: list[tuple[Path, Path]] = []
+
+    def fake_collect_supervisor_status(config: GatewayConfig, gateway_root: Path, *, probe_ports: bool = True) -> dict[str, Any]:
+        status = "running" if ensure_calls else "stopped"
+        return {
+            "services": [
+                {"id": "ds2api", "status": status, "message": "test ds2api status"},
+            ]
+        }
+
+    def fake_ensure_managed_runtimes(config: GatewayConfig, config_path: Path, gateway_root: Path) -> dict[str, Any]:
+        ensure_calls.append((config_path, gateway_root))
+        return {"services": {"ds2api": {"status": "started"}}}
+
+    monkeypatch.setattr(gateway_app, "collect_supervisor_status", fake_collect_supervisor_status)
+    monkeypatch.setattr(gateway_app, "ensure_managed_runtimes", fake_ensure_managed_runtimes)
+
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"object": "list", "data": [{"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek-web"}]},
+                request=request,
+            )
+        if request.url.path == "/v1/chat/completions":
+            seen["payload"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(200, json=_openai_response("OK"), request=request)
+        return httpx.Response(404, json={"error": "unexpected"}, request=request)
+
+    store = CredentialStore(tmp_path / "credentials")
+    store.save(
+        "deepseek-web",
+        {
+            "cookie": "ds_session_id=session-secret",
+            "bearer": "bearer-secret",
+            "userAgent": "Chrome Test",
+        },
+    )
+    client = TestClient(
+        create_app(
+            config=_config(),
+            config_path=tmp_path / "config.json",
+            credential_store=store,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/api/admin/accounts/validate",
+        json={
+            "providerId": "deepseek-web",
+            "accountId": "direct:deepseek-web:default",
+            "modelIds": ["deepseek-v4-pro"],
+            "force": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["validation"]["deepseek-v4-pro"]["status"] == "available"
+    assert seen["payload"]["model"] == "deepseek-v4-pro"
+    assert ensure_calls == [(tmp_path / "config.json", tmp_path)]
+
+
 def test_account_model_validation_selects_requested_webai2api_account_before_probe(tmp_path: Path) -> None:
     posted_instances: list[Any] = []
     restart_payloads: list[Any] = []
