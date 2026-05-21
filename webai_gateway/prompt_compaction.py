@@ -26,6 +26,12 @@ _CURRENT_USER_REQUEST_INSTRUCTION = (
     "do not continue unrelated earlier tasks unless this request explicitly asks to. "
     "Do not summarize DS2API_HISTORY.txt or the current state unless the latest user request asks for a status summary."
 )
+_RESPONSE_LANGUAGE_POLICY_MARKER = "WebLLM Gateway response language policy"
+_SIMPLIFIED_CHINESE_LANGUAGE_REMINDER = (
+    "Response language policy: final answers, explanations, reviews, errors, and plans must be in "
+    "Simplified Chinese (zh-CN) unless the user explicitly asks for another language. Keep code identifiers, "
+    "file paths, commands, API names, model IDs, product names, and quoted source text unchanged when needed."
+)
 _ERROR_RECOVERY_CONTROL_MARKERS = (
     "system-generated error correction",
     "system generated error correction",
@@ -138,12 +144,17 @@ def compact_role_messages_as_ds2api_history(
     entry_list = [(role, text) for role, text in entries]
     history_transcript = build_ds2api_history_transcript(entry_list)
     latest_user = _normalized_current_user_override(current_user_override) or _latest_user_request(entry_list)
+    response_language_instruction = _response_language_continuation_instruction(entry_list)
     snapshot = build_preserved_task_state_snapshot(
         entry_list,
         max_chars=max(800, min(18000, int(live_limit * 0.45))),
     )
     transcript = (snapshot.rstrip() + "\n\n" + history_transcript) if snapshot else history_transcript
-    continuation = _history_continuation_prompt(latest_user, max_user_chars=max(240, min(1800, live_limit // 5)))
+    continuation = _history_continuation_prompt(
+        latest_user,
+        max_user_chars=max(240, min(1800, live_limit // 5)),
+        response_language_instruction=response_language_instruction,
+    )
     if not transcript:
         return continuation[:live_limit]
     prompt = transcript.rstrip() + "\n\n" + continuation
@@ -155,6 +166,7 @@ def compact_role_messages_as_ds2api_history(
         max_chars=live_limit,
         protocol_marker=protocol_marker,
         latest_user=latest_user,
+        response_language_instruction=response_language_instruction,
     )
     if layered:
         return layered[:limit]
@@ -199,6 +211,7 @@ def _compact_role_messages_layered(
     max_chars: int,
     protocol_marker: str,
     latest_user: str = "",
+    response_language_instruction: str = "",
 ) -> str:
     limit = max(1000, int(max_chars or 12000))
     history_entries = _render_history_entries(entries)
@@ -211,7 +224,11 @@ def _compact_role_messages_layered(
         budget=max(800, min(9000, int(limit * 0.28))),
         protocol_marker=protocol_marker,
     )
-    continuation = _history_continuation_prompt(latest_user, max_user_chars=max(240, min(1800, limit // 5)))
+    continuation = _history_continuation_prompt(
+        latest_user,
+        max_user_chars=max(240, min(1800, limit // 5)),
+        response_language_instruction=response_language_instruction,
+    )
     header_lines = [
         _DS2API_HISTORY_TITLE,
         _DS2API_HISTORY_SUMMARY,
@@ -616,12 +633,38 @@ def _looks_like_error_recovery_control_text(compact: str) -> bool:
     return any(marker in compact for marker in _ERROR_RECOVERY_CONTROL_MARKERS)
 
 
-def _history_continuation_prompt(latest_user: str, *, max_user_chars: int) -> str:
+def _history_continuation_prompt(
+    latest_user: str,
+    *,
+    max_user_chars: int,
+    response_language_instruction: str = "",
+) -> str:
     prompt = f"User: {_DS2API_HISTORY_CONTINUATION}"
     current = _current_user_request_block(latest_user, max_chars=max_user_chars)
     if current:
         prompt += "\n\n" + current
+    if response_language_instruction:
+        prompt += "\n\n" + response_language_instruction
     return prompt
+
+
+def _response_language_continuation_instruction(entries: list[tuple[str, str]]) -> str:
+    for role, text in entries:
+        content = str(text or "")
+        if _RESPONSE_LANGUAGE_POLICY_MARKER not in content:
+            continue
+        lowered = content.lower()
+        if any(marker in lowered for marker in ("zh-cn", "zh_cn", "simplified chinese", "simplified-chinese", "chinese")):
+            return _SIMPLIFIED_CHINESE_LANGUAGE_REMINDER
+        if "简体中文" in content or "中文" in content:
+            return _SIMPLIFIED_CHINESE_LANGUAGE_REMINDER
+        policy_line = next(
+            (line.strip() for line in content.splitlines() if _RESPONSE_LANGUAGE_POLICY_MARKER in line),
+            "",
+        )
+        if policy_line:
+            return f"Response language policy still applies: {policy_line}"
+    return ""
 
 
 def _current_user_request_block(latest_user: str, *, max_chars: int) -> str:

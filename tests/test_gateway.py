@@ -18182,6 +18182,36 @@ def test_qwen_messages_layered_compaction_keeps_latest_turns_without_filling_pro
     assert "ANCIENT_OBSERVATION_SENTINEL" not in prompt
 
 
+def test_qwen_messages_layered_compaction_repeats_response_language_policy_at_live_tail() -> None:
+    language_policy = (
+        "WebLLM Gateway response language policy: "
+        "默认使用简体中文（zh-CN）回答；除非用户明确要求其他语言。"
+    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": language_policy + "\n" + ("large tool schema\n" * 200)},
+        {"role": "user", "content": "请详细熟悉和了解下当前项目的架构"},
+        {"role": "assistant", "content": "I will inspect the project files."},
+    ]
+    for index in range(40):
+        messages.extend(
+            [
+                {"role": "tool", "content": f"English source excerpt {index}\n" + ("controller route handler\n" * 40)},
+                {"role": "assistant", "content": f"Based on the files, component {index} is implemented in TypeScript."},
+            ]
+        )
+    messages.append({"role": "user", "content": "源码你也仔细看下，比如控制面的实现"})
+
+    prompt, files = qwen_messages_to_prompt_and_files(messages, max_prompt_chars=3200)
+
+    assert files == []
+    assert "# DS2API_HISTORY.txt" in prompt
+    assert "=== CURRENT USER REQUEST (highest priority) ===" in prompt
+    assert "源码你也仔细看下，比如控制面的实现" in prompt
+    assert "Response language policy: final answers" in prompt
+    assert "Simplified Chinese (zh-CN)" in prompt
+    assert prompt.rfind("Response language policy: final answers") > prompt.rfind("=== CURRENT USER REQUEST")
+
+
 def test_web_prompt_compaction_preserves_required_tool_format_when_tool_manifest_is_large() -> None:
     protocol = (
         "You are using WebLLM Gateway's strict tool bridge.\n"
