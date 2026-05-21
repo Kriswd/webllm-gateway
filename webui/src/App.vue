@@ -148,6 +148,19 @@ onUnmounted(() => {
   <div v-else class="app-shell">
     <LoginModal v-model:visible="loginVisible" />
 
+    <div class="support-strip" role="note">
+      <span class="support-badge">支持</span>
+      <span class="support-text">支持作者持续维护 WebAI Gateway：本地 AI 工具、部署与服务咨询，欢迎了解</span>
+      <a
+        class="support-link"
+        href="https://pay.ldxp.cn/shop/FTIWLFHQ"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        去看看
+      </a>
+    </div>
+
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark"><RocketOutlined /></span>
@@ -225,6 +238,54 @@ onUnmounted(() => {
   background: #f5f7f8;
   color: #111827;
   min-height: 100vh;
+  padding-top: 10px;
+}
+
+.support-strip {
+  align-items: center;
+  background: #eef5ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  box-shadow: 0 10px 28px rgba(37, 99, 235, 0.14);
+  display: flex;
+  gap: 12px;
+  margin: 0 24px 10px;
+  min-height: 46px;
+  padding: 6px 10px 6px 14px;
+}
+
+.support-badge {
+  background: #dbeafe;
+  border-radius: 999px;
+  color: #1d4ed8;
+  flex: 0 0 auto;
+  font-weight: 700;
+  line-height: 1;
+  padding: 7px 11px;
+}
+
+.support-text {
+  color: #111827;
+  flex: 1 1 auto;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  min-width: 0;
+}
+
+.support-link {
+  border: 1px solid #93c5fd;
+  border-radius: 999px;
+  color: #1d4ed8;
+  flex: 0 0 auto;
+  font-weight: 700;
+  padding: 6px 12px;
+  text-decoration: none;
+}
+
+.support-link:hover {
+  background: #dbeafe;
+  color: #1e40af;
 }
 
 .topbar {
@@ -304,6 +365,22 @@ onUnmounted(() => {
 }
 
 @media (max-width: 720px) {
+  .support-strip {
+    align-items: flex-start;
+    border-radius: 16px;
+    flex-wrap: wrap;
+    margin: 0 12px 10px;
+  }
+
+  .support-text {
+    flex-basis: calc(100% - 70px);
+    font-size: 14px;
+  }
+
+  .support-link {
+    margin-left: auto;
+  }
+
   .topbar {
     align-items: flex-start;
     flex-direction: column;

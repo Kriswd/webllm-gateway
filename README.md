@@ -1,10 +1,31 @@
 # WebAI Gateway
 
-WebAI Gateway 是一个独立的网页登录模型 API 网关。它把 Qwen Web、DeepSeek Web、ChatGPT / Gemini / Sora 等网页登录模型包装成稳定的 OpenAI / Anthropic 兼容接口，并提供严格工具调用适配层，方便 OpenClaw、Hermes、Claude Code、Codex 等客户端接入。
+WebAI Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、DeepSeek Web、ChatGPT / Gemini / Sora 等网页登录模型包装成稳定的 OpenAI / Anthropic 兼容接口，让 OpenClaw、Hermes、Claude Code、Codex、KrisAI 等客户端像调用原生 API 一样使用网页登录模型。
 
-网关只做协议适配和格式修复，不执行本地文件、终端、浏览器或 MCP 工具。工具和 MCP 仍由客户端自己的权限系统执行。
+它的核心价值不是简单转发，而是把“不稳定的网页对话”整理成“可验证、可接入、可工具调用”的标准 API：
+
+- 一键网页登录授权，自动检测真实登录态和可用模型，不要求用户手动找 cookie、bearer 或 session。
+- 同时提供 OpenAI `/v1/chat/completions` 和 Anthropic `/v1/messages`，覆盖常见兼容客户端。
+- `ToolBridgeV2` 将 OpenAI `tools/tool_calls` 与 Anthropic `tool_use/tool_result` 统一桥接到网页登录模型，返回标准工具调用结构。
+- Gateway 只做协议适配、错误修复、模型目录和登录管理，不执行本地文件、终端、浏览器或 MCP 工具；权限和副作用仍由下游客户端控制。
+- Qwen direct、DeepSeek via ds2api、WebAI2API sidecar 都被抽象为 provider/runtime 能力，避免为单一客户端写临时特判。
 
 项目本体是 Gateway：API、ToolBridge、网页登录授权、模型目录、Qwen direct 和客户端接入配置。WebAI2API 与 ds2api 不作为源码混入本仓库，只作为按需启用的外部 adapter runtime；未安装它们时，Gateway 核心服务仍可启动。
+
+## 项目优势
+
+- **协议稳定**：优先保持 OpenAI / Anthropic 兼容响应结构，工具调用返回标准 `tool_calls` 或 `tool_use`，不把网页模型的自然语言幻想当成真实工具结果。
+- **边界清楚**：Gateway 不接管 agent loop、不执行本地工具、不绕过客户端权限系统，适合作为 KrisAI、OpenClaw、Hermes、Claude Code、Codex 等客户端前面的统一协议层。
+- **可对标验证**：DeepSeek 链路以 ds2api 作为外部 oracle 对照；Qwen 链路持续用真实请求和 parity/oracle 测试回归。
+- **面向小白**：前端优先展示授权、模型检测、接入地址、API Key 和模型 ID；高级 adapter runtime 页面只作为诊断入口。
+- **可开源维护**：第三方 runtime 不混入源码树，许可证边界、敏感数据边界和发布检查写在文档里。
+
+## 支持作者
+
+如果 WebAI Gateway 帮你少踩坑，可以通过作者的小店支持维护、文档和部署服务：
+[支持作者 / 服务咨询](https://pay.ldxp.cn/shop/FTIWLFHQ)。交流群：1105908706。
+
+本项目不是 OpenAI、Anthropic、Qwen、DeepSeek、ChatGPT、Gemini、Sora、WebAI2API 或 ds2api 的官方项目。使用网页登录模型和第三方 runtime 时，请遵守对应平台服务条款、账号规则和当地法律法规。
 
 ## 启动
 
@@ -49,6 +70,7 @@ Gateway 首页优先展示统一接入、状态、授权和复制配置。外部
 - 贡献规范：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 安全策略：[SECURITY.md](SECURITY.md)
 - 第三方声明：[NOTICE.md](NOTICE.md)
+- 第三方许可证清单：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 
 ## 工具调用适配层
 
