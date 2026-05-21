@@ -13,7 +13,7 @@ Qwen 官方推出了专门针对编程场景优化的网页版助手 **Qwen Code
   - **项目上下文**：支持上传整个项目文件夹，理解文件间依赖关系。
 
 ### 1.2 目标
-在 WebAI Gateway 中快速集成 Qwen Coder，使其能够：
+在 WebLLM Gateway 中快速集成 Qwen Coder，使其能够：
 1. 被现有客户端（KrisAI, Claude Code 等）无缝调用。
 2. 保留基础对话和联网搜索能力。
 3. **重点支持**：编程特有的 Artifacts 展示、MCP 工具调用及长文本代码处理。
@@ -160,4 +160,4 @@ curl http://localhost:8000/v1/chat/completions \
 ---
 
 ## 7. 结论
-集成 Qwen Coder 是提升 WebAI Gateway 编程竞争力的关键一步。鉴于其与现有 Qwen Web 的高度兼容性，采用**增量开发模式**可在 **1 个工作日内** 完成核心功能上线，快速为用户提供专业的代码辅助能力。
+集成 Qwen Coder 是提升 WebLLM Gateway 编程竞争力的关键一步。鉴于其与现有 Qwen Web 的高度兼容性，采用**增量开发模式**可在 **1 个工作日内** 完成核心功能上线，快速为用户提供专业的代码辅助能力。

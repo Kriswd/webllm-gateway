@@ -1,6 +1,6 @@
 # Installation
 
-这份文档描述从干净机器启动 WebAI Gateway 的最小路径。
+这份文档描述从干净机器启动 WebLLM Gateway 的最小路径。
 
 ## Prerequisites
 
@@ -13,17 +13,17 @@
 
 可选 adapter：
 
-- WebAI2API sidecar：用于 ChatGPT、Gemini、Sora、Google Flow、LMArena 等网页登录站点。本地默认目录：`../WebAI2API-sidecar`。
+- WebAI2API sidecar：用于 ChatGPT、LMArena 等已验证或自行配置的网页登录站点。本地默认目录：`../WebAI2API-sidecar`。
 - ds2api runtime：用于 DeepSeek Web 兼容链路和 ds2api parity/oracle 测试。本地默认可执行文件：`.tmp/ds2api/.tmp-bin/ds2api.exe`。
 - Go 工具链：仅在运行 ds2api parity/oracle 测试时需要。
 
-WebAI Gateway 不会把 WebAI2API 或 ds2api 源码作为本仓库的一部分发布。开源使用者可以只运行 Gateway 核心能力；需要对应站点时再自行准备可选 runtime，或者按自己的发布方式提供下载脚本。
+WebLLM Gateway 不会把 WebAI2API 或 ds2api 源码作为本仓库的一部分发布。开源使用者可以只运行 Gateway 核心能力；需要对应站点时再自行准备可选 runtime，或者按自己的发布方式提供下载脚本。
 
 ## Setup
 
 ```powershell
-git clone <your-fork-or-upstream-url> webai-gateway
-cd webai-gateway
+git clone https://github.com/Kriswd/webllm-gateway.git
+cd webllm-gateway
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -45,7 +45,7 @@ Copy-Item config.example.json config.json
 
 ```text
 ProjectX/
-  webai-gateway/
+  webllm-gateway/
   WebAI2API-sidecar/
 ```
 

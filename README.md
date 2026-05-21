@@ -1,6 +1,12 @@
-# WebAI Gateway
+# WebLLM Gateway
 
-WebAI Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成稳定的 OpenAI / Anthropic 兼容接口，让 OpenClaw、Hermes、Claude Code、Codex、KrisAI 等客户端像调用原生 API 一样使用网页登录模型。
+WebLLM Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让 OpenClaw、Hermes、Claude Code、Codex、KrisAI 等客户端像调用原生模型 API 一样使用网页账号。
+
+> Turn web AI accounts into OpenAI/Anthropic-compatible, tool-callable APIs.
+
+项目地址：[github.com/Kriswd/webllm-gateway](https://github.com/Kriswd/webllm-gateway)
+
+一句话：登录网页登录模型账号，自动检测可用模型，把地址、Key 和模型 ID 填到兼容 OpenAI / Anthropic API 的客户端里，就能把网页模型接入工具调用工作流。
 
 它的核心价值不是简单转发，而是把“不稳定的网页对话”整理成“可验证、可接入、可工具调用”的标准 API：
 
@@ -22,7 +28,7 @@ WebAI Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、D
 
 ## 支持作者
 
-如果 WebAI Gateway 帮你少踩坑，可以通过作者的小店支持维护、文档和部署服务：
+如果 WebLLM Gateway 帮你少踩坑，可以通过作者的小店支持维护、文档和部署服务：
 [支持作者 / 服务咨询](https://pay.ldxp.cn/shop/FTIWLFHQ)。交流群：1105908706。
 
 本项目不是 OpenAI、Anthropic、Qwen、DeepSeek、ChatGPT、WebAI2API 或 ds2api 的官方项目。使用网页登录模型和第三方 runtime 时，请遵守对应平台服务条款、账号规则和当地法律法规。
@@ -147,7 +153,7 @@ Claude Code Best 可在 `/login` 里选择 `Anthropic Compatible`，或写入 `~
 
 网页登录模型的单次请求超时由通用 `providerRuntime.requestTimeoutSeconds` 控制，默认 300 秒。工具调用 JSON 一旦完整返回仍会提前结束请求，因此提高该值主要保护 `/init`、项目总结、长文档归纳等慢任务，不会刻意拖慢快速工具选择。
 
-网页登录模型的输入预算由 `providerRuntime.promptMaxChars` 控制，默认 32000 字符。超过预算时会保留开头、WebAI Gateway 工具协议和最后的用户任务，压缩中间的大段技能列表、规则列表或历史上下文，避免网页模型在第一轮请求里长时间无输出。
+网页登录模型的输入预算由 `providerRuntime.promptMaxChars` 控制，默认 32000 字符。超过预算时会保留开头、WebLLM Gateway 工具协议和最后的用户任务，压缩中间的大段技能列表、规则列表或历史上下文，避免网页模型在第一轮请求里长时间无输出。
 
 ## 图片生成
 

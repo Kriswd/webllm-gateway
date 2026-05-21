@@ -1,8 +1,8 @@
-# WebAI Gateway Claude Code Guide
+# WebLLM Gateway Claude Code Guide
 
 ## 项目定位
 
-WebAI Gateway 是一个独立的网页登录模型 API 网关，位于 Claude Code、KrisAI、OpenClaw、Hermes 等下游客户端与 Qwen Web、DeepSeek Web、WebAI2API 等网页模型提供方之间。
+WebLLM Gateway 是一个独立的网页登录模型 API 网关，位于 Claude Code、KrisAI、OpenClaw、Hermes 等下游客户端与 Qwen Web、DeepSeek Web、WebAI2API 等网页模型提供方之间。
 
 核心目标是把不稳定的网页登录模型文本交互包装成稳定的 OpenAI / Anthropic 兼容 API，并通过严格工具桥把网页模型输出转换为标准 `tool_calls` / `tool_use`。
 

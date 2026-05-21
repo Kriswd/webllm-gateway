@@ -2,7 +2,7 @@
 chcp 65001 >nul 2>&1
 setlocal EnableDelayedExpansion
 
-title WebAI Gateway
+title WebLLM Gateway
 cd /d "%~dp0"
 
 if not exist config.json (
@@ -11,7 +11,7 @@ if not exist config.json (
 
 echo.
 echo ========================================
-echo   WebAI Gateway
+echo   WebLLM Gateway
 echo ========================================
 echo.
 echo   控制台:     http://127.0.0.1:8610/
@@ -39,7 +39,7 @@ python -m webai_gateway
 
 if !ERRORLEVEL! NEQ 0 (
   echo.
-  echo WebAI Gateway 异常退出，错误码 !ERRORLEVEL!。
+  echo WebLLM Gateway 异常退出，错误码 !ERRORLEVEL!。
   pause
   exit /b !ERRORLEVEL!
 )

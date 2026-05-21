@@ -340,7 +340,7 @@ def create_app(
     config_file = Path(config_path)
     cfg = config or load_config(config_file)
     client = http_client or httpx.Client(timeout=120, trust_env=False)
-    app = FastAPI(title="WebAI Gateway", version="0.1.0")
+    app = FastAPI(title="WebLLM Gateway", version="0.1.0")
     app.state.config = cfg
     app.state.credential_store = credential_store or CredentialStore(config_file.parent / "credentials")
     app.state.account_registry = AccountRegistry(config_file.parent / ".webai-gateway" / "accounts.json")
@@ -6025,7 +6025,7 @@ def _is_deepseek_ds2api_upstream_empty_output_rate_limit(exc: DeepSeekDs2apiErro
 def _provider_auth_required_detail(provider_label: str) -> str:
     return (
         f"{provider_label} 还没有可用的网页登录授权。"
-        "请打开 WebAI Gateway 首页，选择对应平台，点击“打开授权浏览器”完成网页登录；"
+        "请打开 WebLLM Gateway 首页，选择对应平台，点击“打开授权浏览器”完成网页登录；"
         "登录完成后回到首页刷新模型，再重试 API 调用。"
     )
 
@@ -6033,7 +6033,7 @@ def _provider_auth_required_detail(provider_label: str) -> str:
 def _provider_auth_expired_detail(provider_label: str) -> str:
     return (
         f"{provider_label} 的网页登录授权已过期或失效。"
-        "请打开 WebAI Gateway 首页，选择对应平台，点击“打开授权浏览器”重新登录；"
+        "请打开 WebLLM Gateway 首页，选择对应平台，点击“打开授权浏览器”重新登录；"
         "登录完成后点击“刷新模型”或“验证接入”，再重试 API 调用。"
     )
 

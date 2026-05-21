@@ -1,6 +1,6 @@
-# WebAI Gateway Auto-Research Loop
+# WebLLM Gateway Auto-Research Loop
 
-WebAI Gateway 的 auto-research loop 用于把 Claude Code / 网页模型适配失败沉淀为可回放的 ToolBridge fixture。它不会在线修改 Gateway，也不会执行本地工具；它只做离线采集、脱敏、fixture 生成和 replay 验证。
+WebLLM Gateway 的 auto-research loop 用于把 Claude Code / 网页模型适配失败沉淀为可回放的 ToolBridge fixture。它不会在线修改 Gateway，也不会执行本地工具；它只做离线采集、脱敏、fixture 生成和 replay 验证。
 
 ## 采集失败样本
 

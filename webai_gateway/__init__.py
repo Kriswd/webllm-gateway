@@ -1,2 +1,1 @@
-"""WebAI Gateway package."""
-
+"""WebLLM Gateway package."""

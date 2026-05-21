@@ -193,7 +193,7 @@ def build_auto_research_status(root: str | Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="WebAI Gateway auto-research helper")
+    parser = argparse.ArgumentParser(description="WebLLM Gateway auto-research helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     collect = subparsers.add_parser("collect", help="Collect replay fixtures from a Claude JSONL transcript")

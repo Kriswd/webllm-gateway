@@ -1,8 +1,8 @@
-# WebAI Gateway Agent Guidelines
+# WebLLM Gateway Agent Guidelines
 
 ## 项目定位
 
-WebAI Gateway 是一个独立的网页登录模型 API 网关。它位于 KrisAI、OpenClaw、Hermes、Claude Code 等下游客户端和 Qwen Web、DeepSeek Web、WebAI2API 等网页模型提供方之间。
+WebLLM Gateway 是一个独立的网页登录模型 API 网关。它位于 KrisAI、OpenClaw、Hermes、Claude Code 等下游客户端和 Qwen Web、DeepSeek Web、WebAI2API 等网页模型提供方之间。
 
 本项目的核心目标是：把“不稳定的网页模型文本交互”包装成“稳定的 OpenAI / Anthropic 兼容 API”，让下游客户端像使用原生模型 API 一样使用网页登录模型。
 

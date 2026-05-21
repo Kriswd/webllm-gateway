@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 This file summarizes the main third-party projects referenced by or used in
-WebAI Gateway. It is a release aid, not a substitute for checking each upstream
+WebLLM Gateway. It is a release aid, not a substitute for checking each upstream
 license file before publishing a packaged distribution.
 
 ## Optional adapter runtimes
@@ -11,7 +11,7 @@ license file before publishing a packaged distribution.
 | WebAI2API | Optional sidecar runtime for selected web-login providers | MIT | https://github.com/foxhui/WebAI2API |
 | ds2api | Optional DeepSeek web runtime and oracle reference | GNU AGPL-3.0 | https://github.com/CJackHwang/ds2api |
 
-WebAI Gateway does not vendor either runtime in the public source tree. If a
+WebLLM Gateway does not vendor either runtime in the public source tree. If a
 downstream distribution bundles, modifies, or hosts these runtimes, the
 downstream distributor must comply with the corresponding upstream license.
 

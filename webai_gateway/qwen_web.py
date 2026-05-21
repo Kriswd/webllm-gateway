@@ -45,7 +45,7 @@ _QWEN_WEB_METADATA_KEYS = {
 _QWEN_WEB_METADATA_SIGNAL_KEYS = {"event", "phase", "status", "step", "task", "title", "type"}
 _QWEN_WEB_FINAL_CONTENT_KEYS = {"answer", "calls", "content", "message", "text", "tool_calls"}
 QWEN_WEB_METADATA_RETRY_INSTRUCTION = (
-    "\n\n[WebAI Gateway API mode retry]\n"
+    "\n\n[WebLLM Gateway API mode retry]\n"
     "The previous Qwen Web response contained only workflow metadata, such as {\"title\": ...}, "
     "or did not contain a final answer. Do not output JSON metadata, phase titles, task status, or "
     "artifact-only workflow events. Output the final assistant answer directly. If tool use is required, "
@@ -425,7 +425,7 @@ def _compact_web_prompt(prompt: str, *, max_chars: int) -> str:
 
 
 def _is_tool_bridge_prompt(prompt: str) -> bool:
-    return "WebAI Gateway's strict tool bridge" in (prompt or "")
+    return "WebLLM Gateway's strict tool bridge" in (prompt or "")
 
 
 def _qwen_content_to_text_and_files(content: Any, *, start_index: int) -> tuple[str, list[dict[str, Any]]]:

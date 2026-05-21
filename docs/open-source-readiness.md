@@ -1,6 +1,6 @@
 # Open Source Readiness
 
-这份清单用于把 WebAI Gateway 从本地实验项目整理成可公开发布的仓库。
+这份清单用于把 WebLLM Gateway 从本地实验项目整理成可公开发布的仓库。
 
 ## 当前状态
 

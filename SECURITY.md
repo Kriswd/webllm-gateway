@@ -1,6 +1,6 @@
 # Security Policy
 
-WebAI Gateway 处理网页登录态和本地 API token，默认只应在用户自己的机器上运行。
+WebLLM Gateway 处理网页登录态和本地 API token，默认只应在用户自己的机器上运行。
 
 ## 支持范围
 

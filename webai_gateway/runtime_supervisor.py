@@ -33,7 +33,7 @@ def collect_supervisor_status(
     services = [
         {
             "id": "gateway",
-            "label": "WebAI Gateway",
+            "label": "WebLLM Gateway",
             "role": "public-api",
             "internal": False,
             "baseUrl": gateway_url,
@@ -313,8 +313,8 @@ def _utc_timestamp() -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Start and inspect WebAI Gateway internal runtimes.")
-    parser.add_argument("--config", default="config.json", help="Path to WebAI Gateway config.json")
+    parser = argparse.ArgumentParser(description="Start and inspect WebLLM Gateway internal runtimes.")
+    parser.add_argument("--config", default="config.json", help="Path to WebLLM Gateway config.json")
     parser.add_argument("--ensure", action="store_true", help="Start missing internal runtimes if possible")
     args = parser.parse_args(argv)
     config_path = Path(args.config).resolve()

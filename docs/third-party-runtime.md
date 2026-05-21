@@ -1,12 +1,12 @@
 # Optional Adapter Runtimes
 
-WebAI Gateway 的核心项目是协议网关、网页登录授权管理、direct provider、ToolBridge 和 OpenAI / Anthropic 兼容接口。WebAI2API 和 ds2api 不属于项目本体；它们是按 provider 启用的可选 adapter runtime。
+WebLLM Gateway 的核心项目是协议网关、网页登录授权管理、direct provider、ToolBridge 和 OpenAI / Anthropic 兼容接口。WebAI2API 和 ds2api 不属于项目本体；它们是按 provider 启用的可选 adapter runtime。
 
 开源仓库不应把这些 runtime 的源码、运行态、凭证、浏览器 profile 或构建缓存提交进来。未安装可选 runtime 时，Gateway 仍应能启动并提供核心接口；只是在对应 provider 上显示不可用或需要安装/授权。
 
 ## WebAI2API
 
-- 用途：ChatGPT、Gemini、LMArena、Sora、豆包等网页登录授权、模型目录和网页调用。
+- 用途：ChatGPT、LMArena 等已验证或自行配置的网页登录授权、模型目录和网页调用。
 - 默认地址：`http://127.0.0.1:8500/v1`。
 - 默认目录：`../WebAI2API-sidecar`，可用 `WEBAI2API_SIDECAR_DIR` 覆盖。
 - 本地 package metadata 声明 license 为 MIT，author 为 `foxhui`。

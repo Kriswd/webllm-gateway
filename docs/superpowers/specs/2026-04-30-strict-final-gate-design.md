@@ -2,7 +2,7 @@
 
 ## 背景
 
-Claude Code 通过 WebAI Gateway 使用网页登录模型时，工具调用协议经常被网页模型绕开。近期失败样本显示，模型不一定输出坏 JSON，也不一定直接说工具不存在，而是把未执行动作伪装成普通最终文本，例如：
+Claude Code 通过 WebLLM Gateway 使用网页登录模型时，工具调用协议经常被网页模型绕开。近期失败样本显示，模型不一定输出坏 JSON，也不一定直接说工具不存在，而是把未执行动作伪装成普通最终文本，例如：
 
 - `Need current codebase overview first.`
 - `Use different file path for project structure analysis.`

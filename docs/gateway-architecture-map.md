@@ -1,10 +1,10 @@
-# WebAI Gateway Architecture Map
+# WebLLM Gateway Architecture Map
 
 这份图只面向开发者和开源维护者。产品首页不展示系统架构，用户主流程只保留网页登录授权、模型检测和接入配置。
 
 ```mermaid
 flowchart LR
-  User["用户 / 下游客户端"] --> Gateway["WebAI Gateway :8610"]
+  User["用户 / 下游客户端"] --> Gateway["WebLLM Gateway :8610"]
   Gateway --> UI["授权向导 UI"]
   Gateway --> OpenAI["OpenAI-compatible API"]
   Gateway --> Anthropic["Anthropic-compatible API"]
@@ -13,7 +13,7 @@ flowchart LR
   Gateway --> ToolBridge["ToolBridgeV2"]
   Supervisor --> WebAI2API["WebAI2API 托管能力"]
   Supervisor --> DS2API["ds2api 托管能力"]
-  WebAI2API --> WebProviders["ChatGPT / Gemini / Sora / LMArena"]
+  WebAI2API --> WebProviders["ChatGPT / LMArena / 其它自行配置站点"]
   DS2API --> DeepSeek["DeepSeek Web"]
   Registry --> UI
   ToolBridge --> OpenAI

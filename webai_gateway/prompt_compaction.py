@@ -7,13 +7,13 @@ from collections.abc import Iterable
 from typing import Any
 
 
-_DEFAULT_PROTOCOL_MARKER = "You are using WebAI Gateway's strict tool bridge."
+_DEFAULT_PROTOCOL_MARKER = "You are using WebLLM Gateway's strict tool bridge."
 _REQUIRED_TOOL_FORMAT_MARKER = "Required tool-call format:"
 _DS2API_HISTORY_TITLE = "# DS2API_HISTORY.txt"
 _DS2API_HISTORY_SUMMARY = "Prior conversation history and tool progress."
 _DS2API_TOOLS_TITLE = "# DS2API_TOOLS.txt"
 _DS2API_TOOLS_SUMMARY = "Available tool descriptions and parameter schemas."
-PRESERVED_TASK_STATE_MARKER = "# WebAI Gateway preserved task state"
+PRESERVED_TASK_STATE_MARKER = "# WebLLM Gateway preserved task state"
 LAYERED_HISTORY_MARKER = "[Layered history compaction]"
 _LAYERED_HISTORY_STRATEGY = "ds2api_layered_history"
 _CURRENT_USER_REQUEST_MARKER = "=== CURRENT USER REQUEST (highest priority) ==="
@@ -45,10 +45,10 @@ _ERROR_RECOVERY_CONTROL_MARKERS = (
     "\u6ca1\u6709\u539f\u59cb\u4efb\u52a1",
 )
 STATELESS_WEB_API_GUARD = (
-    "You are serving a stateless WebAI Gateway API request. Ignore any previous website chat, "
+    "You are serving a stateless WebLLM Gateway API request. Ignore any previous website chat, "
     "account memory, profile memory, or project context that is not included in this request. "
     "Follow only the messages below. "
-    "这是一次无状态 WebAI Gateway API 请求；不要引用网页端旧会话、账号记忆、个人资料记忆或本次请求以外的项目上下文。"
+    "这是一次无状态 WebLLM Gateway API 请求；不要引用网页端旧会话、账号记忆、个人资料记忆或本次请求以外的项目上下文。"
 )
 
 
@@ -63,7 +63,7 @@ def compact_web_prompt(
     if len(raw) <= limit:
         return raw
     notice = (
-        "\n\n[Prompt content was compacted by WebAI Gateway for a web-model prompt budget. "
+        "\n\n[Prompt content was compacted by WebLLM Gateway for a web-model prompt budget. "
         f"Original length: {len(raw)} characters. Earlier middle content omitted.]\n\n"
     )
     head_len = min(2000, max(80, limit // 10))
@@ -216,7 +216,7 @@ def _compact_role_messages_layered(
         _DS2API_HISTORY_TITLE,
         _DS2API_HISTORY_SUMMARY,
         LAYERED_HISTORY_MARKER,
-        "Prompt content was compacted by WebAI Gateway using layered DS2API_HISTORY live context.",
+        "Prompt content was compacted by WebLLM Gateway using layered DS2API_HISTORY live context.",
         _layered_history_summary_line(
             original_count=len(history_entries),
             latest_count=len(latest_entries),

@@ -140,7 +140,7 @@ onUnmounted(() => {
   <a-spin
     v-if="isInitializing"
     :spinning="true"
-    tip="正在连接 WebAI Gateway..."
+    tip="正在连接 WebLLM Gateway..."
     size="large"
     class="boot-screen"
   />
@@ -150,7 +150,7 @@ onUnmounted(() => {
 
     <div class="support-strip" role="note">
       <span class="support-badge">支持</span>
-      <span class="support-text">支持作者持续维护 WebAI Gateway：本地 AI 工具、部署与服务咨询，欢迎了解</span>
+      <span class="support-text">支持作者持续维护 WebLLM Gateway：本地 AI 工具、部署与服务咨询，欢迎了解</span>
       <a
         class="support-link"
         href="https://pay.ldxp.cn/shop/FTIWLFHQ"
@@ -165,8 +165,8 @@ onUnmounted(() => {
       <div class="brand">
         <span class="brand-mark"><RocketOutlined /></span>
         <div>
-          <strong>WebAI Gateway</strong>
-          <small>网页登录 API</small>
+          <strong>WebLLM Gateway</strong>
+          <small>网页登录模型 API</small>
         </div>
       </div>
       <a-space wrap>

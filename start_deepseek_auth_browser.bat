@@ -33,4 +33,4 @@ echo.
 
 start "" "%BROWSER%" --remote-debugging-port=%DEBUG_PORT% --user-data-dir="%AUTH_PROFILE%" --no-first-run --disable-default-apps "%LOGIN_URL%"
 
-echo 浏览器已启动。登录完成后回到 WebAI Gateway 控制台点击“重新捕获登录态”。
+echo 浏览器已启动。登录完成后回到 WebLLM Gateway 控制台点击“重新捕获登录态”。

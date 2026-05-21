@@ -1,10 +1,10 @@
-# WebAI Gateway Architecture
+# WebLLM Gateway Architecture
 
-WebAI Gateway 是一个网页登录模型 API 网关。它把 Qwen Web、DeepSeek Web、ChatGPT/WebAI2API 等网页登录上游包装成 OpenAI / Anthropic 兼容 API，同时把不稳定的网页模型文本工具调用转换成稳定的标准工具协议。
+WebLLM Gateway 是一个网页登录模型 API 网关。它把 Qwen Web、DeepSeek Web、ChatGPT/WebAI2API 等网页登录上游包装成 OpenAI / Anthropic 兼容 API，同时把不稳定的网页模型文本工具调用转换成稳定的标准工具协议。
 
 ```mermaid
 flowchart LR
-  U["用户 / 下游客户端"] --> G["WebAI Gateway :8610"]
+  U["用户 / 下游客户端"] --> G["WebLLM Gateway :8610"]
   G --> UI["极简登录向导 UI"]
   G --> API["OpenAI / Anthropic API"]
   G --> MEDIA["图片 API"]

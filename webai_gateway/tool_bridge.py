@@ -1716,7 +1716,7 @@ def build_tool_prompt(tools: list[ToolSpec] | list[dict[str, Any]], options: Too
     read_cache_guard_rule = _read_tool_cache_guard_rule() if _has_read_like_prompt_tool(specs) else ""
     bash_shell_dialect_guard_rule = _bash_shell_dialect_guard_rule() if _has_bash_like_prompt_tool(specs) else ""
     return (
-        "You are using WebAI Gateway's strict tool bridge. You are allowed to request the downstream client to execute listed tools; "
+        "You are using WebLLM Gateway's strict tool bridge. You are allowed to request the downstream client to execute listed tools; "
         "do not confuse this with executing tools inside the web model runtime yourself.\n\n"
         "Available tools (allowed names only):\n"
         f"{tool_manifest}\n\n"

@@ -59,8 +59,8 @@ NATIVE_WEB_SEARCH_RETRY_INSTRUCTION = (
     "如果问题询问网址、官网、地址、URL 或 link，请给出直接 URL 和一句依据；"
     "如果无法确认，请明确说明无法确认及原因。"
 )
-RESPONSE_LANGUAGE_POLICY_MARKER = "WebAI Gateway response language policy"
-WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER = "WebAI Gateway current turn tool-choice policy"
+RESPONSE_LANGUAGE_POLICY_MARKER = "WebLLM Gateway response language policy"
+WEBAI2API_CURRENT_TOOL_CHOICE_POLICY_MARKER = "WebLLM Gateway current turn tool-choice policy"
 RESPONSE_LANGUAGE_OFF_VALUES = {"", "off", "none", "false", "disabled"}
 WEBAI2API_CHATGPT_TEXT_PROMPT_MAX_CHARS = 12000
 WEBAI2API_CHATGPT_TEXT_MODELS = {"gpt-instant", "gpt-thinking", "gpt-pro"}
@@ -1624,7 +1624,7 @@ def _webai2api_protocol_marker(entries: list[tuple[str, str]]) -> str:
         return "TOOL CALL FORMAT - FOLLOW EXACTLY"
     if "Required tool-call format:" in joined:
         return "Required tool-call format:"
-    return "You are using WebAI Gateway's strict tool bridge."
+    return "You are using WebLLM Gateway's strict tool bridge."
 
 
 def _message_content_to_prompt_text(content: Any) -> str:

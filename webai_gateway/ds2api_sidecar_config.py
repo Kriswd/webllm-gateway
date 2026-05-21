@@ -26,8 +26,8 @@ def build_ds2api_sidecar_config(config: GatewayConfig) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Render ds2api sidecar runtime config from WebAI Gateway config.")
-    parser.add_argument("--config", default="config.json", help="Path to WebAI Gateway config.json")
+    parser = argparse.ArgumentParser(description="Render ds2api sidecar runtime config from WebLLM Gateway config.")
+    parser.add_argument("--config", default="config.json", help="Path to WebLLM Gateway config.json")
     args = parser.parse_args(argv)
     config = load_config(Path(args.config))
     print(json.dumps(build_ds2api_sidecar_config(config), ensure_ascii=True, separators=(",", ":")))

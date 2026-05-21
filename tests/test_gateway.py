@@ -1653,7 +1653,7 @@ def test_forwards_normal_non_streaming_chat_without_tool_prompt() -> None:
     assert seen["path"] == "/v1/chat/completions"
     assert "tools" not in seen["body"]
     assert seen["body"]["messages"][0]["role"] == "system"
-    assert "WebAI Gateway response language policy" in seen["body"]["messages"][0]["content"]
+    assert "WebLLM Gateway response language policy" in seen["body"]["messages"][0]["content"]
     assert "默认使用简体中文" in seen["body"]["messages"][0]["content"]
     assert seen["body"]["messages"][1:] == [{"role": "user", "content": "hello"}]
 
@@ -1805,7 +1805,7 @@ def test_injects_tools_and_returns_openai_tool_calls() -> None:
     assert "tool_choice" not in seen["body"]
     system_messages = [m["content"] for m in seen["body"]["messages"] if m["role"] == "system"]
     assert system_messages
-    assert "WebAI Gateway response language policy" in system_messages[0]
+    assert "WebLLM Gateway response language policy" in system_messages[0]
     assert "默认使用简体中文" in system_messages[0]
     assert "```tool_json" in system_messages[0]
     assert '"name": "read_file"' in system_messages[0]
@@ -1929,7 +1929,7 @@ def test_webai2api_upstream_required_tool_choice_retries_plain_text_without_nati
         str(message.get("content", "")) for message in seen_payloads[0]["messages"] if message.get("role") == "user"
     )
     assert "For this response, you MUST call at least one tool from the allowed list." in initial_prompt
-    assert "WebAI Gateway current turn tool-choice policy" in initial_user
+    assert "WebLLM Gateway current turn tool-choice policy" in initial_user
     assert "Gateway JSON instruction" in initial_user
     assert seen_payloads[1]["stream"] is False
     retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
@@ -6890,13 +6890,13 @@ def test_tool_bridge_rewrites_cli_tool_name_to_bash_when_bash_allowed() -> None:
     )
 
     result = parse_tool_response(
-        '```tool_json\n{"calls":[{"id":"call_1","name":"gh","input":{"command":"repo view Kriswd/web-gateway"}}]}\n```',
+        '```tool_json\n{"calls":[{"id":"call_1","name":"gh","input":{"command":"repo view Kriswd/webllm-gateway"}}]}\n```',
         context,
     )
 
     assert result.error is None
     assert [(call.id, call.name, call.input) for call in result.tool_calls] == [
-        ("call_1", "Bash", {"command": "gh repo view Kriswd/web-gateway"})
+        ("call_1", "Bash", {"command": "gh repo view Kriswd/webllm-gateway"})
     ]
 
 
@@ -8050,7 +8050,7 @@ def test_tool_bridge_does_not_rewrite_cli_name_without_bash() -> None:
     )
 
     result = parse_tool_response(
-        '```tool_json\n{"calls":[{"id":"call_1","name":"gh","input":{"command":"repo view Kriswd/web-gateway"}}]}\n```',
+        '```tool_json\n{"calls":[{"id":"call_1","name":"gh","input":{"command":"repo view Kriswd/webllm-gateway"}}]}\n```',
         context,
     )
 
@@ -12041,7 +12041,7 @@ def test_root_serves_fused_gateway_webui_when_available(tmp_path: Path) -> None:
     native_dist = tmp_path / "webui" / "dist"
     native_dist.mkdir(parents=True)
     (native_dist / "index.html").write_text(
-        '<!doctype html><html lang="zh-CN"><head><title>WebAI Gateway</title></head><body><div id="app">融合向导</div></body></html>',
+        '<!doctype html><html lang="zh-CN"><head><title>WebLLM Gateway</title></head><body><div id="app">融合向导</div></body></html>',
         encoding="utf-8",
     )
     client = TestClient(create_app(config=_config(), native_ui_dir=native_dist, http_client=_not_found_client()))
@@ -12049,7 +12049,7 @@ def test_root_serves_fused_gateway_webui_when_available(tmp_path: Path) -> None:
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "<title>WebAI Gateway</title>" in response.text
+    assert "<title>WebLLM Gateway</title>" in response.text
     assert "融合向导" in response.text
 
 
@@ -13914,9 +13914,9 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/gateway/kris-bridge" in main_source
     assert "/dashboard" not in main_source
     assert "redirect: '/'" in main_source
-    assert "网页登录 API" in app_source
+    assert "网页登录模型 API" in app_source
     assert "publicRoutes" in app_source
-    assert "WebAI Gateway" in app_source
+    assert "WebLLM Gateway" in app_source
     assert "状态概览" not in app_source
     assert "请求模型" not in app_source
     assert "系统设置" not in app_source
@@ -14048,7 +14048,7 @@ def test_admin_root_serves_management_ui() -> None:
 
     assert response.status_code == 200
     assert 'lang="zh-CN"' in response.text
-    assert "<title>WebAI Gateway</title>" in response.text
+    assert "<title>WebLLM Gateway</title>" in response.text
     assert '<div id="app">' in response.text
     assert "<title>WebAI2API</title>" not in response.text
 
@@ -17034,7 +17034,7 @@ def test_qwen_web_client_records_task_state_snapshot_diagnostics() -> None:
                     "content": (
                         "system bootstrap\n"
                         + ("skill listing entry\n" * 600)
-                        + "\nYou are using WebAI Gateway's strict tool bridge.\n"
+                        + "\nYou are using WebLLM Gateway's strict tool bridge.\n"
                         + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
                     ),
                 },
@@ -17047,7 +17047,7 @@ def test_qwen_web_client_records_task_state_snapshot_diagnostics() -> None:
 
     sent_prompt = seen["body"]["messages"][0]["content"]
     assert response["choices"][0]["message"]["content"] == "ok"
-    assert "# WebAI Gateway preserved task state" in sent_prompt
+    assert "# WebLLM Gateway preserved task state" in sent_prompt
     assert client.last_diagnostic["prompt_task_state_preserved"] is True
     assert client.last_diagnostic["prompt_task_count"] == 1
     assert client.last_diagnostic["prompt_recent_tool_call_count"] >= 1
@@ -17075,7 +17075,7 @@ def test_qwen_web_client_records_layered_compaction_diagnostics() -> None:
             "content": (
                 "system bootstrap\n"
                 + ("tool schema detail\n" * 700)
-                + "You are using WebAI Gateway's strict tool bridge.\n"
+                + "You are using WebLLM Gateway's strict tool bridge.\n"
                 + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
             ),
         }
@@ -17146,7 +17146,7 @@ def test_qwen_web_helpers_normalize_and_parse_common_stream_shapes() -> None:
 def test_qwen_messages_compacts_oversized_prompt_for_web_provider() -> None:
     huge_system = "system bootstrap\n" + ("skill listing entry\n" * 4000)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Glob, Write.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17161,7 +17161,7 @@ def test_qwen_messages_compacts_oversized_prompt_for_web_provider() -> None:
     assert files == []
     assert len(prompt) <= 1200
     assert "Prompt content was compacted" in prompt
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "Please analyze this codebase" in prompt
     assert prompt.count("skill listing entry") < 10
 
@@ -17291,7 +17291,7 @@ def test_preserved_task_state_keeps_recent_plain_tool_call_before_latest_request
         ]
     )
 
-    assert "# WebAI Gateway preserved task state" in snapshot
+    assert "# WebLLM Gateway preserved task state" in snapshot
     assert "Recent tool calls:" in snapshot
     assert "Read(path=fetch_wechat.py)" in snapshot
 
@@ -17357,7 +17357,7 @@ def test_qwen_web_compaction_injects_no_progress_loop_ledger() -> None:
     huge_system = (
         "system bootstrap\n"
         + ("tool schema detail\n" * 500)
-        + "You are using WebAI Gateway's strict tool bridge.\n"
+        + "You are using WebLLM Gateway's strict tool bridge.\n"
         + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
     messages: list[dict[str, Any]] = [
@@ -17414,7 +17414,7 @@ def test_qwen_web_compaction_preserves_recent_read_result_excerpt_for_continue()
     huge_system = (
         "system bootstrap\n"
         + ("tool schema detail\n" * 500)
-        + "You are using WebAI Gateway's strict tool bridge.\n"
+        + "You are using WebLLM Gateway's strict tool bridge.\n"
         + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
     read_content = (
@@ -17450,7 +17450,7 @@ def test_qwen_web_compaction_preserves_recent_read_result_excerpt_for_continue()
 
     assert files == []
     assert len(prompt) <= 2600
-    assert "# WebAI Gateway preserved task state" in prompt
+    assert "# WebLLM Gateway preserved task state" in prompt
     assert "Read result excerpts:" in prompt
     assert "AUTO_CURATOR_TEMPERATURE_SENTINEL" in prompt
     assert "Continue. Lock LLM temperature and add JSON output validation." in prompt
@@ -17460,7 +17460,7 @@ def test_qwen_web_compaction_preserves_gateway_wrapped_read_cache_for_unchanged_
     huge_system = (
         "system bootstrap\n"
         + ("tool schema detail\n" * 900)
-        + "You are using WebAI Gateway's strict tool bridge.\n"
+        + "You are using WebLLM Gateway's strict tool bridge.\n"
         + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
     auto_content = (
@@ -17568,7 +17568,7 @@ def test_qwen_messages_prepend_stateless_web_api_guard() -> None:
     )
 
     assert files == []
-    assert prompt.startswith("System: You are serving a stateless WebAI Gateway API request.")
+    assert prompt.startswith("System: You are serving a stateless WebLLM Gateway API request.")
     assert "不要引用网页端旧会话" in prompt
     assert "User: 只回复 OK" in prompt
 
@@ -17576,7 +17576,7 @@ def test_qwen_messages_prepend_stateless_web_api_guard() -> None:
 def test_qwen_messages_compaction_preserves_tool_bridge_protocol_with_large_later_history() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Glob, Write.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17593,7 +17593,7 @@ def test_qwen_messages_compaction_preserves_tool_bridge_protocol_with_large_late
     assert files == []
     assert len(prompt) <= 1600
     assert "Prompt content was compacted" in prompt
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "Required tool-call format" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
@@ -17602,7 +17602,7 @@ def test_qwen_messages_compaction_preserves_tool_bridge_protocol_with_large_late
 def test_qwen_messages_compaction_uses_ds2api_history_continuation() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Glob, Write.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17622,7 +17622,7 @@ def test_qwen_messages_compaction_uses_ds2api_history_continuation() -> None:
     assert "# DS2API_HISTORY.txt" in prompt
     assert "Prior conversation history and tool progress." in prompt
     assert "Continue from the latest state in the provided DS2API_HISTORY.txt context" in prompt
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
     assert "=== CURRENT USER REQUEST (highest priority) ===" in prompt
@@ -17633,7 +17633,7 @@ def test_qwen_messages_compaction_uses_ds2api_history_continuation() -> None:
 def test_qwen_messages_tool_observation_does_not_replace_current_request() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Skill, Glob, Read.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17673,7 +17673,7 @@ def test_qwen_messages_tool_observation_does_not_replace_current_request() -> No
 def test_qwen_messages_compaction_promotes_tool_protocol_to_ds2api_tools_context() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 600)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Grep, Edit.\n"
         "Required tool-call format:\n"
         "<|DSML|tool_calls>\n"
@@ -17707,7 +17707,7 @@ def test_qwen_messages_compaction_promotes_tool_protocol_to_ds2api_tools_context
 def test_qwen_messages_compaction_ignores_error_recovery_final_as_current_request() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Glob, Read, Edit.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17744,7 +17744,7 @@ def test_qwen_messages_compaction_ignores_error_recovery_final_as_current_reques
 def test_qwen_messages_compaction_keeps_prior_url_for_referential_followup() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: WebFetch, Read, mcp__chrome-devtools__take_snapshot.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17794,7 +17794,7 @@ def test_qwen_messages_renders_tool_observation_as_tool_role() -> None:
 def test_qwen_messages_compaction_does_not_promote_tool_history_without_task_updates() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Skill, Glob, AskUserQuestion.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17817,7 +17817,7 @@ def test_qwen_messages_compaction_does_not_promote_tool_history_without_task_upd
     )
 
     assert files == []
-    assert "# WebAI Gateway preserved task state" not in prompt
+    assert "# WebLLM Gateway preserved task state" not in prompt
     assert "Recent tool calls:" not in prompt
     assert "=== CURRENT USER REQUEST (highest priority) ===" in prompt
     assert prompt.rfind("LATEST_NEW_TASK_SENTINEL") > prompt.rfind("Continue from the latest state")
@@ -17826,7 +17826,7 @@ def test_qwen_messages_compaction_does_not_promote_tool_history_without_task_upd
 def test_qwen_messages_compaction_preserves_active_tool_errors_without_task_updates() -> None:
     huge_system_prefix = "system bootstrap\n" + ("tool schema detail\n" * 700)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: mcp__chrome-devtools__list_pages, mcp__chrome-devtools__navigate_page, "
         "mcp__web-search__get-single-web-page-content.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
@@ -17869,7 +17869,7 @@ def test_qwen_messages_compaction_preserves_active_tool_errors_without_task_upda
     )
 
     assert files == []
-    assert "# WebAI Gateway preserved task state" in prompt
+    assert "# WebLLM Gateway preserved task state" in prompt
     assert "Recent tool calls:" in prompt
     assert "mcp__chrome-devtools__navigate_page" in prompt
     assert "Tool result signals:" in prompt
@@ -17881,7 +17881,7 @@ def test_qwen_messages_compaction_preserves_active_tool_errors_without_task_upda
 def test_qwen_messages_current_request_skips_skill_control_text() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Skill, Glob, Read.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17928,7 +17928,7 @@ def test_qwen_messages_current_request_skips_skill_control_text() -> None:
 def test_qwen_messages_compaction_uses_gateway_task_anchor_over_guard_user_tail() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Skill, Glob, Read.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17961,7 +17961,7 @@ def test_qwen_messages_compaction_uses_gateway_task_anchor_over_guard_user_tail(
 def test_qwen_messages_compaction_ignores_no_content_task_anchor_override() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Glob, TaskCreate.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -17990,7 +17990,7 @@ def test_qwen_messages_compaction_ignores_no_content_task_anchor_override() -> N
 def test_qwen_messages_compaction_preserves_task_state_snapshot() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 600)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: TaskUpdate, Read, Write.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -18025,7 +18025,7 @@ def test_qwen_messages_compaction_preserves_task_state_snapshot() -> None:
 
     assert files == []
     assert len(prompt) <= 2200
-    assert "# WebAI Gateway preserved task state" in prompt
+    assert "# WebLLM Gateway preserved task state" in prompt
     assert "Task 1: completed - Create config module" in prompt
     assert "Task 4: in_progress - Extract Feishu client" in prompt
     assert "feishu_client.py" in prompt
@@ -18058,7 +18058,7 @@ def test_qwen_messages_task_state_snapshot_preserves_taskupdate_todo_description
                 "content": (
                     "system bootstrap\n"
                     + ("tool schema detail\n" * 600)
-                    + "You are using WebAI Gateway's strict tool bridge.\n"
+                    + "You are using WebLLM Gateway's strict tool bridge.\n"
                     + "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
                 ),
             },
@@ -18070,7 +18070,7 @@ def test_qwen_messages_task_state_snapshot_preserves_taskupdate_todo_description
     )
 
     assert files == []
-    assert "# WebAI Gateway preserved task state" in prompt
+    assert "# WebLLM Gateway preserved task state" in prompt
     assert "Task 1: completed - 创建 config.py 配置模块" in prompt
     assert "Task 2: in_progress - 重构 sync_to_feishu.py 使用 Config 和 FeishuClient" in prompt
     assert "no description" not in prompt
@@ -18079,7 +18079,7 @@ def test_qwen_messages_task_state_snapshot_preserves_taskupdate_todo_description
 
 def test_qwen_messages_layered_compaction_keeps_latest_turns_without_filling_provider_budget() -> None:
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: TaskUpdate, Read, Grep, Write.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -18115,10 +18115,10 @@ def test_qwen_messages_layered_compaction_keeps_latest_turns_without_filling_pro
 
     assert files == []
     assert len(prompt) <= 36000
-    assert "# WebAI Gateway preserved task state" in prompt
+    assert "# WebLLM Gateway preserved task state" in prompt
     assert "# DS2API_HISTORY.txt" in prompt
     assert "[Layered history compaction]" in prompt
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "Task 6: in_progress - Refactor Feishu sync" in prompt
     assert "LATEST_TOOL_RESULT_SENTINEL" in prompt
@@ -18128,7 +18128,7 @@ def test_qwen_messages_layered_compaction_keeps_latest_turns_without_filling_pro
 
 def test_web_prompt_compaction_preserves_required_tool_format_when_tool_manifest_is_large() -> None:
     protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools:\n"
         + "\n".join(f'{{"name":"Tool{i}","description":"{"x" * 20}"}}' for i in range(200))
         + "\nRequired tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
@@ -18138,7 +18138,7 @@ def test_web_prompt_compaction_preserves_required_tool_format_when_tool_manifest
     prompt = compact_web_prompt(raw, max_chars=1800)
 
     assert len(prompt) <= 1800
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "Required tool-call format" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
@@ -18416,7 +18416,7 @@ def test_qwen_coder_keeps_tool_bridge_for_windows_path_update_task(tmp_path: Pat
     assert payload.get("_webai_native_web_search") is False
     assert "tools" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert '"name": "Bash"' in prompt
     assert '"name": "web-search"' not in prompt
     assert response.json()["content"] == [
@@ -22547,7 +22547,7 @@ def test_qwen_coder_client_keeps_coding_prompt_budget_above_generic_default() ->
 def test_qwen_coder_messages_compaction_preserves_tool_bridge_protocol_with_large_later_history() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Glob, Write.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -22564,7 +22564,7 @@ def test_qwen_coder_messages_compaction_preserves_tool_bridge_protocol_with_larg
     assert files == []
     assert len(prompt) <= 1600
     assert "Prompt content was compacted" in prompt
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "Required tool-call format" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
@@ -22577,7 +22577,7 @@ def test_qwen_coder_messages_prepend_stateless_web_api_guard() -> None:
     )
 
     assert files == []
-    assert prompt.startswith("System: You are serving a stateless WebAI Gateway API request.")
+    assert prompt.startswith("System: You are serving a stateless WebLLM Gateway API request.")
     assert "不要引用网页端旧会话" in prompt
     assert "User: 只回复 OK" in prompt
 
@@ -22585,7 +22585,7 @@ def test_qwen_coder_messages_prepend_stateless_web_api_guard() -> None:
 def test_qwen_coder_messages_compaction_uses_ds2api_history_continuation() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Read, Glob, Edit.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -22605,7 +22605,7 @@ def test_qwen_coder_messages_compaction_uses_ds2api_history_continuation() -> No
     assert "# DS2API_HISTORY.txt" in prompt
     assert "Prior conversation history and tool progress." in prompt
     assert "Continue from the latest state in the provided DS2API_HISTORY.txt context" in prompt
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "<|DSML|tool_calls>" in prompt
     assert "LATEST_SENTINEL" in prompt
 
@@ -22613,7 +22613,7 @@ def test_qwen_coder_messages_compaction_uses_ds2api_history_continuation() -> No
 def test_qwen_coder_messages_tool_observation_does_not_replace_current_request() -> None:
     huge_system_prefix = "system bootstrap\n" + ("skill listing entry\n" * 500)
     tool_protocol = (
-        "You are using WebAI Gateway's strict tool bridge.\n"
+        "You are using WebLLM Gateway's strict tool bridge.\n"
         "Available tools: Glob, Read, Edit.\n"
         "Required tool-call format:\n<|DSML|tool_calls>\n</|DSML|tool_calls>"
     )
@@ -22753,7 +22753,7 @@ def test_qwen_web_compaction_preserves_local_project_context_for_project_followu
     )
 
     assert files == []
-    assert "# WebAI Gateway preserved task state" in prompt
+    assert "# WebLLM Gateway preserved task state" in prompt
     assert "Local project context:" in prompt
     assert "E:/ProjectX/nexu" in prompt
     marker = "=== CURRENT USER REQUEST (highest priority) ==="
@@ -23452,7 +23452,7 @@ def test_qwen_web_auto_activation_routes_plain_web_search_to_native_provider(tmp
     assert "tools" not in payload
     assert "tool_choice" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" not in prompt
+    assert "WebLLM Gateway's strict tool bridge" not in prompt
     assert "Provider" in prompt
     body = response.json()
     assert body["stop_reason"] == "end_turn"
@@ -23505,7 +23505,7 @@ def test_qwen_web_auto_activation_routes_github_version_lookup_to_native_provide
     assert "tools" not in payload
     assert "tool_choice" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" not in prompt
+    assert "WebLLM Gateway's strict tool bridge" not in prompt
     assert "Provider" in prompt
     assert response.json()["content"] == [{"type": "text", "text": "GitHub release lookup returned versions."}]
 
@@ -23556,7 +23556,7 @@ def test_qwen_web_auto_activation_keeps_local_github_push_on_tool_bridge(tmp_pat
     payload = seen["payload"]
     assert payload.get("_webai_native_web_search") is False
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert response.json()["content"] == [
         {"type": "tool_use", "id": "toolu_call_1", "name": "Bash", "input": {"command": "git status --short"}}
     ]
@@ -23638,7 +23638,7 @@ def test_qwen_web_auto_activation_keeps_local_project_reference_on_tool_bridge(t
     assert "tools" not in payload
     assert "tool_choice" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert "E:/ProjectX/nexu" in prompt
     assert first_task in prompt
     assert followup in prompt
@@ -23856,7 +23856,7 @@ def test_qwen_web_auto_activation_does_not_bridge_meta_question_after_tool_loop(
     assert "tools" not in payload
     assert "tool_choice" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" not in prompt
+    assert "WebLLM Gateway's strict tool bridge" not in prompt
     assert "Required tool-call format" not in prompt
     body = response.json()
     assert body["stop_reason"] == "end_turn"
@@ -24037,7 +24037,7 @@ def test_qwen_web_continue_inherits_recent_native_search_context(tmp_path: Path)
     assert payload["_webai_native_web_search"] is True
     assert "tools" not in payload
     prompt = "\n".join(str(message.get("content", "")) for message in payload["messages"])
-    assert "WebAI Gateway's strict tool bridge" not in prompt
+    assert "WebLLM Gateway's strict tool bridge" not in prompt
     assert "Provider" in prompt
     assert response.json()["content"] == [{"type": "text", "text": "Continuation: verify chatglm.cn and bigmodel.cn first."}]
 
@@ -24081,7 +24081,7 @@ def test_qwen_web_native_search_off_keeps_web_tool_bridge_available(tmp_path: Pa
 
     assert response.status_code == 200
     prompt = "\n".join(str(message.get("content", "")) for message in seen["payload"]["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert seen["payload"].get("_webai_native_web_search") is False
     assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_web", "name": "WebSearch", "input": {"query": "GLM-5.1 官方体验网页"}}]
 
@@ -24124,7 +24124,7 @@ def test_qwen_web_auto_activation_keeps_tool_bridge_for_local_agent_task(tmp_pat
 
     assert response.status_code == 200
     prompt = "\n".join(str(message.get("content", "")) for message in seen["payload"]["messages"])
-    assert "WebAI Gateway's strict tool bridge" in prompt
+    assert "WebLLM Gateway's strict tool bridge" in prompt
     assert seen["payload"].get("_webai_native_web_search") is not True
     assert response.json()["content"] == [{"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "README.md"}}]
 
@@ -26787,7 +26787,7 @@ def test_anthropic_qwen_web_accepts_image_blocks_as_multimodal_payload(tmp_path:
     assert response.status_code == 200
     payload = _FakeQwenMultimodalClient.captured_payload
     assert payload["messages"][0]["role"] == "system"
-    assert "WebAI Gateway response language policy" in payload["messages"][0]["content"]
+    assert "WebLLM Gateway response language policy" in payload["messages"][0]["content"]
     user_message = next(message for message in payload["messages"] if message.get("role") == "user")
     content = user_message["content"]
     assert content[0] == {"type": "text", "text": "请描述这张图"}

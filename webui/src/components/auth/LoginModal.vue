@@ -56,7 +56,7 @@ const handleLogin = async () => {
                     </template>
                 </a-avatar>
                 <div style="margin-top: 16px; font-size: 16px; font-weight: 500;">
-                    WebAI2API 管理面板
+                    WebLLM Gateway 控制台
                 </div>
                 <div style="color: #8c8c8c; margin-top: 8px;">
                     请输入访问 API Token 以继续

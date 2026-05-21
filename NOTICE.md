@@ -1,6 +1,6 @@
 # Notices
 
-WebAI Gateway is released under the MIT License.
+WebLLM Gateway is released under the MIT License.
 
 The public project tree is intended to contain Gateway source code, tests, UI,
 and documentation only. It does not vendor the source code, credentials,

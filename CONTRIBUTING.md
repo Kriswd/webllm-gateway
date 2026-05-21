@@ -1,6 +1,6 @@
 # Contributing
 
-感谢你改进 WebAI Gateway。这个项目的核心目标是把网页登录模型稳定包装成 OpenAI / Anthropic 兼容 API，而不是实现一个 agent runtime。
+感谢你改进 WebLLM Gateway。这个项目的核心目标是把网页登录模型稳定包装成 OpenAI / Anthropic 兼容 API，而不是实现一个 agent runtime。
 
 ## 开发前检查
 
