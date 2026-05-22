@@ -1,12 +1,14 @@
 # WebLLM Gateway
 
-WebLLM Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让 OpenClaw、Hermes、Claude Code、Codex 等客户端像调用原生模型 API 一样使用网页账号。Qwen 3.7 系列已经调通，Qwen 3.7 Max / Plus Preview 可通过 qwen-web 直连链路接入。
+**给 OpenClaw、Hermes、Claude Code、Codex 等 Agent 工具链使用的网页登录模型 API 网关。**
+
+WebLLM Gateway 把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让 Agent 客户端像调用原生模型 API 一样使用网页账号。Qwen 3.7 系列已经调通，Qwen 3.7 Max / Plus Preview 可通过 qwen-web 直连链路接入。
 
 > Turn web AI accounts into OpenAI/Anthropic-compatible, tool-callable APIs.
 
 项目地址：[github.com/Kriswd/webllm-gateway](https://github.com/Kriswd/webllm-gateway)
 
-一句话：登录网页登录模型账号，自动检测可用模型，把地址、Key 和模型 ID 填到兼容 OpenAI / Anthropic API 的客户端里，就能把网页模型接入工具调用工作流。
+一句话：登录网页登录模型账号，自动检测可用模型，把地址、Key 和模型 ID 填到 OpenClaw、Hermes、Claude Code、Codex 等兼容 OpenAI / Anthropic API 的 Agent 客户端里，就能把网页模型接入工具调用工作流。
 
 它的核心价值不是简单转发，而是把“不稳定的网页对话”整理成“可验证、可接入、可工具调用”的标准 API：
 
@@ -18,9 +20,21 @@ WebLLM Gateway 是一个独立的网页登录模型 API 网关：把 Qwen Web、
 
 项目本体是 Gateway：API、ToolBridge、网页登录授权、模型目录、Qwen direct 和客户端接入配置。WebAI2API 与 ds2api 不作为源码混入本仓库，只作为按需启用的外部 adapter runtime；未安装它们时，Gateway 核心服务仍可启动。
 
+## 适合谁
+
+- 正在折腾 OpenClaw、Hermes、Claude Code、Codex 或其它 Agent runtime，希望把 Qwen / DeepSeek 网页模型接进标准工具调用链路。
+- 已有网页登录模型账号，但不想手动抠 cookie、bearer、session token，只想打开浏览器登录后复制 API 地址和模型 ID。
+- 需要 OpenAI `tools/tool_calls` 或 Anthropic `tool_use/tool_result` 结构，而不是只拿到网页登录模型的一段自然语言回复。
+- 想把 ds2api / WebAI2API 这类网页登录能力整理成更清晰的 Gateway 项目，保持源码边界、许可证边界和用户数据边界。
+
 ## 界面预览
 
 ![WebLLM Gateway 核心界面](docs/assets/webllm-gateway-home.png)
+
+## Agent Demo
+
+- [Qwen 3.7 接入 Agent 工具调用链路 Demo](docs/demos/agent-tool-calling.md)
+- [开源推广发布包](docs/promotion/launch-kit.md)
 
 ## 项目优势
 

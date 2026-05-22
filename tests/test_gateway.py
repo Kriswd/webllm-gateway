@@ -14243,6 +14243,8 @@ def test_open_source_release_materials_are_present() -> None:
         "docs/installation.md",
         "docs/media-generation.md",
         "docs/third-party-runtime.md",
+        "docs/demos/agent-tool-calling.md",
+        "docs/promotion/launch-kit.md",
         "docs/gateway-architecture-map.md",
         ".github/workflows/ci.yml",
     ]
@@ -14255,6 +14257,8 @@ def test_open_source_release_materials_are_present() -> None:
     architecture_map = (root / "docs" / "gateway-architecture-map.md").read_text(encoding="utf-8")
     installation = (root / "docs" / "installation.md").read_text(encoding="utf-8")
     media = (root / "docs" / "media-generation.md").read_text(encoding="utf-8")
+    agent_demo = (root / "docs" / "demos" / "agent-tool-calling.md").read_text(encoding="utf-8")
+    launch_kit = (root / "docs" / "promotion" / "launch-kit.md").read_text(encoding="utf-8")
     third_party = (root / "docs" / "third-party-runtime.md").read_text(encoding="utf-8")
     security = (root / "SECURITY.md").read_text(encoding="utf-8")
     contributing = (root / "CONTRIBUTING.md").read_text(encoding="utf-8")
@@ -14264,7 +14268,14 @@ def test_open_source_release_materials_are_present() -> None:
     assert "docs/installation.md" in readme
     assert "docs/media-generation.md" in readme
     assert "docs/third-party-runtime.md" in readme
+    assert "docs/demos/agent-tool-calling.md" in readme
+    assert "docs/promotion/launch-kit.md" in readme
+    assert "OpenClaw" in readme and "Hermes" in readme and "Agent 工具链" in readme
     assert "qwen-web/qwen3.7-max-preview" in readme
+    assert "Qwen 3.7 接入 Agent 工具调用链路" in agent_demo
+    assert "tool_calls" in agent_demo and "tool_use" in agent_demo
+    assert "微信群 / 社群文案" in launch_kit
+    assert "agent-tools" in launch_kit
     assert "POST /v1/images/generations" in media
     assert "gpt-image-2" in media
     assert "WebAI2API" in third_party and "MIT" in third_party
@@ -14293,6 +14304,8 @@ def test_open_source_release_materials_are_present() -> None:
         "docs/installation.md",
         "docs/media-generation.md",
         "docs/third-party-runtime.md",
+        "docs/demos/agent-tool-calling.md",
+        "docs/promotion/launch-kit.md",
     ]
     personal_path_markers = ("C:\\Users\\woody", "woody.DESKTOP", "E:\\ProjectX", "D:\\ProjectX")
     for relative in formal_docs:
