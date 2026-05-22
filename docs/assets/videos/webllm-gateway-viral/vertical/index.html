@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1080, height=1920" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      html,
+      body {
+        background: #120d0b;
+        color: #fff0db;
+        height: 1920px;
+        overflow: hidden;
+        width: 1080px;
+      }
+
+      body {
+        font-family: "Noto Sans Japanese", sans-serif;
+      }
+
+      #root {
+        background:
+          radial-gradient(circle at 82% 8%, rgba(212, 80, 30, 0.25), rgba(18, 13, 11, 0) 31%),
+          radial-gradient(circle at 14% 88%, rgba(100, 255, 161, 0.12), rgba(18, 13, 11, 0) 30%),
+          #120d0b;
+        height: 1920px;
+        overflow: hidden;
+        position: relative;
+        width: 1080px;
+      }
+
+      #root::after {
+        background:
+          repeating-linear-gradient(180deg, rgba(255, 240, 219, 0.032) 0 1px, rgba(18, 13, 11, 0) 1px 16px),
+          linear-gradient(90deg, rgba(255, 177, 112, 0.08) 1px, rgba(18, 13, 11, 0) 1px);
+        background-size: auto, 72px 72px;
+        content: "";
+        inset: 0;
+        mix-blend-mode: screen;
+        opacity: 0.56;
+        pointer-events: none;
+        position: absolute;
+        z-index: 18;
+      }
+
+      .scene {
+        background-color: #120d0b;
+        inset: 0;
+        overflow: hidden;
+        position: absolute;
+      }
+
+      .scene-content {
+        display: flex;
+        flex-direction: column;
+        gap: 34px;
+        height: 100%;
+        justify-content: center;
+        padding: 112px 74px 132px;
+        position: relative;
+        width: 100%;
+        z-index: 2;
+      }
+
+      .eyebrow,
+      .code-label {
+        align-items: center;
+        background: rgba(212, 80, 30, 0.14);
+        border: 2px solid rgba(255, 177, 112, 0.44);
+        border-radius: 999px;
+        color: #ffb170;
+        display: inline-flex;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 24px;
+        font-weight: 800;
+        gap: 12px;
+        letter-spacing: 0.04em;
+        line-height: 1;
+        padding: 15px 22px;
+        width: max-content;
+      }
+
+      .eyebrow::before {
+        background: #d4501e;
+        border-radius: 999px;
+        content: "";
+        height: 14px;
+        width: 14px;
+      }
+
+      h1,
+      h2 {
+        font-family: "Arial Black", "Noto Sans Japanese", sans-serif;
+        font-weight: 900;
+        letter-spacing: 0;
+        line-height: 0.98;
+        text-wrap: balance;
+      }
+
+      h1 {
+        font-size: 104px;
+      }
+
+      h2 {
+        font-size: 82px;
+      }
+
+      .line {
+        display: block;
+      }
+
+      .accent {
+        color: #ffb170;
+      }
+
+      .proof-green {
+        color: #64ffa1;
+      }
+
+      .subtitle {
+        color: rgba(255, 240, 219, 0.88);
+        font-size: 43px;
+        font-weight: 700;
+        letter-spacing: 0;
+        line-height: 1.38;
+        max-width: 900px;
+      }
+
+      .slash {
+        background: #d4501e;
+        height: 52px;
+        left: -120px;
+        opacity: 0.88;
+        position: absolute;
+        transform: rotate(-6deg);
+        width: 1380px;
+        z-index: 1;
+      }
+
+      .ghost {
+        color: rgba(255, 240, 219, 0.055);
+        font-family: "Arial Black", "Noto Sans Japanese", sans-serif;
+        font-size: 168px;
+        font-weight: 900;
+        left: -26px;
+        letter-spacing: -0.08em;
+        line-height: 0.86;
+        position: absolute;
+        top: 84px;
+        transform: rotate(-5deg);
+        white-space: nowrap;
+      }
+
+      .mini-tabs,
+      .client-row,
+      .action-rack {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+      }
+
+      .tab,
+      .chip {
+        border: 2px solid rgba(255, 240, 219, 0.22);
+        border-radius: 18px;
+        color: #fff0db;
+        font-size: 28px;
+        font-weight: 800;
+        padding: 18px 22px;
+      }
+
+      .tab.hot,
+      .chip.hot {
+        background: #d4501e;
+        border-color: #d4501e;
+      }
+
+      .chip.proof {
+        background: rgba(100, 255, 161, 0.12);
+        border-color: rgba(100, 255, 161, 0.42);
+        color: #64ffa1;
+      }
+
+      .compare {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 1fr;
+      }
+
+      .compare-card,
+      .glass-card,
+      .proof-card,
+      .bridge-node {
+        backdrop-filter: blur(8px);
+        background: rgba(255, 240, 219, 0.08);
+        border: 2px solid rgba(255, 240, 219, 0.16);
+        border-radius: 34px;
+        box-shadow: 0 34px 90px rgba(0, 0, 0, 0.28);
+      }
+
+      .compare-card {
+        min-height: 226px;
+        padding: 36px;
+      }
+
+      .compare-card small,
+      .proof-card small,
+      .ui-caption {
+        color: #ffb170;
+        display: block;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 23px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+        margin-bottom: 14px;
+        text-transform: uppercase;
+      }
+
+      .compare-card strong,
+      .proof-card strong {
+        display: block;
+        font-size: 54px;
+        font-weight: 900;
+        letter-spacing: 0;
+        line-height: 1.08;
+      }
+
+      .compare-card.agent {
+        background: rgba(212, 80, 30, 0.16);
+        border-color: rgba(255, 177, 112, 0.44);
+      }
+
+      .ui-grid {
+        align-items: center;
+        display: grid;
+        gap: 24px;
+        grid-template-columns: 1fr;
+      }
+
+      .screenshot-frame {
+        background: #f3faf8;
+        border: 3px solid rgba(255, 240, 219, 0.72);
+        border-radius: 36px;
+        box-shadow: 0 40px 100px rgba(0, 0, 0, 0.36);
+        overflow: hidden;
+        padding: 18px;
+        transform: rotate(-1.3deg);
+      }
+
+      .screenshot-frame img {
+        border-radius: 24px;
+        display: block;
+        max-height: 600px;
+        object-fit: cover;
+        object-position: center top;
+        width: 100%;
+      }
+
+      .step-list {
+        display: grid;
+        gap: 14px;
+      }
+
+      .step {
+        align-items: center;
+        background: rgba(255, 240, 219, 0.09);
+        border: 2px solid rgba(255, 240, 219, 0.12);
+        border-radius: 24px;
+        display: flex;
+        font-size: 31px;
+        font-weight: 800;
+        gap: 18px;
+        padding: 22px 24px;
+      }
+
+      .step b {
+        align-items: center;
+        background: #d4501e;
+        border-radius: 16px;
+        display: inline-flex;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 26px;
+        height: 54px;
+        justify-content: center;
+        min-width: 54px;
+      }
+
+      .proof-stack {
+        display: grid;
+        gap: 20px;
+      }
+
+      .proof-card {
+        padding: 30px;
+      }
+
+      .proof-card.terminal {
+        background: #07110e;
+        border-color: rgba(100, 255, 161, 0.4);
+        color: #caffdc;
+        font-family: "JetBrains Mono", monospace;
+      }
+
+      .terminal-lines {
+        display: grid;
+        font-size: 28px;
+        font-weight: 700;
+        gap: 12px;
+        line-height: 1.34;
+      }
+
+      .terminal-lines span {
+        display: block;
+      }
+
+      .terminal-lines span::before {
+        color: #64ffa1;
+        content: ">";
+        margin-right: 16px;
+      }
+
+      .readme-frame img {
+        max-height: 370px;
+      }
+
+      .bridge {
+        display: grid;
+        gap: 18px;
+      }
+
+      .bridge-node {
+        min-height: 178px;
+        padding: 30px;
+      }
+
+      .bridge-node strong {
+        display: block;
+        font-size: 42px;
+        font-weight: 900;
+        line-height: 1.16;
+      }
+
+      .bridge-node.center {
+        background: #d4501e;
+        border-color: #ffb170;
+      }
+
+      .arrow {
+        color: #ffb170;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 38px;
+        font-weight: 900;
+        padding-left: 22px;
+      }
+
+      .boundary {
+        background:
+          linear-gradient(135deg, rgba(212, 80, 30, 0.22), rgba(100, 255, 161, 0.08)),
+          rgba(255, 240, 219, 0.08);
+        border: 2px solid rgba(255, 177, 112, 0.38);
+        border-radius: 38px;
+        display: grid;
+        gap: 22px;
+        padding: 38px;
+      }
+
+      .boundary strong {
+        font-size: 48px;
+        font-weight: 900;
+        letter-spacing: 0;
+        line-height: 1.12;
+      }
+
+      .repo {
+        color: #fff0db;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 31px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .wipe {
+        background:
+          repeating-linear-gradient(135deg, #d4501e 0 84px, #120d0b 84px 112px, #ffb170 112px 126px);
+        height: 2400px;
+        left: -1600px;
+        opacity: 0.98;
+        position: absolute;
+        top: -260px;
+        transform: rotate(-8deg);
+        width: 1140px;
+        z-index: 30;
+      }
+
+      .final-fade {
+        background: #120d0b;
+        inset: 0;
+        opacity: 0;
+        position: absolute;
+        z-index: 40;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="83"
+      data-width="1080"
+      data-height="1920"
+    >
+      <audio
+        id="narration"
+        data-start="0"
+        data-duration="80.13"
+        data-track-index="40"
+        src="../assets/narration-vertical.wav"
+        data-volume="1"
+      ></audio>
+
+      <section id="scene-hook" class="clip scene" data-start="0" data-duration="12.2" data-track-index="1">
+        <div class="ghost">WEB AI BREAKOUT</div>
+        <div class="slash" style="top: 1160px"></div>
+        <div class="scene-content">
+          <div class="eyebrow hook-piece">公开实验 / 00</div>
+          <h1 class="hook-piece">
+            <span class="line">网页里的 AI</span>
+            <span class="line">能接进</span>
+            <span class="line accent">会干活的</span>
+            <span class="line">Agent 吗？</span>
+          </h1>
+          <p class="subtitle hook-piece">我真试了。不是让它多聊两句，是让它进入会用工具做事的链路。</p>
+          <div class="mini-tabs hook-piece">
+            <span class="tab">网页登录</span>
+            <span class="tab hot">Agent 工具</span>
+            <span class="tab">真实任务</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-gap" class="clip scene" data-start="10.9" data-duration="15.5" data-track-index="2">
+        <div class="ghost" style="top: 120px">CHAT VS WORK</div>
+        <div class="slash" style="top: 740px"></div>
+        <div class="scene-content">
+          <div class="eyebrow gap-piece">为什么以前卡住</div>
+          <h2 class="gap-piece">
+            <span class="line">网页模型</span>
+            <span class="line">能聊、能写</span>
+          </h2>
+          <div class="compare gap-piece">
+            <div class="compare-card">
+              <small>普通聊天</small>
+              <strong>给你一段回答</strong>
+            </div>
+            <div class="compare-card agent">
+              <small>Agent 要求</small>
+              <strong>读文件、接工具、拿结果、继续做</strong>
+            </div>
+          </div>
+          <div class="action-rack gap-piece">
+            <span class="chip">不是只会说</span>
+            <span class="chip hot">要真的能接上</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-reveal" class="clip scene" data-start="24.8" data-duration="17.4" data-track-index="3">
+        <div class="ghost">GATEWAY</div>
+        <div class="scene-content">
+          <div class="eyebrow reveal-piece">解法出现</div>
+          <h2 class="reveal-piece">
+            <span class="line">WebLLM</span>
+            <span class="line accent">Gateway</span>
+          </h2>
+          <p class="subtitle reveal-piece">登录网页账号，复制地址和模型，把 Qwen、DeepSeek 接进 Agent 客户端。</p>
+          <div class="ui-grid reveal-piece">
+            <figure class="screenshot-frame">
+              <div class="ui-caption">Qwen 3.7 已调通</div>
+              <img src="../assets/gateway-home.png" alt="WebLLM Gateway home screen" />
+            </figure>
+            <div class="step-list">
+              <div class="step"><b>01</b> 打开授权浏览器</div>
+              <div class="step"><b>02</b> 自动检测可用模型</div>
+              <div class="step"><b>03</b> 填给 Agent 客户端</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-proof" class="clip scene" data-start="40.6" data-duration="18.2" data-track-index="4">
+        <div class="ghost" style="top: 126px">PROOF LOOP</div>
+        <div class="scene-content">
+          <div class="eyebrow proof-piece">真实任务证据</div>
+          <h2 class="proof-piece">
+            <span class="line">先读 README</span>
+            <span class="line accent">再找卖点</span>
+          </h2>
+          <div class="proof-stack proof-piece">
+            <div class="proof-card terminal">
+              <small>Agent 客户端</small>
+              <div class="terminal-lines">
+                <span>请求读取 README.md</span>
+                <span>客户端真的执行工具</span>
+                <span>结果回传，继续回答</span>
+              </div>
+            </div>
+            <figure class="screenshot-frame readme-frame">
+              <div class="ui-caption">读到真实内容</div>
+              <img src="../assets/readme-page.png" alt="GitHub README screenshot" />
+            </figure>
+          </div>
+          <p class="subtitle proof-piece">重点：它不是假装读过。</p>
+        </div>
+      </section>
+
+      <section id="scene-bridge" class="clip scene" data-start="57.1" data-duration="15.3" data-track-index="5">
+        <div class="slash" style="top: 530px"></div>
+        <div class="scene-content">
+          <div class="eyebrow bridge-piece">说白了</div>
+          <h2 class="bridge-piece">
+            <span class="line">Gateway</span>
+            <span class="line">就是<span class="accent">翻译官</span></span>
+          </h2>
+          <div class="bridge bridge-piece">
+            <div class="bridge-node">
+              <small class="code-label">Agent</small>
+              <strong>想让模型做什么</strong>
+            </div>
+            <div class="arrow">translate ↓</div>
+            <div class="bridge-node center">
+              <strong>翻译给网页登录模型</strong>
+            </div>
+            <div class="arrow">translate ↓</div>
+            <div class="bridge-node">
+              <small class="code-label">Back to Agent</small>
+              <strong>变回能执行的动作</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-cta" class="clip scene" data-start="70.8" data-duration="12.2" data-track-index="6">
+        <div class="ghost" style="top: 142px">OPEN SOURCE</div>
+        <div class="scene-content">
+          <div class="eyebrow cta-piece">GitHub 已开源</div>
+          <h2 class="cta-piece">
+            <span class="line">你折腾 Agent</span>
+            <span class="line accent">这条路</span>
+            <span class="line">可以试试</span>
+          </h2>
+          <div class="boundary cta-piece">
+            <strong>真正读文件、跑命令、管权限的，还是你的客户端。</strong>
+            <div class="client-row">
+              <span class="chip hot">OpenClaw</span>
+              <span class="chip hot">Hermes</span>
+              <span class="chip">Claude Code</span>
+              <span class="chip">Codex</span>
+            </div>
+            <div class="repo">github.com/Kriswd/webllm-gateway</div>
+          </div>
+        </div>
+      </section>
+
+      <div id="wipe-1" class="clip wipe" data-start="10.7" data-duration="1" data-track-index="20"></div>
+      <div id="wipe-2" class="clip wipe" data-start="24.5" data-duration="1" data-track-index="21"></div>
+      <div id="wipe-3" class="clip wipe" data-start="40.3" data-duration="1" data-track-index="22"></div>
+      <div id="wipe-4" class="clip wipe" data-start="56.8" data-duration="1" data-track-index="23"></div>
+      <div id="wipe-5" class="clip wipe" data-start="70.5" data-duration="1" data-track-index="24"></div>
+      <div id="final-fade" class="clip final-fade" data-start="81.8" data-duration="1.2" data-track-index="22"></div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+
+      tl.from(".hook-piece", { y: 76, opacity: 0, scale: 0.97, duration: 0.72, stagger: 0.12, ease: "expo.out" }, 0.18);
+      tl.from("#scene-hook .ghost", { x: -120, opacity: 0, duration: 0.8, ease: "power4.out" }, 0.12);
+      tl.from("#scene-hook .slash", { x: -500, rotation: -12, duration: 0.58, ease: "back.out(1.8)" }, 0.62);
+
+      tl.from(".gap-piece", { x: -74, opacity: 0, duration: 0.62, stagger: 0.11, ease: "power4.out" }, 11.1);
+      tl.from("#scene-gap .compare-card:first-child", { y: 60, rotation: -1.8, opacity: 0, duration: 0.52, ease: "back.out(1.5)" }, 11.54);
+      tl.from("#scene-gap .compare-card.agent", { y: 76, scale: 0.95, opacity: 0, duration: 0.58, ease: "expo.out" }, 11.72);
+
+      tl.from(".reveal-piece", { y: 72, opacity: 0, duration: 0.62, stagger: 0.1, ease: "expo.out" }, 25.02);
+      tl.from("#scene-reveal .screenshot-frame", { x: 96, y: 40, rotation: 3, opacity: 0, duration: 0.72, ease: "power4.out" }, 25.72);
+      tl.from("#scene-reveal .step", { x: -60, opacity: 0, duration: 0.45, stagger: 0.1, ease: "back.out(1.4)" }, 26.12);
+
+      tl.from(".proof-piece", { y: 58, opacity: 0, duration: 0.58, stagger: 0.12, ease: "power3.out" }, 40.84);
+      tl.from("#scene-proof .terminal", { scale: 0.94, rotation: -1.2, opacity: 0, duration: 0.68, ease: "expo.out" }, 41.54);
+      tl.from("#scene-proof .readme-frame", { x: 96, opacity: 0, duration: 0.64, ease: "back.out(1.4)" }, 42.02);
+
+      tl.from(".bridge-piece", { y: 64, opacity: 0, duration: 0.58, stagger: 0.11, ease: "expo.out" }, 57.32);
+      tl.from("#scene-bridge .bridge-node", { x: -54, opacity: 0, duration: 0.48, stagger: 0.18, ease: "power4.out" }, 58.18);
+      tl.from("#scene-bridge .arrow", { scaleY: 0.35, opacity: 0, transformOrigin: "top", duration: 0.34, stagger: 0.18, ease: "back.out(1.7)" }, 58.42);
+
+      tl.from(".cta-piece", { y: 72, opacity: 0, duration: 0.64, stagger: 0.14, ease: "expo.out" }, 71.02);
+      tl.from("#scene-cta .chip", { x: -34, opacity: 0, rotation: -1, duration: 0.38, stagger: 0.08, ease: "back.out(1.6)" }, 72.2);
+
+      ["#wipe-1", "#wipe-2", "#wipe-3", "#wipe-4", "#wipe-5"].forEach((selector, index) => {
+        const at = [10.7, 24.5, 40.3, 56.8, 70.5][index];
+        tl.fromTo(selector, { x: 0 }, { x: 2850, duration: 0.88, ease: "power4.inOut" }, at);
+      });
+      tl.to("#final-fade", { opacity: 1, duration: 0.9, ease: "power2.in" }, 82.02);
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

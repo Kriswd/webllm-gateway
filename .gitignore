@@ -32,6 +32,11 @@ cookies/
 *.pem
 *.key
 
+# Local HyperFrames review artifacts
+docs/assets/videos/**/renders/*-draft.mp4
+docs/assets/videos/**/renders/*-contact.png
+docs/assets/videos/**/renders/*-proof.png
+
 # Environment
 .env
 .env.local
