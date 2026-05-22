@@ -91,6 +91,7 @@ from webai_gateway.web_auth import (
     DeepSeekWebAuthService,
     PROVIDERS,
     catalog_model_payloads,
+    credential_from_remote_auth_url,
     create_job,
     default_cdp_url,
     get_provider,
@@ -1708,6 +1709,36 @@ def create_app(
         cdp_url = str(body.get("cdpUrl") or default_cdp_url())
         get_provider(provider_id)
         return app.state.browser_launcher.start(provider_id, cdp_url)
+
+    def _save_web_auth_callback_url(provider_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        provider = get_provider(provider_id)
+        if provider.route != "direct":
+            raise HTTPException(status_code=400, detail=f"{provider.name} 请使用网页登录授权流程，不需要粘贴授权 URL。")
+        auth_url = str(body.get("url") or body.get("callbackUrl") or body.get("callback_url") or "")
+        user_agent = str(body.get("userAgent") or body.get("user_agent") or "")
+        try:
+            credential = credential_from_remote_auth_url(provider_id, auth_url, user_agent=user_agent)
+            app.state.credential_store.save(provider_id, credential)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "success": True,
+            "message": "远程授权 URL 已导入，登录态已保存。请刷新模型并检测可用性。",
+            "credential": app.state.credential_store.summary(provider_id),
+        }
+
+    @app.post("/api/admin/web-auth/callback-url")
+    async def import_web_auth_callback_url(request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        provider_id = str(body.get("provider") or body.get("providerId") or "deepseek-web")
+        return _save_web_auth_callback_url(provider_id, body)
+
+    @app.post("/api/admin/onboarding/providers/{provider_id}/callback-url")
+    async def import_onboarding_provider_callback_url(provider_id: str, request: Request) -> dict[str, Any]:
+        require_local_admin(request)
+        body = await _json_body(request)
+        return _save_web_auth_callback_url(provider_id, body)
 
     @app.post("/api/admin/web-auth/jobs")
     async def start_web_auth_job(request: Request) -> dict[str, Any]:

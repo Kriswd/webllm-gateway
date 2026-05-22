@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlparse
 
 from webai_gateway.deepseek_web import DEEPSEEK_WEB_CATALOG_MODELS
 
@@ -30,6 +30,23 @@ QWEN_CREDENTIAL_ORIGINS: dict[str, tuple[str, ...]] = {
 
 def default_cdp_url() -> str:
     return os.environ.get("WEBAI_DEFAULT_CDP_URL", "").strip() or DEFAULT_CDP_URL
+
+
+REMOTE_AUTH_EMPTY_URL_DETAIL = (
+    "这个授权 URL 里没有可直接使用的 cookie/bearer/session token。"
+    "Qwen/DeepSeek 普通网页登录通常不会把登录态放在地址栏里；"
+    "如果 Gateway 部署在 NAS 或远程机器上，请改用远程 CDP：在电脑上用 Chrome/Edge 启动远程调试端口，"
+    "把 CDP 地址填为 http://电脑IP:9222 后再点“打开授权浏览器/重新检测登录态”。"
+)
+REMOTE_AUTH_CODE_ONLY_DETAIL = (
+    "这个授权 URL 里只有一次性的 OAuth code，Gateway 没有这次授权的 verifier，不能直接换取网页登录态。"
+    "请改用远程 CDP：在电脑上用 Chrome/Edge 启动远程调试端口，把 CDP 地址填为 http://电脑IP:9222 后再检测。"
+)
+REMOTE_AUTH_TOKEN_KEYS = ("bearer", "access_token", "token", "id_token", "auth_token", "jwt")
+REMOTE_AUTH_COOKIE_KEYS = ("cookie", "cookies")
+REMOTE_AUTH_SESSION_KEYS = ("session_token", "sessionToken", "qwen_session", "qwenSession")
+REMOTE_AUTH_CODE_KEYS = ("code", "auth_code", "authorization_code")
+REMOTE_AUTH_USER_AGENT_KEYS = ("user_agent", "userAgent", "ua")
 
 
 @dataclass(frozen=True)
@@ -617,6 +634,84 @@ def is_credential_authorized(provider_id: str, credential: dict[str, Any] | None
     if provider_id == "deepseek-web":
         return bool(credential.get("bearer"))
     return bool(credential.get("cookie") or credential.get("bearer"))
+
+
+def credential_from_remote_auth_url(provider_id: str, auth_url: str, user_agent: str = "") -> dict[str, Any]:
+    provider = get_provider(provider_id)
+    url = str(auth_url or "").strip()
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("请粘贴完整的授权 URL。")
+
+    params = _remote_auth_url_params(parsed)
+    bearer = _strip_bearer_prefix(_first_remote_auth_param(params, REMOTE_AUTH_TOKEN_KEYS))
+    cookie = _first_remote_auth_param(params, REMOTE_AUTH_COOKIE_KEYS)
+    session_token = _first_remote_auth_param(params, REMOTE_AUTH_SESSION_KEYS)
+    code = _first_remote_auth_param(params, REMOTE_AUTH_CODE_KEYS)
+    parsed_user_agent = _first_remote_auth_param(params, REMOTE_AUTH_USER_AGENT_KEYS)
+
+    if not cookie and provider.id in QWEN_DIRECT_PROVIDER_IDS:
+        qwen_cookie = params.get("qwen_session") or params.get("sessionToken") or params.get("session_token")
+        if qwen_cookie:
+            cookie = f"qwen_session={qwen_cookie}"
+    if not session_token and provider.id in QWEN_DIRECT_PROVIDER_IDS and cookie:
+        session_token = _qwen_session_from_cookie_header(cookie)
+
+    if code and not any([bearer, cookie, session_token]):
+        raise ValueError(REMOTE_AUTH_CODE_ONLY_DETAIL)
+
+    metadata: dict[str, Any] = {}
+    if session_token:
+        metadata["sessionToken"] = session_token
+
+    credential = {
+        "cookie": cookie,
+        "bearer": bearer,
+        "userAgent": str(user_agent or parsed_user_agent or ""),
+        "metadata": metadata,
+    }
+    if not is_credential_authorized(provider.id, credential):
+        raise ValueError(REMOTE_AUTH_EMPTY_URL_DETAIL)
+    return credential
+
+
+def _remote_auth_url_params(parsed_url: Any) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for raw in (parsed_url.query, parsed_url.fragment):
+        for key, value in parse_qsl(raw, keep_blank_values=True):
+            clean_key = str(key or "").strip()
+            if clean_key and value and clean_key not in params:
+                params[clean_key] = str(value).strip()
+    return params
+
+
+def _first_remote_auth_param(params: dict[str, str], names: tuple[str, ...]) -> str:
+    for name in names:
+        value = params.get(name)
+        if value:
+            return value
+    lowered = {key.lower(): value for key, value in params.items() if value}
+    for name in names:
+        value = lowered.get(name.lower())
+        if value:
+            return value
+    return ""
+
+
+def _strip_bearer_prefix(value: str) -> str:
+    token = str(value or "").strip()
+    if token.lower().startswith("bearer "):
+        return token.split(None, 1)[1].strip()
+    return token
+
+
+def _qwen_session_from_cookie_header(cookie: str) -> str:
+    for part in str(cookie or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        lowered = name.lower()
+        if value and any(hint in lowered for hint in QWEN_LOGIN_COOKIE_HINTS):
+            return value.strip()
+    return ""
 
 
 def provider_payload(store: CredentialStore) -> dict[str, Any]:

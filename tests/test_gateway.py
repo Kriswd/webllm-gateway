@@ -14158,6 +14158,8 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/api/admin/onboarding" in bridge_source
     assert "/api/admin/onboarding/providers/" in bridge_source
     assert "/api/admin/onboarding/login/finish" in bridge_source
+    assert "/api/admin/web-auth/callback-url" in bridge_source
+    assert "远程/NAS 授权" in bridge_source
     assert "pendingWebAI2APILogin" in bridge_source
     assert "data.accountId || ''" in bridge_source
     assert "async function autoValidateWebAI2APILogin()" in bridge_source
@@ -15560,6 +15562,86 @@ def test_qwen_store_rejects_visitor_cookie_only_credential(tmp_path: Path) -> No
         )
 
     assert store.get("qwen") is None
+
+
+def test_remote_auth_callback_url_imports_qwen_credentials_without_leaking_url(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "credentials")
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=store,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/api/admin/web-auth/callback-url",
+        json={
+            "provider": "qwen",
+            "url": "https://callback.local/done#cookie=qwen_session%3Dqwen-secret&session_token=qwen-secret",
+            "userAgent": "Remote Chrome",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["credential"]["authorized"] is True
+    assert body["credential"]["fields"] == {"cookie": True, "bearer": False, "userAgent": True}
+    assert "qwen-secret" not in response.text
+    assert "callback.local" not in response.text
+    saved = store.get("qwen")
+    assert saved is not None
+    assert saved["cookie"] == "qwen_session=qwen-secret"
+    assert saved["metadata"]["sessionToken"] == "qwen-secret"
+    assert saved["userAgent"] == "Remote Chrome"
+
+
+def test_remote_auth_callback_url_imports_deepseek_bearer_without_leaking_token(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "credentials")
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=store,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/api/admin/web-auth/callback-url",
+        json={
+            "provider": "deepseek-web",
+            "url": "https://callback.local/done#access_token=deepseek-secret-token",
+            "userAgent": "Remote Chrome",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["credential"]["fields"]["bearer"] is True
+    assert "deepseek-secret-token" not in response.text
+    saved = store.get("deepseek-web")
+    assert saved is not None
+    assert saved["bearer"] == "deepseek-secret-token"
+
+
+def test_remote_auth_callback_url_rejects_plain_login_url_with_remote_cdp_hint(tmp_path: Path) -> None:
+    client = TestClient(
+        create_app(
+            config=_config(),
+            credential_store=CredentialStore(tmp_path / "credentials"),
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/api/admin/web-auth/callback-url",
+        json={"provider": "qwen", "url": "https://chat.qwen.ai/"},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "远程 CDP" in detail
+    assert "cookie/bearer/session token" in detail
+    assert "chat.qwen.ai" not in detail
 
 
 def test_onboarding_marks_existing_qwen_cookie_only_file_unauthorized(tmp_path: Path) -> None:

@@ -43,6 +43,10 @@ const cdpUrl = ref('http://127.0.0.1:9222');
 const configProfile = ref('cc-switch');
 const accountEditOpen = ref(false);
 const accountEditSaving = ref(false);
+const remoteAuthOpen = ref(false);
+const remoteAuthSaving = ref(false);
+const remoteAuthUrl = ref('');
+const remoteAuthProviderId = ref('');
 const accountEditForm = ref({
   id: '',
   displayName: '',
@@ -91,6 +95,10 @@ const providers = computed(() => {
 
 const selectedProvider = computed(() => {
   return providers.value.find((item) => item.id === selectedProviderId.value) || providers.value[0] || null;
+});
+
+const remoteAuthProvider = computed(() => {
+  return providers.value.find((item) => item.id === remoteAuthProviderId.value) || selectedProvider.value;
 });
 
 const selectedProviderAccounts = computed(() => {
@@ -543,6 +551,43 @@ async function retryDirectAuthCapture(provider = selectedProvider.value) {
     message.error(actionError.value);
   } finally {
     actionLoading.value = false;
+  }
+}
+
+function openRemoteAuthModal(provider = selectedProvider.value) {
+  if (!provider) return;
+  remoteAuthProviderId.value = provider.id;
+  remoteAuthUrl.value = '';
+  remoteAuthOpen.value = true;
+}
+
+async function submitRemoteAuthUrl() {
+  const providerId = remoteAuthProvider.value?.id || selectedProvider.value?.id;
+  const url = remoteAuthUrl.value.trim();
+  if (!providerId) {
+    message.warning('请先选择平台');
+    return;
+  }
+  if (!url) {
+    message.warning('请粘贴授权 URL');
+    return;
+  }
+  remoteAuthSaving.value = true;
+  try {
+    const res = await fetch('/api/admin/web-auth/callback-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: providerId, url }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+    remoteAuthOpen.value = false;
+    message.success(data.message || '远程授权 URL 已导入');
+    await loadOnboarding();
+  } catch (error) {
+    message.error(error.message || String(error));
+  } finally {
+    remoteAuthSaving.value = false;
   }
 }
 
@@ -1141,6 +1186,15 @@ onMounted(loadOnboarding);
                 {{ selectedProvider.loginKind === 'direct' ? '打开授权浏览器' : '打开网页登录授权' }}
               </a-button>
               <a-button
+                v-if="selectedProvider.loginKind === 'direct'"
+                size="large"
+                :loading="remoteAuthSaving"
+                @click="openRemoteAuthModal(selectedProvider)"
+              >
+                <template #icon><LinkOutlined /></template>
+                远程/NAS 授权
+              </a-button>
+              <a-button
                 v-if="selectedProvider.loginKind !== 'direct'"
                 size="large"
                 :loading="actionLoading"
@@ -1367,6 +1421,36 @@ onMounted(loadOnboarding);
         <div class="field-block">
           <label>备注</label>
           <a-textarea v-model:value="accountEditForm.note" :rows="3" placeholder="仅保存在本机，不保存凭证正文" />
+        </div>
+      </a-space>
+    </a-modal>
+
+    <a-modal
+      v-model:open="remoteAuthOpen"
+      title="远程/NAS 授权"
+      :confirm-loading="remoteAuthSaving"
+      ok-text="导入授权 URL"
+      cancel-text="取消"
+      @ok="submitRemoteAuthUrl"
+    >
+      <a-space direction="vertical" style="width: 100%;">
+        <a-alert
+          type="info"
+          show-icon
+          message="适合 Gateway 部署在 NAS 或服务器的场景"
+          description="只有 URL 里带 cookie、bearer 或 session token 时才能直接导入。普通登录页地址不包含登录态，系统会提示你改用远程 CDP 捕获。"
+        />
+        <div class="field-block">
+          <label>当前平台</label>
+          <a-typography-text strong>{{ remoteAuthProvider?.name || '未选择平台' }}</a-typography-text>
+        </div>
+        <div class="field-block">
+          <label>授权 URL</label>
+          <a-textarea
+            v-model:value="remoteAuthUrl"
+            :rows="4"
+            placeholder="粘贴完成登录后的回调 URL。不要把这个 URL 发给陌生人。"
+          />
         </div>
       </a-space>
     </a-modal>

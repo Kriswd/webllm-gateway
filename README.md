@@ -98,6 +98,7 @@ Windows 宿主机可参考：
 
 - 首页默认只展示当前已经实际验证可用的网页登录通路，避免把未验证站点当成可用产品能力。
 - DeepSeek Web、Qwen / 通义千问国际版、Qwen Coder：点击“打开授权浏览器”，在弹出的浏览器里登录。网关检测到真实登录态后才会显示已授权。
+- NAS、Docker 或远程机器部署时，推荐在你正在使用的电脑上启动带 CDP 的 Chrome / Edge，把控制台里的 CDP 地址改成 `http://电脑IP:9222` 后再检测登录态；如果你拿到的是包含 `cookie`、`bearer`、`session_token` 等凭据的授权回调 URL，也可以点“远程/NAS 授权”粘贴导入。普通登录页 URL 不包含登录态，Gateway 会明确拒绝并提示改用远程 CDP。
 - ChatGPT：通过可选 WebAI2API adapter runtime 接入图片生成；点击“登录或修复账号”后 Gateway 会自动准备隔离 worker，完成网页登录授权并恢复 API 后即可检测和调用已验证模型，不需要手动进入外部后台配置工作池。
 - 授权完成后，在“可用模型”里复制模型 ID，填到 KrisAI、OpenClaw、Hermes 或 Claude Code。
 - “接入客户端”区域可以复制 OpenAI / Anthropic 兼容地址和 API Key，也可以重新生成本地网关令牌。
@@ -295,6 +296,7 @@ WebAI2API 支持且已验证开放的站点和模型会继续透传并合并到 
 - `POST /api/admin/token/rotate`
 - `GET /api/admin/web-auth/providers`
 - `POST /api/admin/web-auth/browser/start`
+- `POST /api/admin/web-auth/callback-url`
 - `POST /api/admin/web-auth/jobs`
 - `GET /api/admin/web-auth/jobs/{job_id}`
 - `GET /api/admin/web-auth/credentials`

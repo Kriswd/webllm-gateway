@@ -71,6 +71,7 @@ WEBAI_DEFAULT_CDP_URL=http://host.docker.internal:9222
 ```
 
 也就是说浏览器建议在宿主机上启动并开放 `9222` 调试端口，容器只连接它并捕获登录态。
+如果 Gateway 跑在 NAS 或远程服务器，而你在另一台电脑上完成登录，请把控制台里的 CDP 地址改成 `http://电脑IP:9222`。只有当你拿到的授权回调 URL 本身包含 `cookie`、`bearer` 或 `session_token` 等凭据时，才可以使用首页的“远程/NAS 授权”粘贴导入；普通登录页 URL 不包含登录态，无法靠复制地址完成授权。
 
 Windows 宿主机示例：
 
