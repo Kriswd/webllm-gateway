@@ -1,41 +1,47 @@
 # WebLLM Gateway 开源推广发布包
 
-这份发布包面向 OpenClaw、Hermes、Claude Code、Codex 和其它 Agent runtime 玩家。第一波传播不要泛泛讲“API 网关”，要讲清楚：网页登录模型也可以进入标准工具调用链路。
+这份发布包的主线调整为：不要把复杂编程任务作为主要价值，重点讲 Qwen 3.7 MAX 网页模型接入小龙虾和 Hermes，适合轻中度工具调用、养虾养马和节省部分 API Token。
 
 ## 核心定位
 
-WebLLM Gateway 是一个给 Agent 工具链使用的网页登录模型 API 网关。它把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让 OpenClaw、Hermes、Claude Code、Codex 等客户端像调用原生模型 API 一样使用网页账号。
+WebLLM Gateway 是一个网页登录模型 API 网关。它把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让小龙虾（OpenClaw）、Hermes 等客户端可以用网页账号跑轻中度任务。
+
+## B站标题
+
+```text
+我把Qwen 3.7 MAX网页模型接入了小龙虾和hermes，网页模型也能调用工具干活了？
+```
 
 ## 一句话版本
 
-把 Qwen / DeepSeek 网页账号接进 OpenClaw、Hermes、Claude Code、Codex，让网页登录模型也能跑标准工具调用。
+把 Qwen 3.7 MAX 网页账号接进小龙虾和 Hermes，让网页模型也能参与轻中度工具调用，适合养虾养马、资料整理、简单自动化和低成本试错。
 
 ## 30 秒版本
 
-我开源了一个小项目 WebLLM Gateway：它不是聊天壳子，而是给 Agent 工具链用的网页登录模型 API 网关。
+我开源了一个小项目 WebLLM Gateway。
 
-登录 Qwen / DeepSeek 网页账号后，Gateway 会自动检测可用模型，并暴露 OpenAI / Anthropic 兼容 API。OpenClaw、Hermes、Claude Code、Codex 这类客户端可以直接填 `base_url`、`api_key`、`model` 来调用。重点是它处理了工具调用桥接：OpenAI `tool_calls` 和 Anthropic `tool_use/tool_result` 都会被转换成网页登录模型能理解的协议，再转回标准结构。
+它不是要把网页模型吹成万能编程模型，也不建议拿来硬跑复杂工程长链路。它更适合把 Qwen 3.7 MAX 这类网页登录模型，接进小龙虾、Hermes 等兼容客户端，处理资料整理、信息查询、简单工具调用、批量小任务。
 
-Qwen 3.7 系列已经调通，适合 Agent 玩家拿来做编程、项目分析和工具调用测试。
+流程很简单：打开授权浏览器登录网页账号，Gateway 自动检测可用模型，然后复制 API 地址、Key 和模型 ID 到客户端里。客户端负责执行工具和权限确认，Gateway 只负责把“网页模型文本”和“标准工具调用协议”互相翻译。
+
+核心价值：够用的轻任务少烧一点 API Token。
 
 ## GitHub 仓库描述
 
 ```text
-WebLLM Gateway：让 Qwen/DeepSeek 网页模型接入 OpenAI/Anthropic 兼容 Agent 工具链，支持 OpenClaw、Hermes、Claude Code、Codex 工具调用
+WebLLM Gateway：把 Qwen 3.7 MAX 等网页模型接入小龙虾、Hermes 等兼容客户端，支持轻中度工具调用
 ```
 
 ## 推荐 GitHub Topics
 
 ```text
-agent-tools
 tool-calling
 openai-compatible
 anthropic-compatible
-claude-code
 openclaw
 hermes
-codex
 qwen
+qwen37
 deepseek
 web-llm
 ai-gateway
@@ -44,15 +50,45 @@ webai2api
 ds2api
 ```
 
+## B站简介
+
+```text
+这次不吹复杂编程任务，重点是低成本轻量工具调用：
+Qwen 3.7 MAX 网页模型 -> WebLLM Gateway -> 小龙虾 / Hermes。
+
+适合资料整理、信息查询、简单工具调用、养虾养马、低成本试错，用网页登录账号省一部分 API Token。
+复杂工程、长链路高可靠编程任务别硬上，还是交给更稳的模型和官方 API。
+
+项目地址：
+https://github.com/Kriswd/webllm-gateway
+
+仅供学习研究，请遵守平台规则和法律法规。
+```
+
+## B站标签
+
+```text
+Qwen
+通义千问
+Qwen 3.7 MAX
+小龙虾
+Hermes
+网页模型
+工具调用
+省Token
+开源项目
+大模型
+```
+
 ## 微信群 / 社群文案
 
-我开源了一个 Agent 工具链网关项目：WebLLM Gateway。
+我把 WebLLM Gateway 开源了。
 
-它可以把 Qwen / DeepSeek 这类网页登录模型包装成 OpenAI / Anthropic 兼容 API，给 OpenClaw、Hermes、Claude Code、Codex 等客户端调用。
+一句话：把 Qwen 3.7 MAX 这类网页登录模型，接进小龙虾和 Hermes，让网页模型也能参与工具调用。
 
-重点不是简单转发，而是做了工具调用桥接：OpenAI `tool_calls`、Anthropic `tool_use/tool_result` 都能转成网页登录模型可理解的协议，再转回标准结构。Qwen 3.7 系列已经调通。
+但边界先说清楚：它不是万能编程模型，不建议硬跑复杂工程长链路。更适合资料整理、信息查询、简单自动化、养虾养马这类轻中度任务。客户端负责执行工具和权限确认，Gateway 只负责协议翻译。
 
-适合想折腾 Agent runtime、低成本编程模型、网页登录模型工具调用的人试试。
+适合想低成本试错、省一点 API Token、折腾网页模型工具调用的人试试。
 
 项目地址：
 https://github.com/Kriswd/webllm-gateway
@@ -61,56 +97,43 @@ https://github.com/Kriswd/webllm-gateway
 
 最近把 WebLLM Gateway 开源了。
 
-一句话：把 Qwen / DeepSeek 网页账号接进 OpenClaw、Hermes、Claude Code、Codex，让网页登录模型也能跑标准工具调用。
+这次定位想说清楚一点：它不是拿网页模型去硬刚复杂编程任务，而是把 Qwen 3.7 MAX 这类网页登录模型接进小龙虾、Hermes，让网页模型也能做轻中度工具调用。
 
-这个项目主要解决的是 Agent 工具链里的一个痛点：很多网页登录模型本身没有稳定标准 API，更别说 OpenAI / Anthropic 工具调用协议。Gateway 会负责登录态检测、模型目录、协议适配和 ToolBridge，真正的文件读写、命令执行、MCP 权限仍然交给下游客户端，不越界。
+比如资料整理、信息查询、简单自动化、养虾养马这类活，很多时候够用就行，还能少烧一点 API Token。真正执行工具和权限确认的仍然是客户端，Gateway 只是把网页登录模型和标准 OpenAI / Anthropic 工具协议互相翻译。
 
-Qwen 3.7 系列已经调通，欢迎 Agent 玩家试用、提 issue、给 star。
-
+项目地址：
 https://github.com/Kriswd/webllm-gateway
 
-## GitHub / 论坛标题
-
-```text
-WebLLM Gateway: OpenAI/Anthropic-compatible gateway for Qwen and DeepSeek web accounts, built for Agent tool calling
-```
-
-中文标题：
-
-```text
-开源 WebLLM Gateway：把 Qwen / DeepSeek 网页模型接进 OpenClaw、Hermes、Claude Code、Codex 工具调用链路
-```
+仅供学习研究使用，记得遵守平台规则和相关法律法规。
 
 ## X / Twitter 文案
 
 ```text
 I open-sourced WebLLM Gateway.
 
-It turns Qwen / DeepSeek web accounts into OpenAI & Anthropic-compatible APIs for agent runtimes like OpenClaw, Hermes, Claude Code and Codex.
+It turns Qwen 3.7 MAX and other web-login LLM accounts into OpenAI/Anthropic-compatible APIs for lightweight tool calling in clients like OpenClaw and Hermes.
 
-The core part is ToolBridge: web models can participate in standard tool calling flows without executing local tools inside the gateway.
-
-Qwen 3.7 is already wired up.
+Not positioned as a heavy coding-agent replacement. The sweet spot is practical, lightweight tasks where web accounts can save API tokens.
 
 https://github.com/Kriswd/webllm-gateway
 ```
 
 ## 60 秒 demo 脚本
 
-1. 打开 Gateway 首页，展示 `Qwen 3.7 系列已调通`。
+1. 打开 Gateway 首页，展示 `Qwen 3.7 MAX 已调通`。
 2. 点开 Qwen 平台，展示已授权和模型列表。
 3. 复制 `base_url`、`api_key`、`model`。
-4. 打开 OpenClaw、Hermes、Claude Code 或 Codex 客户端配置页。
+4. 打开小龙虾或 Hermes 客户端配置页。
 5. 填入 `http://127.0.0.1:8610/v1`、`local-dev-key`、`qwen-web/qwen3.7-max-preview`。
-6. 下发任务：读取 README 并总结 Agent 工具调用卖点。
+6. 下发轻任务：整理一段资料、查询信息、调用一个简单工具。
 7. 展示客户端触发工具调用。
-8. 展示最终回答基于真实文件内容。
-9. 收尾：Gateway 只做协议桥接，不执行本地工具，权限仍由客户端控制。
+8. 展示工具结果回传后，模型继续整理答案。
+9. 收尾：复杂工程别硬上，轻中度任务和低成本试错更适合。
 
 ## 首批投放渠道
 
-- OpenClaw、Hermes、Claude Code、Codex、MCP 相关群。
-- Qwen / DeepSeek 网页模型折腾群。
+- 小龙虾、Hermes、Qwen / DeepSeek 网页模型折腾群。
+- AI 工具、低成本用量、Token 节省相关社群。
 - GitHub Trending / 开源项目推荐社群。
 - V2EX、掘金、知乎想法、即刻、小红书、B站动态。
 - 给 WebAI2API、ds2api、OpenClaw、Hermes 相关讨论区发“兼容/接入经验”，少讲广告，多讲真实 demo。
@@ -118,11 +141,11 @@ https://github.com/Kriswd/webllm-gateway
 ## 冷启动 Checklist
 
 - GitHub topics 已配置。
-- README 首屏能在 10 秒内看懂 Agent 工具调用价值。
+- README 首屏能在 10 秒内看懂“小龙虾 / Hermes + Qwen 3.7 MAX + 轻量工具调用”的价值。
 - 首页截图能看到 Qwen 3.7 和授权流程。
-- 至少准备 1 个真实 Agent 工具调用录屏。
+- 至少准备 1 个真实轻量工具调用录屏。
 - 发帖时附上 demo 文档，不只贴仓库链接。
-- 置顶一个 issue：欢迎反馈 OpenClaw / Hermes / Claude Code / Codex 接入问题。
+- 置顶一个 issue：欢迎反馈小龙虾 / Hermes 接入问题。
 - 每收到一个用户报错，都沉淀成 FAQ 或 troubleshooting 文档。
 
 ## 风险提示

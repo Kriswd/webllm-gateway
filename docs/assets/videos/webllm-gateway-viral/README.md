@@ -2,7 +2,7 @@
 
 这套 HyperFrames 素材用于 WebLLM Gateway 开源推广，主叙事是：
 
-> 把本来只能在网页里聊天的 AI，接进会用工具干活的 Agent 链路。
+> 把 Qwen 3.7 MAX 网页模型接进小龙虾和 Hermes，让网页模型也能做轻中度工具调用，少烧一点 API Token。
 
 ## 成片
 

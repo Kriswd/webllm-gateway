@@ -987,7 +987,7 @@ onMounted(loadOnboarding);
           <a-tag color="green">Qwen 3.7 系列已调通</a-tag>
         </div>
         <h1>把网页账号变成可工具调用的 API，实现养虾养马自由！</h1>
-        <p>登录网页账号，自动检测可用模型；Qwen 3.7 Max / Plus Preview 已纳入直连链路，支持在 OpenClaw、Hermes、Claude Code、Codex 或其它兼容 OpenAI 和 Anthropic API 的客户端调用。</p>
+        <p>登录网页账号，自动检测可用模型；Qwen 3.7 Max / Plus Preview 已纳入直连链路，支持在小龙虾、Hermes 或其它兼容 OpenAI 和 Anthropic API 的客户端做轻中度工具调用。</p>
         <div class="hero-actions">
           <a-button type="primary" size="large" :loading="actionLoading" @click="handleStartLogin">
             <template #icon><LoginOutlined /></template>
@@ -1379,7 +1379,7 @@ onMounted(loadOnboarding);
         <div class="code-header">
           <div class="code-title-stack">
             <span>{{ clientConfigTitle }}</span>
-            <small v-if="configProfile === 'cc-switch'">默认展示 cc-switch 的 Claude Provider 配置，复制后粘贴到对应 Provider 的 settings_config。</small>
+            <small v-if="configProfile === 'cc-switch'">默认展示 cc-switch 兼容配置，复制后粘贴到对应 Provider 的 settings_config。</small>
           </div>
           <a-segmented
             v-model:value="configProfile"

@@ -2,7 +2,7 @@
 
 ## Style Prompt
 
-Public hacker experiment with launch-film pressure. The video should feel like somebody broke a webpage-only AI out of its chat tab and proved it can join an Agent tool workflow. Use heavy type, warm darkness, rust-orange slices, proof-green terminal moments, and real UI evidence. The viral hook is aggressive; the explanation stays plain and legible.
+Public hacker experiment with launch-film pressure. The video should feel like somebody connected Qwen 3.7 MAX web access to OpenClaw and Hermes, then proved lightweight tool calling is useful without overpromising complex coding. Use heavy type, warm darkness, rust-orange slices, proof-green terminal moments, and real UI evidence. The viral hook is direct; the explanation stays plain, practical, and legible.
 
 ## Colors
 
@@ -31,4 +31,5 @@ Public hacker experiment with launch-film pressure. The video should feel like s
 - Do not use purple-blue AI gradients or floating orb decoration.
 - Do not show sensitive cookies, bearer tokens, API keys, or account details.
 - Do not imply Gateway executes local tools or bypasses client permissions.
+- Do not position Claude Code, Codex, or complex programming workflows as the main value.
 - Do not replace real UI evidence with vague abstract particles.
