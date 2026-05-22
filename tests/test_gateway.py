@@ -14210,6 +14210,22 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/health" in app_source
 
 
+def test_public_intro_and_visible_static_ui_do_not_reference_internal_krisai() -> None:
+    root = Path(__file__).resolve().parents[1]
+    readme = root / "README.md"
+    screenshot = root / "docs" / "assets" / "webllm-gateway-home.png"
+    static_index = root / "webai_gateway" / "static" / "index.html"
+
+    readme_source = readme.read_text(encoding="utf-8")
+    static_source = static_index.read_text(encoding="utf-8")
+
+    assert "KrisAI" not in readme_source
+    assert "KrisAI" not in static_source
+    assert "![WebLLM Gateway 核心界面](docs/assets/webllm-gateway-home.png)" in readme_source
+    assert screenshot.exists()
+    assert screenshot.stat().st_size > 100_000
+
+
 def test_open_source_release_materials_are_present() -> None:
     root = Path(__file__).resolve().parents[1]
     required_files = [
