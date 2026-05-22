@@ -26,6 +26,7 @@ config.json
 data/
 credentials/
 .webai-gateway/
+.superpowers/
 browser-profile/
 cookies/
 *.pem
