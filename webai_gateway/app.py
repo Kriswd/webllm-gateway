@@ -161,6 +161,7 @@ WEBAI2API_MODEL_UNAVAILABLE_MARKERS = (
     "no selectable models",
 )
 REQUEST_DIAGNOSTIC_LIMIT = 200
+REQUEST_DIAGNOSTIC_LOG_MAX_BYTES = 2_000_000
 QWEN_LIVE_MODEL_CATALOG_CACHE_SECONDS = 120
 TOOL_CALL_REGISTRY_LIMIT = 512
 OFF_TASK_QUESTION_ERROR_KINDS = {
@@ -354,9 +355,22 @@ def create_app(
     app.state.qwen_coder_client_factory = qwen_coder_client_factory or QwenCoderClient
     app.state.web_auth_jobs = {}
     app.state.tool_bridge_events = deque(maxlen=TOOL_BRIDGE_EVENT_LIMIT)
-    app.state.request_diagnostics = deque(maxlen=REQUEST_DIAGNOSTIC_LIMIT)
-    app.state.request_diagnostic_sequence = 0
+    diagnostics_persistence_enabled = not (config is not None and config_file == Path("config.json"))
+    request_diagnostics_log_path = (
+        config_file.parent / ".webai-gateway" / "logs" / "request-diagnostics.jsonl"
+        if diagnostics_persistence_enabled
+        else None
+    )
+    persisted_diagnostics, persisted_diagnostic_sequence = (
+        _load_request_diagnostics_log(request_diagnostics_log_path, limit=REQUEST_DIAGNOSTIC_LIMIT)
+        if request_diagnostics_log_path is not None
+        else ([], 0)
+    )
+    app.state.request_diagnostics = deque(persisted_diagnostics, maxlen=REQUEST_DIAGNOSTIC_LIMIT)
+    app.state.request_diagnostic_sequence = persisted_diagnostic_sequence
     app.state.request_diagnostic_lock = threading.Lock()
+    app.state.request_diagnostics_log_path = request_diagnostics_log_path
+    app.state.request_diagnostics_log_max_bytes = REQUEST_DIAGNOSTIC_LOG_MAX_BYTES
     app.state.qwen_live_model_catalog_cache = {}
     app.state.tool_call_registry = OrderedDict()
     app.state.media_generations = OrderedDict()
@@ -3212,21 +3226,90 @@ def _record_request_diagnostic(app: FastAPI, kind: str, **fields: Any) -> None:
     events = getattr(app.state, "request_diagnostics", None)
     if events is None:
         return
-    sequence = 0
+    event = {"at": utc_now(), "kind": kind, "diagnosticSeq": 0}
+    for key, value in fields.items():
+        if value in (None, "", [], {}):
+            continue
+        event[key] = value
+    event = _sanitize_request_diagnostic_event(event)
+
     lock = getattr(app.state, "request_diagnostic_lock", None)
     if lock is not None:
         with lock:
             sequence = int(getattr(app.state, "request_diagnostic_sequence", 0) or 0) + 1
             app.state.request_diagnostic_sequence = sequence
+            event["diagnosticSeq"] = sequence
+            events.append(event)
+            _append_request_diagnostic_log(app, event)
     else:
         sequence = int(getattr(app.state, "request_diagnostic_sequence", 0) or 0) + 1
         app.state.request_diagnostic_sequence = sequence
-    event = {"at": utc_now(), "kind": kind, "diagnosticSeq": sequence}
-    for key, value in fields.items():
-        if value in (None, "", [], {}):
+        event["diagnosticSeq"] = sequence
+        events.append(event)
+        _append_request_diagnostic_log(app, event)
+
+
+def _load_request_diagnostics_log(path: Path, *, limit: int) -> tuple[list[dict[str, Any]], int]:
+    if not path.exists():
+        return [], 0
+    events: list[dict[str, Any]] = []
+    max_sequence = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return [], 0
+    for line in lines[-max(1, limit) :]:
+        if not line.strip():
             continue
-        event[key] = value
-    events.append(event)
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        event = _sanitize_request_diagnostic_event(item)
+        sequence = event.get("diagnosticSeq")
+        if isinstance(sequence, int):
+            max_sequence = max(max_sequence, sequence)
+        events.append(event)
+    return events[-max(1, limit) :], max_sequence
+
+
+def _append_request_diagnostic_log(app: FastAPI, event: dict[str, Any]) -> None:
+    path = getattr(app.state, "request_diagnostics_log_path", None)
+    if not isinstance(path, Path):
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _trim_request_diagnostics_log(path, int(getattr(app.state, "request_diagnostics_log_max_bytes", 0) or 0))
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(_sanitize_request_diagnostic_event(event), ensure_ascii=False, separators=(",", ":")))
+            handle.write("\n")
+    except OSError:
+        return
+
+
+def _trim_request_diagnostics_log(path: Path, max_bytes: int) -> None:
+    if max_bytes <= 0 or not path.exists():
+        return
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        keep = lines[-REQUEST_DIAGNOSTIC_LIMIT:]
+        path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8", newline="\n")
+    except OSError:
+        return
+
+
+def _sanitize_request_diagnostic_event(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _sanitize_request_diagnostic_event(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_request_diagnostic_event(item) for item in value]
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
+    return value
 
 
 def _auto_research_candidate_report(app: FastAPI, *, limit: int = 20) -> dict[str, Any]:

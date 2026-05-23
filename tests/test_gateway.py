@@ -14183,7 +14183,7 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "Qwen 3.7 系列已调通" in bridge_source
     assert "Qwen 3.7 Max / Plus Preview 已纳入直连链路" in bridge_source
     assert "把网页账号变成可工具调用的 API，实现养虾养马自由！" in bridge_source
-    assert "支持在 OpenClaw、Hermes、Claude Code、Codex 或其它兼容 OpenAI 和 Anthropic API 的客户端调用。" in bridge_source
+    assert "支持在小龙虾、Hermes 或其它兼容 OpenAI 和 Anthropic API 的客户端做轻中度工具调用。" in bridge_source
     assert "Gateway 地址" not in bridge_source
     assert "本机地址" not in bridge_source
     assert "config-grid" not in bridge_source
@@ -14207,7 +14207,7 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/v1/images/generations" in bridge_source
     assert "gpt-image-2" in bridge_source
     assert "response_format" in bridge_source
-    assert "Claude Code" in bridge_source
+    assert "Claude Code" not in bridge_source
     assert "const configProfile = ref('cc-switch');" in bridge_source
     assert "cc-switch 专用配置" in bridge_source
     assert "ANTHROPIC_API_BASE_URL" in bridge_source
@@ -14270,12 +14270,12 @@ def test_open_source_release_materials_are_present() -> None:
     assert "docs/third-party-runtime.md" in readme
     assert "docs/demos/agent-tool-calling.md" in readme
     assert "docs/promotion/launch-kit.md" in readme
-    assert "OpenClaw" in readme and "Hermes" in readme and "Agent 工具链" in readme
+    assert "OpenClaw" in readme and "Hermes" in readme and "轻中度工具调用" in readme
     assert "qwen-web/qwen3.7-max-preview" in readme
-    assert "Qwen 3.7 接入 Agent 工具调用链路" in agent_demo
+    assert "Qwen 3.7 接入轻量工具调用链路" in agent_demo
     assert "tool_calls" in agent_demo and "tool_use" in agent_demo
     assert "微信群 / 社群文案" in launch_kit
-    assert "agent-tools" in launch_kit
+    assert "轻中度工具调用" in launch_kit
     assert "POST /v1/images/generations" in media
     assert "gpt-image-2" in media
     assert "WebAI2API" in third_party and "MIT" in third_party
@@ -26776,6 +26776,56 @@ def test_request_diagnostics_records_request_start_with_tool_context() -> None:
         {"role": "user", "contentType": "text", "contentChars": 30}
     ]
     assert diagnostics[-1]["kind"] == "completion_response"
+
+
+def test_request_diagnostics_persist_redacted_events_across_restart(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_openai_response("ok"), request=request)
+
+    config_path = tmp_path / "config.json"
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            config_path=config_path,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "web-model",
+            "messages": [{"role": "user", "content": "hello api_key=sk-test-secret-value"}],
+            "max_tokens": 32,
+        },
+    )
+
+    log_path = tmp_path / ".webai-gateway" / "logs" / "request-diagnostics.jsonl"
+    assert response.status_code == 200
+    assert log_path.exists()
+    persisted_text = log_path.read_text(encoding="utf-8")
+    assert "sk-test-secret-value" not in persisted_text
+    assert "api_key=[redacted]" in persisted_text
+
+    restarted = TestClient(
+        create_app(
+            config=config,
+            config_path=config_path,
+            http_client=_not_found_client(),
+        )
+    )
+    diagnostics = restarted.get("/api/admin/request-diagnostics").json()["events"]
+
+    response_events = [event for event in diagnostics if event["kind"] == "completion_response"]
+    assert response_events
+    assert response_events[-1]["responseContentPreview"] == "ok"
+    assert "sk-test-secret-value" not in json.dumps(diagnostics, ensure_ascii=False)
+    assert "api_key=[redacted]" in response_events[-1]["requestLatestUserPreview"]
 
 
 def test_request_diagnostics_correlates_started_and_empty_response() -> None:
