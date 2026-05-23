@@ -14556,11 +14556,13 @@ def test_start_script_uses_configured_ds2api_concurrency() -> None:
 
 def test_start_script_delegates_internal_runtimes_to_gateway_supervisor() -> None:
     script = Path("start_webai_gateway.bat").read_text(encoding="utf-8")
+    module = Path("webai_gateway/__main__.py").read_text(encoding="utf-8")
 
     assert "webai_gateway.runtime_supervisor" in script
     assert "--ensure" in script
     assert "netstat -ano" not in script
     assert "corepack" not in script
+    assert "ensure_managed_runtimes" in module
 
 
 def test_provider_runtime_qwen_web_backend_round_trips_config(tmp_path: Path) -> None:
@@ -14736,6 +14738,64 @@ def test_supervisor_preserves_external_runtime_status_for_docker_urls(tmp_path: 
     services = {item["id"]: item for item in status["services"]}
     assert services["webai2api"]["status"] == "external"
     assert services["ds2api"]["status"] == "external"
+    assert status["failedServices"] == []
+
+
+def test_supervisor_reports_recent_started_runtime_as_starting_until_port_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from webai_gateway import runtime_supervisor
+
+    state_path = tmp_path / ".webai-gateway" / "runtime" / "managed-runtimes.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "updatedAt": runtime_supervisor._utc_timestamp(),
+                "services": {"webai2api": {"status": "started", "pid": 1234}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_supervisor, "_port_is_listening", lambda host, port: False)
+    config = GatewayConfig(
+        upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1"),
+        provider_runtime=ProviderRuntimeConfig(deepseek_ds2api_base_url="http://127.0.0.1:9331/v1"),
+    )
+
+    status = runtime_supervisor.collect_supervisor_status(config, tmp_path)
+
+    services = {item["id"]: item for item in status["services"]}
+    assert services["webai2api"]["status"] == "starting"
+    assert status["failedServices"] == []
+
+
+def test_supervisor_reports_stale_started_runtime_as_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from webai_gateway import runtime_supervisor
+
+    state_path = tmp_path / ".webai-gateway" / "runtime" / "managed-runtimes.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "updatedAt": "2026-05-01T00:00:00Z",
+                "services": {"webai2api": {"status": "started", "pid": 1234}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_supervisor, "_port_is_listening", lambda host, port: False)
+    config = GatewayConfig(
+        upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1"),
+        provider_runtime=ProviderRuntimeConfig(deepseek_ds2api_base_url="http://127.0.0.1:9331/v1"),
+    )
+
+    status = runtime_supervisor.collect_supervisor_status(config, tmp_path)
+
+    services = {item["id"]: item for item in status["services"]}
+    assert services["webai2api"]["status"] == "stopped"
     assert status["failedServices"] == []
 
 

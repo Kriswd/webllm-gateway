@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -112,6 +113,8 @@ def _service_status(
             status = "external"
         elif parsed["local"] and parsed["port"] and _port_is_listening(parsed["host"], parsed["port"]):
             status = "running"
+        elif status == "started" and _state_is_recent(state, max_age_seconds=90.0):
+            status = "starting"
         elif status in {"started", "running", "already-running"}:
             status = "stopped"
         elif status not in {"missing", "failed"}:
@@ -316,6 +319,16 @@ def _creation_flags() -> int:
 
 def _utc_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _state_is_recent(state: dict[str, Any], *, max_age_seconds: float) -> bool:
+    updated_at = str(state.get("updatedAt") or "")
+    try:
+        parsed = datetime.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    age = (datetime.now(timezone.utc) - parsed).total_seconds()
+    return 0 <= age <= max_age_seconds
 
 
 def main(argv: Sequence[str] | None = None) -> int:
