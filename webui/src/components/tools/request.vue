@@ -1180,7 +1180,7 @@ onUnmounted(() => {
 .stat-value {
     font-size: 18px;
     font-weight: 600;
-    font-family: 'SF Mono', 'Monaco', monospace;
+    font-family: var(--wg-font-serif, "Source Han Serif SC", "Noto Serif SC", "Noto Serif CJK SC", STSong, SimSun, serif);
 }
 
 .stat-label {
@@ -1334,7 +1334,7 @@ onUnmounted(() => {
     border: 1px solid #f0f0f0;
     border-radius: 4px;
     padding: 12px;
-    font-family: 'Consolas', 'Monaco', monospace;
+    font-family: var(--wg-font-serif, "Source Han Serif SC", "Noto Serif SC", "Noto Serif CJK SC", STSong, SimSun, serif);
     font-size: 13px;
     white-space: pre-wrap;
     word-break: break-all;
@@ -1417,7 +1417,7 @@ onUnmounted(() => {
     border: 1px solid #f0f0f0;
     border-radius: 4px;
     padding: 16px;
-    font-family: 'Consolas', 'Monaco', monospace;
+    font-family: var(--wg-font-serif, "Source Han Serif SC", "Noto Serif SC", "Noto Serif CJK SC", STSong, SimSun, serif);
     font-size: 14px;
     white-space: pre-wrap;
     word-break: break-all;

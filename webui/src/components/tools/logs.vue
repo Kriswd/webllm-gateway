@@ -328,7 +328,7 @@ onUnmounted(() => {
     max-height: 600px;
     overflow-y: auto;
     overflow-x: auto;
-    font-family: 'Consolas', 'Monaco', monospace;
+    font-family: var(--wg-font-serif, "Source Han Serif SC", "Noto Serif SC", "Noto Serif CJK SC", STSong, SimSun, serif);
     font-size: 12px;
     background: #fafafa;
     border-radius: 4px;
@@ -466,7 +466,7 @@ onUnmounted(() => {
 .stat-value {
     font-size: 18px;
     font-weight: 600;
-    font-family: 'SF Mono', 'Monaco', monospace;
+    font-family: var(--wg-font-serif, "Source Han Serif SC", "Noto Serif SC", "Noto Serif CJK SC", STSong, SimSun, serif);
 }
 
 .stat-label {

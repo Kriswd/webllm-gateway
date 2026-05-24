@@ -226,6 +226,84 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+@font-face {
+  font-display: swap;
+  font-family: "Source Han Serif SC";
+  font-style: normal;
+  font-weight: 200 900;
+  src:
+    local("Source Han Serif SC"),
+    local("Source Han Serif CN"),
+    local("Noto Serif SC"),
+    local("Noto Serif CJK SC"),
+    url("/fonts/NotoSerifSC-VF.ttf") format("truetype");
+}
+
+:global(:root) {
+  --wg-font-serif: "Source Han Serif SC", "Noto Serif SC", "Noto Serif CJK SC", STSong, SimSun, serif;
+  --wg-bg: #f6f4ef;
+  --wg-paper: #fffefa;
+  --wg-paper-soft: #f2eee5;
+  --wg-paper-muted: #ebe5da;
+  --wg-ink: #211f1b;
+  --wg-muted: #6c675e;
+  --wg-quiet: #8b8377;
+  --wg-rule: #dfd9cd;
+  --wg-accent: #315b55;
+  --wg-accent-strong: #244842;
+  --wg-accent-soft: #e5ece9;
+  --wg-info: #365979;
+  --wg-danger: #98514e;
+}
+
+:global(html),
+:global(body),
+:global(#app),
+:global(#app *),
+:global(.ant-drawer),
+:global(.ant-drawer *),
+:global(.ant-modal),
+:global(.ant-modal *),
+:global(.ant-message),
+:global(.ant-message *),
+:global(.ant-notification),
+:global(.ant-notification *) {
+  font-family: var(--wg-font-serif) !important;
+  letter-spacing: 0;
+}
+
+:global(body) {
+  background: var(--wg-bg);
+  color: var(--wg-ink);
+}
+
+:global(.ant-btn) {
+  border-radius: 4px;
+  box-shadow: none;
+  font-weight: 600;
+}
+
+:global(.ant-btn-primary) {
+  background: var(--wg-accent);
+  border-color: var(--wg-accent);
+}
+
+:global(.ant-btn-primary:not(:disabled):hover) {
+  background: var(--wg-accent-strong);
+  border-color: var(--wg-accent-strong);
+}
+
+:global(.ant-input),
+:global(.ant-select-selector),
+:global(.ant-input-affix-wrapper),
+:global(.ant-picker),
+:global(.ant-segmented),
+:global(.ant-card),
+:global(.ant-drawer-content),
+:global(.ant-modal-content) {
+  border-radius: 5px !important;
+}
+
 .boot-screen {
   align-items: center;
   display: flex;
@@ -235,44 +313,45 @@ onUnmounted(() => {
 
 .app-shell {
   background:
-    linear-gradient(180deg, rgba(236, 244, 243, 0.88), rgba(247, 249, 250, 0.96) 360px),
-    #f6f8f8;
-  color: #111827;
+    linear-gradient(180deg, rgba(255, 254, 250, 0.96), rgba(246, 244, 239, 0.98) 360px),
+    var(--wg-bg);
+  color: var(--wg-ink);
   min-height: 100vh;
   padding-top: 0;
 }
 
 .support-strip {
   align-items: center;
-  background: #f4f8ff;
-  border-bottom: 1px solid #cfe1ff;
+  background: #fbfaf7;
+  border-bottom: 1px solid var(--wg-rule);
   color: inherit;
   display: flex;
   gap: 10px;
   min-height: 34px;
   padding: 5px 30px;
   text-decoration: none;
-  transition: background 160ms ease, border-color 160ms ease;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
 .support-strip:hover {
-  background: #eaf2ff;
-  border-color: #b7d3ff;
+  background: var(--wg-accent-soft);
+  border-color: #c9d5d0;
 }
 
 .support-badge {
-  background: #dbeafe;
-  border-radius: 999px;
-  color: #1d4ed8;
+  background: var(--wg-accent-soft);
+  border: 1px solid #c9d5d0;
+  border-radius: 3px;
+  color: var(--wg-accent);
   flex: 0 0 auto;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: 1;
-  padding: 5px 9px;
+  padding: 4px 8px;
 }
 
 .support-text {
-  color: #111827;
+  color: var(--wg-ink);
   flex: 1 1 auto;
   font-size: 13px;
   font-weight: 600;
@@ -284,25 +363,25 @@ onUnmounted(() => {
 }
 
 .support-link {
-  border: 1px solid #93c5fd;
-  border-radius: 999px;
-  color: #1d4ed8;
+  border: 1px solid #c9d5d0;
+  border-radius: 3px;
+  color: var(--wg-accent);
   flex: 0 0 auto;
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 600;
   padding: 4px 10px;
 }
 
 .support-strip:hover .support-link {
-  background: #dbeafe;
-  color: #1e40af;
+  background: #fffefa;
+  color: var(--wg-accent-strong);
 }
 
 .topbar {
   align-items: center;
   backdrop-filter: blur(18px);
-  background: rgba(255, 255, 255, 0.9);
-  border-bottom: 1px solid rgba(203, 213, 225, 0.72);
+  background: rgba(255, 254, 250, 0.92);
+  border-bottom: 1px solid rgba(223, 217, 205, 0.9);
   display: flex;
   gap: 16px;
   justify-content: space-between;
@@ -322,10 +401,10 @@ onUnmounted(() => {
 
 .brand-mark {
   align-items: center;
-  background: #ecfdf5;
-  border: 1px solid #a7f3d0;
-  border-radius: 7px;
-  color: #0f766e;
+  background: var(--wg-accent-soft);
+  border: 1px solid #c9d5d0;
+  border-radius: 4px;
+  color: var(--wg-accent);
   display: inline-flex;
   font-size: 18px;
   height: 38px;
@@ -340,6 +419,7 @@ onUnmounted(() => {
 
 .brand strong {
   font-size: 17px;
+  font-weight: 700;
   letter-spacing: 0;
   line-height: 1.15;
 }
@@ -351,7 +431,7 @@ onUnmounted(() => {
 
 .brand small,
 .muted {
-  color: #667085;
+  color: var(--wg-muted);
 }
 
 .content-shell {
@@ -365,9 +445,10 @@ onUnmounted(() => {
 }
 
 .result-box {
-  background: #101828;
-  border-radius: 8px;
-  color: #e5e7eb;
+  background: #201f1c;
+  border: 1px solid #3c3831;
+  border-radius: 5px;
+  color: #f6f4ef;
   margin: 0;
   max-height: 260px;
   overflow: auto;
@@ -377,7 +458,7 @@ onUnmounted(() => {
 }
 
 .error-text {
-  color: #c2410c;
+  color: var(--wg-danger);
   margin-bottom: 0;
 }
 

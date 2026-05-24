@@ -41,3 +41,13 @@ downstream distributor must comply with the corresponding upstream license.
 When distributing built `webui/dist` assets, keep this notice with the release
 and preserve license notices for bundled frontend dependencies, especially
 MPL-2.0 components such as noVNC.
+
+## Bundled fonts
+
+| Project | Purpose | License | Source |
+| --- | --- | --- | --- |
+| Noto Serif CJK / Source Han Serif compatible font | Self-hosted Simplified Chinese serif UI font for consistent rendering across the WebUI and static console | SIL Open Font License 1.1 | https://github.com/notofonts/noto-cjk |
+
+The bundled `NotoSerifSC-VF.ttf` files are used as the self-hosted fallback for
+the `Source Han Serif SC` UI font stack. Keep this notice with source and built
+assets when publishing packaged releases.
