@@ -14230,7 +14230,12 @@ def test_public_intro_and_visible_static_ui_do_not_reference_internal_krisai() -
     assert "Qwen 3.7 系列已调通" in static_source
     assert "![WebLLM Gateway 核心界面](docs/assets/webllm-gateway-home.png)" in readme_source
     assert screenshot.exists()
-    assert screenshot.stat().st_size > 100_000
+    screenshot_bytes = screenshot.read_bytes()
+    assert screenshot_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    screenshot_width = int.from_bytes(screenshot_bytes[16:20], "big")
+    screenshot_height = int.from_bytes(screenshot_bytes[20:24], "big")
+    assert screenshot_width >= 1200
+    assert screenshot_height >= 700
 
 
 def test_open_source_release_materials_are_present() -> None:
