@@ -55,6 +55,7 @@ from webai_gateway.openai_api import (
     build_tool_refusal_recovery_payload,
     build_unknown_tool_recovery_payload,
     build_virtual_loader_tool_recovery_payload,
+    build_openai_text_sse,
     build_openai_tool_calls_sse,
     build_tool_call_sse,
     build_upstream_payload,
@@ -181,6 +182,32 @@ _SENSITIVE_KEY_RE = re.compile(
 )
 _SMOKE_SENSITIVE_FIELD_RE = re.compile(r"(?i)\b(?:qwen_session|ds_session_id|hwsid|sessiontoken)\s*=\s*\[redacted\]")
 _GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
+_LOCAL_EXECUTION_ACTION_RE = re.compile(
+    r"(?:打开|启动|运行|唤起|执行|帮我开|帮我打开|open|launch|start|run).{0,40}"
+    r"(?:QQ|微信|WeChat|Chrome|Edge|Safari|Codex|Claude|Cursor|VS\s*Code|应用|软件|程序|app|desktop|桌面|电脑|本机)",
+    re.IGNORECASE,
+)
+_LOCAL_EXECUTION_TARGET_RE = re.compile(
+    r"(?:打开|启动|运行|唤起|open|launch|start|run)\s*(?:我(?:电脑|本机|mac|Mac)?(?:的)?|电脑(?:的)?|本机(?:的)?|macOS(?:的)?|Mac(?:的)?)?\s*([A-Za-z0-9_.+-]{2,40}|[\u4e00-\u9fffA-Za-z0-9_.+-]{2,40})",
+    re.IGNORECASE,
+)
+_LOCAL_EXECUTION_TOOL_NAMES = {
+    "bash",
+    "cmd",
+    "command",
+    "computer",
+    "desktop",
+    "execute",
+    "launch",
+    "launchapp",
+    "open",
+    "openapp",
+    "powershell",
+    "pwsh",
+    "run",
+    "shell",
+    "terminal",
+}
 _REQUEST_TRACE_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "webai_gateway_request_trace_context",
     default={},
@@ -2066,17 +2093,13 @@ def create_app(
                         bridge=bridge,
                     ),
                 )
-                tool_calls = _response_tool_calls(parsed)
-                if tool_calls:
-                    sse_body = build_openai_tool_calls_sse(tool_calls, model=model)
-                else:
-                    text = _response_message_text(parsed)
-                    sse_body = build_tool_call_sse(
-                        text,
-                        allowed_tools=allowed_tools,
-                        model=model,
-                        bridge_context=bridge_context,
-                    )
+                sse_body = _bridge_stream_sse_body(
+                    parsed,
+                    bridge_result,
+                    allowed_tools=allowed_tools,
+                    model=model,
+                    bridge_context=bridge_context,
+                )
                 return _openai_stream_response(
                     app,
                     body=body,
@@ -2938,6 +2961,28 @@ def _response_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
     message = choices[0].get("message") if choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict) else {}
     tool_calls = message.get("tool_calls")
     return tool_calls if isinstance(tool_calls, list) else []
+
+
+def _bridge_stream_sse_body(
+    parsed: dict[str, Any],
+    bridge_result: Any,
+    *,
+    allowed_tools: set[str],
+    model: str,
+    bridge_context: Any,
+) -> str:
+    tool_calls = _response_tool_calls(parsed)
+    if tool_calls:
+        return build_openai_tool_calls_sse(tool_calls, model=model)
+    content = _response_message_text(parsed)
+    if getattr(bridge_result, "error", None) is not None or str(getattr(bridge_result, "controller_reason", "") or ""):
+        return build_openai_text_sse(content or EMPTY_ASSISTANT_RESPONSE_TEXT, model=model)
+    return build_tool_call_sse(
+        content,
+        allowed_tools=allowed_tools,
+        model=model,
+        bridge_context=bridge_context,
+    )
 
 
 def _openai_response_from_stream_buffer(content: str, *, finish_reason: str, model: str) -> dict[str, Any]:
@@ -6234,6 +6279,8 @@ def _finalize_retry_exhausted_bridge_error(
 
 
 def _controller_retry_exhausted_text(error: BridgeError, *, bridge_context: Any) -> str:
+    if _bridge_context_needs_unavailable_local_execution(bridge_context):
+        return _unavailable_local_execution_text(bridge_context)
     allowed = sorted(str(tool.name) for tool in getattr(bridge_context, "tools", []) if str(getattr(tool, "name", "") or ""))
     parts = [
         "上游网页模型连续返回低信息或不完整的最终回复，Gateway 已拒绝把它当成成功结果。",
@@ -6246,6 +6293,44 @@ def _controller_retry_exhausted_text(error: BridgeError, *, bridge_context: Any)
         parts.append(f"当前允许工具：{', '.join(allowed[:16])}{suffix}")
     parts.append("请重试；如果仍然出现，建议切换更强的网页登录模型或把这段诊断发给 Gateway 适配层排查。")
     return "\n".join(parts)
+
+
+def _bridge_context_needs_unavailable_local_execution(bridge_context: Any) -> bool:
+    task = str(getattr(bridge_context, "task_text", "") or "")
+    if not _LOCAL_EXECUTION_ACTION_RE.search(task):
+        return False
+    return not _bridge_context_has_local_execution_tool(bridge_context)
+
+
+def _bridge_context_has_local_execution_tool(bridge_context: Any) -> bool:
+    for tool in getattr(bridge_context, "tools", []) or []:
+        compact = re.sub(r"[^a-z0-9]+", "", str(getattr(tool, "name", "") or "").lower())
+        if compact in _LOCAL_EXECUTION_TOOL_NAMES:
+            return True
+    return False
+
+
+def _unavailable_local_execution_text(bridge_context: Any) -> str:
+    task = str(getattr(bridge_context, "task_text", "") or "")
+    target = _local_execution_target_from_task(task)
+    allowed = sorted(str(tool.name) for tool in getattr(bridge_context, "tools", []) if str(getattr(tool, "name", "") or ""))
+    parts = [
+        f"当前客户端没有提供可以打开本机应用或执行命令的工具，所以 Gateway 不能直接打开{target}。",
+    ]
+    if allowed:
+        suffix = " ..." if len(allowed) > 16 else ""
+        parts.append(f"当前允许工具：{', '.join(allowed[:16])}{suffix}")
+        parts.append("这些工具只能完成对应的询问、读写文件或网页获取能力，不能启动本机软件。")
+    parts.append("请在有道龙虾里启用 shell / terminal / open_app / 电脑控制类工具后重试，或先手动打开应用再继续。")
+    return "\n".join(parts)
+
+
+def _local_execution_target_from_task(task: str) -> str:
+    match = _LOCAL_EXECUTION_TARGET_RE.search(task or "")
+    if not match:
+        return "这个本地应用或命令"
+    target = re.sub(r"[，。,.!?！？\\s]+$", "", match.group(1).strip())
+    return target or "这个本地应用或命令"
 
 
 def _should_retry_tool_refusal_recovery(bridge_result: Any) -> bool:
@@ -6754,29 +6839,19 @@ def _deepseek_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any],
             headers={"x-should-retry": "false"},
         ) from exc
     if bool(body.get("stream")):
-        content = ""
-        choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
-        if choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
-            if isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls"):
-                return _openai_stream_response(
-                    app,
-                    body=body,
-                    route="deepseek-web",
-                    model=model,
-                    bridge=bridge,
-                    sse_body=build_openai_tool_calls_sse(msg["tool_calls"], model=model),
-                    provider_diagnostic=getattr(web_client, "last_diagnostic", None),
-                    bridge_context=bridge_context,
-                )
-            content = str(msg.get("content") or "")
         return _openai_stream_response(
             app,
             body=body,
             route="deepseek-web",
             model=model,
             bridge=bridge,
-            sse_body=build_tool_call_sse(content, allowed_tools=allowed_tools, model=model, bridge_context=bridge_context),
+            sse_body=_bridge_stream_sse_body(
+                parsed,
+                bridge_result,
+                allowed_tools=allowed_tools,
+                model=model,
+                bridge_context=bridge_context,
+            ),
             provider_diagnostic=getattr(web_client, "last_diagnostic", None),
             bridge_context=bridge_context,
         )
@@ -7003,29 +7078,19 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
             headers={"x-should-retry": "false"},
         ) from exc
     if bool(body.get("stream")):
-        content = ""
-        choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
-        if choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
-            if isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls"):
-                return _openai_stream_response(
-                    app,
-                    body=body,
-                    route="qwen-web",
-                    model=model,
-                    bridge=bridge,
-                    sse_body=build_openai_tool_calls_sse(msg["tool_calls"], model=model),
-                    provider_diagnostic=getattr(web_client, "last_diagnostic", None),
-                    bridge_context=bridge_context,
-                )
-            content = str(msg.get("content") or "")
         return _openai_stream_response(
             app,
             body=body,
             route="qwen-web",
             model=model,
             bridge=bridge,
-            sse_body=build_tool_call_sse(content, allowed_tools=allowed_tools, model=model, bridge_context=bridge_context),
+            sse_body=_bridge_stream_sse_body(
+                parsed,
+                bridge_result,
+                allowed_tools=allowed_tools,
+                model=model,
+                bridge_context=bridge_context,
+            ),
             provider_diagnostic=getattr(web_client, "last_diagnostic", None),
             bridge_context=bridge_context,
         )
@@ -7258,29 +7323,19 @@ def _qwen_coder_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], c
             headers={"x-should-retry": "false"},
         ) from exc
     if bool(body.get("stream")):
-        content = ""
-        choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
-        if choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
-            if isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls"):
-                return _openai_stream_response(
-                    app,
-                    body=body,
-                    route="qwen-coder",
-                    model=model,
-                    bridge=bridge,
-                    sse_body=build_openai_tool_calls_sse(msg["tool_calls"], model=model),
-                    provider_diagnostic=getattr(web_client, "last_diagnostic", None),
-                    bridge_context=bridge_context,
-                )
-            content = str(msg.get("content") or "")
         return _openai_stream_response(
             app,
             body=body,
             route="qwen-coder",
             model=model,
             bridge=bridge,
-            sse_body=build_tool_call_sse(content, allowed_tools=allowed_tools, model=model, bridge_context=bridge_context),
+            sse_body=_bridge_stream_sse_body(
+                parsed,
+                bridge_result,
+                allowed_tools=allowed_tools,
+                model=model,
+                bridge_context=bridge_context,
+            ),
             provider_diagnostic=getattr(web_client, "last_diagnostic", None),
             bridge_context=bridge_context,
         )

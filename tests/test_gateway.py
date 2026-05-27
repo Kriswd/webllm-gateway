@@ -38,6 +38,7 @@ from webai_gateway.openai_api import (
     build_tool_call_sse,
     build_tool_refusal_recovery_payload,
     parse_chat_response,
+    parse_sse_text,
     post_upstream,
     tool_bridge_rejected_response_text,
 )
@@ -26784,6 +26785,78 @@ def test_qwen_web_repairs_named_lowercase_tool_intent_for_youdao_tools(tmp_path:
     tool_call = choice["message"]["tool_calls"][0]
     assert tool_call["function"]["name"] == "read"
     assert json.loads(tool_call["function"]["arguments"]) == {"file_path": "README.md"}
+
+
+def test_qwen_web_stream_does_not_reparse_retry_exhausted_diagnostic_for_youdao_open_app(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class RepeatedNamedToolIntentQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            return _openai_response("我将使用 read 工具继续查看 /usr/local/bin/codex。")
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=RepeatedNamedToolIntentQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "description": name, "parameters": {"type": "object"}},
+        }
+        for name in ["AskUserQuestion", "edit", "read", "web_fetch", "write"]
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "qwen-web/qwen3.7-max-preview",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "你好，帮我打开QQ"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_read_os",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": json.dumps({"file_path": "/etc/os-release"})},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_read_os", "content": "NAME=mac\n"},
+            ],
+            "tools": tools,
+            "max_tokens": 1024,
+        },
+    )
+
+    content, finish_reason = parse_sse_text(response.text)
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    assert finish_reason == "stop"
+    assert "当前客户端没有提供可以打开本机应用或执行命令的工具" in content
+    assert "Gateway 不能直接打开QQ" in content
+    assert "当前允许工具：" in content
+    assert "read" in content
+    assert "web_fetch" in content
+    assert "上游模型请求了当前未允许" not in content
+    assert "Gateway 已拒绝该工具 JSON" not in content
 
 
 def test_qwen_web_tool_bridge_recovers_when_permission_denial_repair_repeats(tmp_path: Path) -> None:
