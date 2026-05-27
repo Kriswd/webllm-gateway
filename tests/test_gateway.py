@@ -14153,6 +14153,8 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "网页登录模型 API" in app_source
     assert "publicRoutes" in app_source
     assert "WebLLM Gateway" in app_source
+    assert "/api/admin/debug-log-bundle" in app_source
+    assert "导出日志" in app_source
     assert "状态概览" not in app_source
     assert "请求模型" not in app_source
     assert "系统设置" not in app_source
@@ -14404,6 +14406,8 @@ def test_static_management_ui_exposes_request_diagnostics() -> None:
     assert "toolBridgeControllerState" in script_response.text
     assert "semanticFinalJudgeMode" in script_response.text
     assert "providerPromptCompacted" in script_response.text
+    assert "exportDebugLogButton" in index_response.text
+    assert "debug-log-bundle" in script_response.text
 
 
 def test_static_management_ui_exposes_auto_research_dashboard() -> None:
@@ -25645,6 +25649,37 @@ def test_malformed_repair_payload_adds_compact_standard_json_formatter_prompt() 
     assert '"file_path":"README.md"' in retry_prompt
 
 
+def test_named_tool_intent_repair_payload_adds_compact_standard_json_formatter_prompt() -> None:
+    bridge_result = BridgeResult(
+        content="",
+        tool_calls=[],
+        raw_content="我将使用 read 工具查看 README，然后再修改。",
+        error=BridgeError(
+            "deferred_named_tool_action_without_call",
+            "The model said it would use an allowed downstream tool but did not emit the required fenced tool_json call.",
+            repairable=True,
+        ),
+    )
+
+    repaired = build_repair_payload(
+        {
+            "messages": [
+                {"role": "system", "content": "Tool bridge prompt with AskUserQuestion, edit, read, web_fetch, write."},
+                {"role": "user", "content": "请检查项目并完成修改。"},
+            ]
+        },
+        bridge_result,
+        allowed_tools={"AskUserQuestion", "edit", "read", "web_fetch", "write"},
+    )
+
+    retry_prompt = str(repaired["messages"][-1]["content"])
+    assert "GATEWAY TOOL_JSON FORMATTER RETRY" in retry_prompt
+    assert "Allowed tool names: AskUserQuestion, edit, read, web_fetch, write" in retry_prompt
+    assert "The first non-whitespace characters must be ```tool_json" in retry_prompt
+    assert '"name":"read"' in retry_prompt
+    assert '"file_path":"README.md"' in retry_prompt
+
+
 def test_off_task_environment_repair_payload_adds_compact_standard_json_formatter_prompt() -> None:
     bridge_result = BridgeResult(
         content="I will check the Claude command setup instead of reading the requested profile.",
@@ -26657,6 +26692,100 @@ def test_qwen_web_tool_bridge_repairs_deferred_research_without_tool_call(tmp_pa
     ]
 
 
+def test_qwen_web_repairs_named_lowercase_tool_intent_for_youdao_tools(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class NamedToolIntentQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            if len(seen_payloads) == 1:
+                return _openai_response("我将使用 read 工具查看 README，然后再继续。")
+            return _openai_response(
+                '```tool_json\n{"calls":[{"id":"call_read_readme","name":"read","input":{"file_path":"README.md"}}]}\n```'
+            )
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=NamedToolIntentQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "qwen-web/qwen3.6-max-preview",
+            "messages": [{"role": "user", "content": "请先读取 README 再继续。"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "AskUserQuestion",
+                        "description": "Ask the user a question.",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "description": "Edit a local file.",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a local file.",
+                        "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "description": "Fetch a URL.",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "description": "Write a local file.",
+                        "parameters": {"type": "object"},
+                    },
+                },
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 2
+    retry_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[1]["messages"])
+    assert "GATEWAY TOOL_JSON FORMATTER RETRY" in retry_prompt
+    assert "Allowed tool names:" in retry_prompt
+    assert "read" in retry_prompt
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "read"
+    assert json.loads(tool_call["function"]["arguments"]) == {"file_path": "README.md"}
+
+
 def test_qwen_web_tool_bridge_recovers_when_permission_denial_repair_repeats(tmp_path: Path) -> None:
     seen_payloads: list[dict[str, Any]] = []
     denial = (
@@ -26882,6 +27011,43 @@ def test_request_diagnostics_records_request_start_with_tool_context() -> None:
         {"role": "user", "contentType": "text", "contentChars": 30}
     ]
     assert diagnostics[-1]["kind"] == "completion_response"
+
+
+def test_admin_debug_log_bundle_exports_sanitized_diagnostics() -> None:
+    client = _client(lambda request: httpx.Response(200, json=_openai_response("ok"), request=request))
+    client.app.state.request_diagnostics.append(
+        {
+            "kind": "completion_response",
+            "route": "qwen-web",
+            "apiKey": "sk-customer-secret",
+            "authorization": "Bearer customer-token-123456",
+            "responseContentPreview": "失败原因 cookie=customer-cookie-abcdef token=inline-secret-abcdef",
+        }
+    )
+    client.app.state.tool_bridge_events.append(
+        {
+            "kind": "tool_bridge_rejection",
+            "errorKind": "deferred_named_tool_action_without_call",
+            "rawPreview": "我将使用 read 工具查看 README。",
+            "session": "qwen-session-secret",
+        }
+    )
+
+    response = client.get("/api/admin/debug-log-bundle")
+
+    assert response.status_code == 200
+    assert "webai-gateway-debug-log" in response.headers["content-disposition"]
+    payload = response.json()
+    assert payload["schemaVersion"] == 1
+    assert payload["product"] == "WebAI Gateway"
+    assert payload["requestDiagnostics"][0]["kind"] == "completion_response"
+    assert payload["toolBridgeEvents"][0]["errorKind"] == "deferred_named_tool_action_without_call"
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "sk-customer-secret" not in text
+    assert "customer-token-123456" not in text
+    assert "customer-cookie-abcdef" not in text
+    assert "qwen-session-secret" not in text
+    assert "[redacted]" in text
 
 
 def test_request_diagnostics_persist_redacted_events_across_restart(tmp_path: Path) -> None:

@@ -262,6 +262,26 @@ async function loadRequestDiagnostics() {
   renderRequestDiagnostics(data.events || []);
 }
 
+async function exportDebugLogBundle() {
+  const res = await fetch("/api/admin/debug-log-bundle");
+  if (!res.ok) {
+    throw new Error(`调试日志导出失败：HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("content-disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/i);
+  const filename = match?.[1] || `webai-gateway-debug-log-${Date.now()}.json`;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast("调试日志已导出，发给维护者即可排查。");
+}
+
 function renderAutoResearchStatus(data) {
   state.autoResearch = data || null;
   const available = data?.available === true;
@@ -673,6 +693,7 @@ async function boot() {
     Promise.all([refreshStatus(), loadAuthProviders(), loadRequestDiagnostics(), loadAutoResearchStatus(), loadAutoResearchCandidates()]).catch((error) => showToast(error.message));
   });
   $("refreshDiagnosticsButton").addEventListener("click", () => loadRequestDiagnostics().catch((error) => showToast(error.message)));
+  $("exportDebugLogButton").addEventListener("click", () => exportDebugLogBundle().catch((error) => showToast(error.message)));
   $("refreshAutoResearchButton").addEventListener("click", () => {
     Promise.all([loadAutoResearchStatus(), loadAutoResearchCandidates()]).catch((error) => showToast(error.message));
   });

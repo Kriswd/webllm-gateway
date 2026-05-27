@@ -5,6 +5,7 @@ import {
   ApiOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  DownloadOutlined,
   LoadingOutlined,
   PoweroffOutlined,
   ReloadOutlined,
@@ -79,6 +80,28 @@ async function runChatTest() {
 function openApiTestDrawer() {
   apiTestDrawer.value = true;
   loadModelsForTest();
+}
+
+async function exportDebugLogBundle() {
+  try {
+    const res = await fetch('/api/admin/debug-log-bundle', { headers: settingsStore.getHeaders() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const disposition = res.headers.get('content-disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/i);
+    const filename = match?.[1] || `webai-gateway-debug-log-${Date.now()}.json`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    message.success('调试日志已导出，发给维护者即可排查。');
+  } catch (error) {
+    message.error(`调试日志导出失败：${error.message || String(error)}`);
+  }
 }
 
 function statusTag(status) {
@@ -169,6 +192,10 @@ onUnmounted(() => {
         </div>
       </div>
       <a-space wrap>
+        <a-button @click="exportDebugLogBundle">
+          <template #icon><DownloadOutlined /></template>
+          导出日志
+        </a-button>
         <a-button @click="openApiTestDrawer">
           <template #icon><ApiOutlined /></template>
           接口测试

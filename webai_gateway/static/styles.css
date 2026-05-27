@@ -425,6 +425,13 @@ h2 {
   margin-bottom: 18px;
 }
 
+.section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .badge {
   color: var(--accent-strong);
   background: #e5ece9;

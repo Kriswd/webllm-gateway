@@ -176,6 +176,9 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)((?:api[_-]?key|authorization|bearer|cookie|session|token|secret|qwen_session|ds_session_id)"
     r"[\w.-]*\s*[\"']?\s*[:=]\s*[\"']?)([^\"'\s,;}]+)"
 )
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(?:api[_-]?key|authorization|bearer|cookie|session|token|secret|qwen_session|ds_session_id)"
+)
 _SMOKE_SENSITIVE_FIELD_RE = re.compile(r"(?i)\b(?:qwen_session|ds_session_id|hwsid|sessiontoken)\s*=\s*\[redacted\]")
 _GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
 _REQUEST_TRACE_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
@@ -490,6 +493,15 @@ def create_app(
     def admin_request_diagnostics(request: Request) -> dict[str, Any]:
         require_local_admin(request)
         return {"events": list(app.state.request_diagnostics)}
+
+    @app.get("/api/admin/debug-log-bundle")
+    def admin_debug_log_bundle(request: Request) -> JSONResponse:
+        require_local_admin(request)
+        generated = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+        return JSONResponse(
+            _build_debug_log_bundle(app),
+            headers={"Content-Disposition": f'attachment; filename="webai-gateway-debug-log-{generated}.json"'},
+        )
 
     @app.get("/api/admin/auto-research/status")
     def admin_auto_research_status(request: Request) -> dict[str, Any]:
@@ -2431,6 +2443,38 @@ def _runtime_status(app: FastAPI) -> dict[str, Any]:
         ),
         "statusText": "运行代码是最新的" if not stale else "源码已更新，请重启 Gateway 让补丁生效",
     }
+
+
+def _build_debug_log_bundle(app: FastAPI) -> dict[str, Any]:
+    config = getattr(app.state, "config", GatewayConfig())
+    request_diagnostics = list(getattr(app.state, "request_diagnostics", []) or [])
+    tool_bridge_events = list(getattr(app.state, "tool_bridge_events", []) or [])
+    bundle = {
+        "schemaVersion": 1,
+        "product": "WebAI Gateway",
+        "generatedAt": utc_now(),
+        "health": {"ok": True, "runtime": _runtime_status(app)},
+        "config": config_to_public(config),
+        "requestDiagnostics": request_diagnostics[-REQUEST_DIAGNOSTIC_LIMIT:],
+        "toolBridgeEvents": tool_bridge_events[-REQUEST_DIAGNOSTIC_LIMIT:],
+        "customerHint": (
+            "把这个 JSON 文件发给维护者即可排查工具调用、Provider 输出、Prompt 压缩和运行状态。"
+            "已自动脱敏 API Key、cookie、bearer、session、token 等敏感字段。"
+        ),
+    }
+    return _sanitize_debug_log_bundle(bundle)
+
+
+def _sanitize_debug_log_bundle(value: Any, key_hint: str = "") -> Any:
+    if isinstance(value, dict):
+        return {str(key): _sanitize_debug_log_bundle(item, str(key)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_debug_log_bundle(item, key_hint) for item in value]
+    if isinstance(value, str):
+        if key_hint and _SENSITIVE_KEY_RE.search(key_hint):
+            return "[redacted]" if value else value
+        return _redact_sensitive_text(value)
+    return value
 
 
 def _run_provider_smoke_test(

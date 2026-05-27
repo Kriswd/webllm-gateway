@@ -63,7 +63,10 @@
               <h2>请求诊断</h2>
               <p>查看最近请求的 ToolBridge 错误、Provider Prompt 压缩和响应摘要。</p>
             </div>
-            <button id="refreshDiagnosticsButton" type="button" class="secondary">刷新诊断</button>
+            <div class="section-actions">
+              <button id="refreshDiagnosticsButton" type="button" class="secondary">刷新诊断</button>
+              <button id="exportDebugLogButton" type="button" class="secondary">导出调试日志</button>
+            </div>
           </div>
           <div id="requestDiagnosticsStatus" class="diagnostics-status">尚未加载</div>
           <div id="requestDiagnosticsList" class="diagnostics-list" aria-live="polite"></div>

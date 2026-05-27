@@ -857,6 +857,7 @@ _NON_PROGRESS_RECOVERY_ERROR_KINDS = {
 }
 _STANDARD_TOOL_JSON_FORMATTER_ERROR_KINDS = {
     "deferred_code_change_without_call",
+    "deferred_named_tool_action_without_call",
     "deferred_tool_action_without_call",
     "empty_tool_call",
     "incomplete_response",
