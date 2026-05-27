@@ -14823,6 +14823,47 @@ def test_supervisor_does_not_autostart_non_local_docker_runtime_urls(
     assert "host.docker.internal" in state["services"]["ds2api"]["message"]
 
 
+def test_supervisor_does_not_start_duplicate_webai2api_while_prior_launch_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from webai_gateway import runtime_supervisor
+
+    sidecar_dir = tmp_path / "sidecar"
+    sidecar_dir.mkdir()
+    (sidecar_dir / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("WEBAI2API_SIDECAR_DIR", str(sidecar_dir))
+
+    state_path = tmp_path / ".webai-gateway" / "runtime" / "managed-runtimes.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "updatedAt": runtime_supervisor._utc_timestamp(),
+                "services": {"webai2api": {"status": "started", "pid": 1234}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_supervisor, "_port_is_listening", lambda host, port: False)
+    monkeypatch.setattr(runtime_supervisor.shutil, "which", lambda command: "corepack.cmd")
+
+    def reject_duplicate_start(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("pending WebAI2API runtime must not be launched again")
+
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", reject_duplicate_start)
+    config = GatewayConfig(
+        upstream=UpstreamConfig(base_url="http://127.0.0.1:8500/v1"),
+        provider_runtime=ProviderRuntimeConfig(deepseek_ds2api_base_url="http://host.docker.internal:9331/v1"),
+    )
+
+    state = runtime_supervisor.ensure_managed_runtimes(config, tmp_path / "config.json", tmp_path)
+
+    service = state["services"]["webai2api"]
+    assert service["status"] == "starting"
+    assert service["pid"] == 1234
+    assert "not started again" in service["message"]
+
+
 def test_supervisor_marks_webai2api_safe_mode_as_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from webai_gateway import runtime_supervisor
 

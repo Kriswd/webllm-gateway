@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -21,6 +22,8 @@ from webai_gateway.ds2api_sidecar_config import build_ds2api_sidecar_config
 
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+WEBAI2API_START_GRACE_SECONDS = 420.0
+RUNTIME_LOCK_STALE_SECONDS = 30.0
 
 
 def collect_supervisor_status(
@@ -84,13 +87,15 @@ def collect_supervisor_status(
 
 
 def ensure_managed_runtimes(config: GatewayConfig, config_path: Path, gateway_root: Path) -> dict[str, Any]:
-    services = {
-        "webai2api": _ensure_webai2api(config, gateway_root),
-        "ds2api": _ensure_ds2api(config, config_path, gateway_root),
-    }
-    state = {"updatedAt": _utc_timestamp(), "services": services}
-    _save_state(gateway_root, state)
-    return state
+    with _runtime_start_lock(gateway_root):
+        previous_state = _load_state(gateway_root)
+        services = {
+            "webai2api": _ensure_webai2api(config, gateway_root, previous_state),
+            "ds2api": _ensure_ds2api(config, config_path, gateway_root),
+        }
+        state = {"updatedAt": _utc_timestamp(), "services": services}
+        _save_state(gateway_root, state)
+        return state
 
 
 def _service_status(
@@ -113,6 +118,10 @@ def _service_status(
             status = "external"
         elif parsed["local"] and parsed["port"] and _port_is_listening(parsed["host"], parsed["port"]):
             status = "running"
+        elif service_id == "webai2api" and status in {"started", "starting"} and _service_start_is_recent(
+            state, saved, max_age_seconds=WEBAI2API_START_GRACE_SECONDS
+        ):
+            status = "starting"
         elif status == "started" and _state_is_recent(state, max_age_seconds=90.0):
             status = "starting"
         elif status in {"started", "running", "already-running"}:
@@ -189,12 +198,25 @@ def _safe_http_error_preview(exc: HTTPError) -> str:
     return _safe_message(body or str(exc.reason or ""))
 
 
-def _ensure_webai2api(config: GatewayConfig, gateway_root: Path) -> dict[str, Any]:
+def _ensure_webai2api(config: GatewayConfig, gateway_root: Path, previous_state: dict[str, Any] | None = None) -> dict[str, Any]:
     parsed = _parse_service_url(config.upstream.base_url, 8500)
     if not parsed["local"]:
         return {"status": "external", "message": f"WebAI2API runtime is external: {config.upstream.base_url}"}
     if parsed["local"] and parsed["port"] and _port_is_listening(parsed["host"], parsed["port"]):
         return {"status": "already-running", "message": "WebAI2API runtime already listening"}
+    previous_state = previous_state if isinstance(previous_state, dict) else {}
+    previous_services = previous_state.get("services") if isinstance(previous_state.get("services"), dict) else {}
+    previous_service = previous_services.get("webai2api") if isinstance(previous_services.get("webai2api"), dict) else {}
+    if str(previous_service.get("status") or "") in {"started", "starting"} and _service_start_is_recent(
+        previous_state, previous_service, max_age_seconds=WEBAI2API_START_GRACE_SECONDS
+    ):
+        return {
+            "status": "starting",
+            "pid": previous_service.get("pid"),
+            "path": previous_service.get("path"),
+            "startedAt": previous_service.get("startedAt") or previous_state.get("updatedAt") or _utc_timestamp(),
+            "message": "WebAI2API runtime launch is still pending; not started again",
+        }
     sidecar_dir = _default_webai2api_sidecar_dir(gateway_root).resolve()
     if not (sidecar_dir / "package.json").exists():
         return {"status": "missing", "path": str(sidecar_dir), "message": f"未找到 WebAI2API runtime：{sidecar_dir}"}
@@ -211,7 +233,13 @@ def _ensure_webai2api(config: GatewayConfig, gateway_root: Path) -> dict[str, An
             stderr=stderr,
             creationflags=_creation_flags(),
         )
-    return {"status": "started", "pid": process.pid, "path": str(sidecar_dir), "message": "WebAI2API runtime started"}
+    return {
+        "status": "started",
+        "pid": process.pid,
+        "path": str(sidecar_dir),
+        "startedAt": _utc_timestamp(),
+        "message": "WebAI2API runtime started",
+    }
 
 
 def _ensure_ds2api(config: GatewayConfig, config_path: Path, gateway_root: Path) -> dict[str, Any]:
@@ -288,6 +316,40 @@ def _state_path(gateway_root: Path) -> Path:
     return gateway_root / ".webai-gateway" / "runtime" / "managed-runtimes.json"
 
 
+@contextmanager
+def _runtime_start_lock(gateway_root: Path) -> Any:
+    lock_path = _state_path(gateway_root).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + RUNTIME_LOCK_STALE_SECONDS
+    handle: int | None = None
+    while handle is None:
+        try:
+            handle = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                stale = (time.time() - lock_path.stat().st_mtime) > RUNTIME_LOCK_STALE_SECONDS
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the runtime startup lock")
+            time.sleep(0.05)
+    try:
+        os.write(handle, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(handle)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
 def _load_state(gateway_root: Path) -> dict[str, Any]:
     path = _state_path(gateway_root)
     try:
@@ -322,9 +384,17 @@ def _utc_timestamp() -> str:
 
 
 def _state_is_recent(state: dict[str, Any], *, max_age_seconds: float) -> bool:
-    updated_at = str(state.get("updatedAt") or "")
+    return _timestamp_is_recent(str(state.get("updatedAt") or ""), max_age_seconds=max_age_seconds)
+
+
+def _service_start_is_recent(state: dict[str, Any], service: dict[str, Any], *, max_age_seconds: float) -> bool:
+    started_at = str(service.get("startedAt") or state.get("updatedAt") or "")
+    return _timestamp_is_recent(started_at, max_age_seconds=max_age_seconds)
+
+
+def _timestamp_is_recent(timestamp: str, *, max_age_seconds: float) -> bool:
     try:
-        parsed = datetime.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        parsed = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return False
     age = (datetime.now(timezone.utc) - parsed).total_seconds()
