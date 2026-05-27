@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 import inspect
@@ -177,6 +178,10 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
 )
 _SMOKE_SENSITIVE_FIELD_RE = re.compile(r"(?i)\b(?:qwen_session|ds_session_id|hwsid|sessiontoken)\s*=\s*\[redacted\]")
 _GPT_THINKING_MODEL_IDS = {"gpt-thinking", "chatgpt_text/gpt-thinking"}
+_REQUEST_TRACE_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "webai_gateway_request_trace_context",
+    default={},
+)
 
 
 class _ProviderRateLimitGate:
@@ -429,6 +434,23 @@ def create_app(
         host = request.client.host if request.client else ""
         if host not in LOCAL_ADMIN_HOSTS:
             raise HTTPException(status_code=403, detail="Admin UI is only available from localhost")
+
+    @app.middleware("http")
+    async def request_trace_context(request: Request, call_next: Any) -> Response:
+        request_id = _safe_trace_id(request.headers.get("X-WebAI-Request-Id")) or _new_gateway_request_id()
+        context = {
+            "requestId": request_id,
+            "traceId": _request_trace_id(request),
+            "requestStartedAt": utc_now(),
+            "requestStartedMonotonic": time.monotonic(),
+        }
+        token = _REQUEST_TRACE_CONTEXT.set(context)
+        try:
+            response = await call_next(request)
+            response.headers.setdefault("x-webai-request-id", request_id)
+            return response
+        finally:
+            _REQUEST_TRACE_CONTEXT.reset(token)
 
     @app.get("/", include_in_schema=False)
     def admin_ui(request: Request) -> FileResponse:
@@ -3249,6 +3271,52 @@ def _record_request_diagnostic(app: FastAPI, kind: str, **fields: Any) -> None:
         _append_request_diagnostic_log(app, event)
 
 
+def _new_gateway_request_id() -> str:
+    return f"gwreq_{secrets.token_hex(8)}"
+
+
+def _safe_trace_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = _redact_sensitive_text(text)
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "_", text).strip("_.:-")
+    return text[:120]
+
+
+def _request_trace_id(request: Request) -> str:
+    candidates = (
+        request.query_params.get("__trace_id"),
+        request.headers.get("X-Ds2-Test-Trace"),
+        request.headers.get("X-WebAI-Trace-Id"),
+        request.headers.get("X-Request-Id"),
+        request.headers.get("X-Request-ID"),
+    )
+    for candidate in candidates:
+        trace_id = _safe_trace_id(candidate)
+        if trace_id:
+            return trace_id
+    return ""
+
+
+def _request_diagnostic_lifecycle_fields(*, phase: str) -> dict[str, Any]:
+    context = _REQUEST_TRACE_CONTEXT.get({})
+    if not isinstance(context, dict):
+        context = {}
+    request_id = _safe_trace_id(context.get("requestId")) or _new_gateway_request_id()
+    fields: dict[str, Any] = {"requestId": request_id}
+    trace_id = _safe_trace_id(context.get("traceId"))
+    if trace_id:
+        fields["traceId"] = trace_id
+    started_at = str(context.get("requestStartedAt") or "").strip()
+    if started_at:
+        fields["requestStartedAt"] = started_at
+    started_monotonic = context.get("requestStartedMonotonic")
+    if phase in {"response", "error"} and isinstance(started_monotonic, (int, float)):
+        fields["durationMs"] = max(0, int((time.monotonic() - float(started_monotonic)) * 1000))
+    return fields
+
+
 def _load_request_diagnostics_log(path: Path, *, limit: int) -> tuple[list[dict[str, Any]], int]:
     if not path.exists():
         return [], 0
@@ -3389,22 +3457,24 @@ def _record_completion_diagnostic(
     bridge: bool,
     **response_fields: Any,
 ) -> None:
+    request_fingerprint = _completion_request_fingerprint(
+        endpoint=endpoint,
+        route=route,
+        model=model,
+        body=body,
+        stream=stream,
+        bridge=bridge,
+    )
     _record_request_diagnostic(
         app,
         "completion_response",
+        **_request_diagnostic_lifecycle_fields(phase="response"),
         endpoint=endpoint,
         route=route,
         model=model,
         stream=stream,
         bridge=bridge,
-        requestFingerprint=_completion_request_fingerprint(
-            endpoint=endpoint,
-            route=route,
-            model=model,
-            body=body,
-            stream=stream,
-            bridge=bridge,
-        ),
+        requestFingerprint=request_fingerprint,
         **_request_body_diagnostic_fields(body),
         **response_fields,
     )
@@ -3549,22 +3619,24 @@ def _record_completion_started_diagnostic(
     bridge: bool,
     bridge_context: Any | None = None,
 ) -> None:
+    request_fingerprint = _completion_request_fingerprint(
+        endpoint=endpoint,
+        route=route,
+        model=model,
+        body=body,
+        stream=stream,
+        bridge=bridge,
+    )
     _record_request_diagnostic(
         app,
         "completion_request_started",
+        **_request_diagnostic_lifecycle_fields(phase="start"),
         endpoint=endpoint,
         route=route,
         model=model,
         stream=stream,
         bridge=bridge,
-        requestFingerprint=_completion_request_fingerprint(
-            endpoint=endpoint,
-            route=route,
-            model=model,
-            body=body,
-            stream=stream,
-            bridge=bridge,
-        ),
+        requestFingerprint=request_fingerprint,
         **_request_body_diagnostic_fields(body),
         **_tool_bridge_context_diagnostic_fields(bridge_context),
     )
@@ -3585,22 +3657,24 @@ def _record_completion_error_diagnostic(
     provider_diagnostic: Any = None,
     bridge_context: Any | None = None,
 ) -> None:
+    request_fingerprint = _completion_request_fingerprint(
+        endpoint=endpoint,
+        route=route,
+        model=model,
+        body=body,
+        stream=stream,
+        bridge=bridge,
+    )
     _record_request_diagnostic(
         app,
         "completion_error",
+        **_request_diagnostic_lifecycle_fields(phase="error"),
         endpoint=endpoint,
         route=route,
         model=model,
         stream=stream,
         bridge=bridge,
-        requestFingerprint=_completion_request_fingerprint(
-            endpoint=endpoint,
-            route=route,
-            model=model,
-            body=body,
-            stream=stream,
-            bridge=bridge,
-        ),
+        requestFingerprint=request_fingerprint,
         statusCode=status_code,
         errorKind=error_kind,
         errorPreview=_preview_text(_redact_sensitive_text(str(error)), max_chars=500),

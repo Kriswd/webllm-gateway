@@ -26932,6 +26932,40 @@ def test_request_diagnostics_correlates_started_and_empty_response() -> None:
     assert completed["responseWarning"] == "empty_stream_response"
 
 
+def test_request_diagnostics_records_trace_id_request_id_and_duration() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.01)
+        return httpx.Response(200, json=_openai_response("ok"), request=request)
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+    )
+    client = TestClient(create_app(config=config, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+
+    response = client.post(
+        "/v1/chat/completions?__trace_id=trace-ci-001",
+        headers=_headers(),
+        json={
+            "model": "web-model",
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 16,
+        },
+    )
+    diagnostics = client.get("/api/admin/request-diagnostics").json()["events"]
+
+    assert response.status_code == 200
+    started = next(event for event in diagnostics if event["kind"] == "completion_request_started")
+    completed = diagnostics[-1]
+    assert started["requestId"].startswith("gwreq_")
+    assert completed["requestId"] == started["requestId"]
+    assert started["traceId"] == "trace-ci-001"
+    assert completed["traceId"] == "trace-ci-001"
+    assert completed["requestStartedAt"] == started["requestStartedAt"]
+    assert isinstance(completed["durationMs"], int)
+    assert completed["durationMs"] >= 0
+
+
 def test_qwen_web_generic_exception_records_completion_error_diagnostic(tmp_path: Path) -> None:
     class FailingQwenClient:
         def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
