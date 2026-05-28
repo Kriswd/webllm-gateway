@@ -592,6 +592,7 @@ _LOCAL_AGENT_TOOL_NAMES = frozenset(
         "multiedit",
         "read",
         "skill",
+        "showwidget",
         "webfetch",
         "websearch",
         "write",
@@ -1227,11 +1228,19 @@ def _local_agent_required_tool_policy(
     if has_tool_loop or not local_tools:
         return policy
     exposure_policy = (context.options.exposure_policy or "safe").strip().lower()
-    if exposure_policy not in {"local-agent", "local_agent", "code-agent", "code_agent"}:
+    local_execution_explicit = _task_explicitly_requests_local_execution(task_text)
+    if (
+        exposure_policy not in {"local-agent", "local_agent", "code-agent", "code_agent"}
+        and not local_execution_explicit
+    ):
         return policy
     if not _looks_like_local_agent_task(task_text):
         return policy
-    if not (_task_explicitly_allows_mutation(task_text) or _local_agent_task_explicitly_requests_shell(task_text)):
+    if not (
+        _task_explicitly_allows_mutation(task_text)
+        or _local_agent_task_explicitly_requests_shell(task_text)
+        or local_execution_explicit
+    ):
         return policy
     forced_name = _initial_local_agent_forced_tool(context, task_text, local_tools)
     if forced_name:
@@ -1251,7 +1260,7 @@ def _initial_local_agent_forced_tool(
     task_text: str,
     local_tools: list[ToolSpec],
 ) -> str:
-    if _local_agent_task_explicitly_requests_shell(task_text):
+    if _local_agent_task_explicitly_requests_shell(task_text) or _task_explicitly_requests_local_execution(task_text):
         shell_tool = _select_shell_execution_tool(local_tools)
         if shell_tool:
             return shell_tool.name
@@ -1655,6 +1664,10 @@ def _local_agent_task_explicitly_requests_shell(text: str) -> bool:
         "推送",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _task_explicitly_requests_local_execution(text: str) -> bool:
+    return _looks_like_explicit_local_execution_task(text)
 
 
 def prepare_messages(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -8444,7 +8457,18 @@ def _tool_by_name(tools: list[ToolSpec], name: str) -> ToolSpec | None:
 def _is_shell_execution_tool(tool: ToolSpec | None, name: str) -> bool:
     lowered = (name or "").strip().lower()
     compact = re.sub(r"[^a-z0-9]+", "", lowered)
-    if compact in {"bash", "exec", "execute", "shell", "terminal", "command", "runcommand", "powershell", "cmd"}:
+    if compact in {
+        "bash",
+        "exec",
+        "execute",
+        "shell",
+        "terminal",
+        "command",
+        "runcommand",
+        "powershell",
+        "cmd",
+        "showwidget",
+    }:
         return True
     if not tool or not _has_shell_command_property(tool):
         return False

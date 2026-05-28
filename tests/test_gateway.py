@@ -26868,12 +26868,20 @@ def test_workbuddy_second_local_app_request_after_tool_result_starts_new_task(tm
 
         def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
             seen_payloads.append(payload)
+            prompt = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if "MUST call exactly this tool name: show_widget" in prompt:
+                return _openai_response(
+                    "```tool_json\n"
+                    '{"calls":[{"id":"call_open_qq","name":"show_widget","input":'
+                    '{"command":"open -a QQ || open qq:// || echo \\"QQ not found via open command\\""}}]}\n'
+                    "```"
+                )
             return _openai_response("\u6211\u5c06\u7ee7\u7eed\u5e2e\u4f60\u6253\u5f00 QQ\u3002")
 
     config = GatewayConfig(
         server=ServerConfig(api_key="local-dev-key"),
         upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
-        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
     )
     client = TestClient(
         create_app(
@@ -26946,15 +26954,109 @@ def test_workbuddy_second_local_app_request_after_tool_result_starts_new_task(tm
     )
 
     assert response.status_code == 200
-    assert len(seen_payloads) >= 1
+    assert len(seen_payloads) == 1
     first_prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[0]["messages"])
     assert "New user task boundary" in first_prompt
     assert "Active tool-loop continuation" not in first_prompt
-    content = response.json()["choices"][0]["message"]["content"]
-    assert "Gateway \u4e0d\u80fd\u76f4\u63a5\u6253\u5f00QQ" in content
-    assert "codex" not in content.lower()
-    assert "unproven_final_answer_without_tool_call" not in content
-    assert "Gateway \u5df2\u62d2\u7edd" not in content
+    assert "MUST call exactly this tool name: show_widget" in first_prompt
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "show_widget"
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        "command": "open -a QQ || open qq:// || echo \"QQ not found via open command\""
+    }
+
+
+def test_workbuddy_anthropic_second_local_app_request_uses_show_widget(tmp_path: Path) -> None:
+    seen_payloads: list[dict[str, Any]] = []
+
+    class ShowWidgetQwenClient:
+        def __init__(self, credential: dict[str, Any], http_client: httpx.Client | None = None) -> None:
+            self.credential = credential
+
+        def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+            seen_payloads.append(payload)
+            prompt = "\n".join(str(message.get("content", "")) for message in payload.get("messages", []))
+            if "MUST call exactly this tool name: show_widget" in prompt:
+                return _openai_response(
+                    "```tool_json\n"
+                    '{"calls":[{"id":"call_open_qq","name":"show_widget","input":'
+                    '{"command":"open -a QQ || open qq:// || echo \\"QQ not found via open command\\""}}]}\n'
+                    "```"
+                )
+            return _openai_response("\u6211\u5c06\u7ee7\u7eed\u5e2e\u4f60\u6253\u5f00 QQ\u3002")
+
+    config = GatewayConfig(
+        server=ServerConfig(api_key="local-dev-key"),
+        upstream=UpstreamConfig(base_url="http://upstream.test/v1", model="web-model"),
+        tool_bridge=ToolBridgeConfig(activation_policy="auto", exposure_policy="all", tool_profile="all"),
+    )
+    client = TestClient(
+        create_app(
+            config=config,
+            credential_store=_credential_store(tmp_path),
+            qwen_client_factory=ShowWidgetQwenClient,
+            http_client=_not_found_client(),
+        )
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={**_headers(), "anthropic-version": "2023-06-01"},
+        json={
+            "model": "qwen-web/qwen3.7-max-preview",
+            "messages": [
+                {"role": "user", "content": "\u5e2e\u6211\u6253\u5f00\u6211\u7535\u8111\u7684codex"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_open_codex",
+                            "name": "show_widget",
+                            "input": {
+                                "command": "open -a Codex || open codex:// || echo 'Codex not found via open command'"
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_open_codex",
+                            "content": "\u5df2\u6267\u884c\u547d\u4ee4",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "\u5e2e\u6211\u6253\u5f00\u6211\u7535\u8111\u7684QQ"},
+            ],
+            "tools": [
+                {"name": "AskUserQuestion", "description": "Ask the user", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "Read files", "input_schema": {"type": "object"}},
+                {"name": "show_widget", "description": "Show a command widget", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(seen_payloads) == 1
+    prompt = "\n".join(str(message.get("content", "")) for message in seen_payloads[0]["messages"])
+    assert "New user task boundary" in prompt
+    assert "MUST call exactly this tool name: show_widget" in prompt
+    body = response.json()
+    assert body["stop_reason"] == "tool_use"
+    assert body["content"] == [
+        {
+            "type": "tool_use",
+            "id": "toolu_call_open_qq",
+            "name": "show_widget",
+            "input": {"command": "open -a QQ || open qq:// || echo \"QQ not found via open command\""},
+        }
+    ]
 
 
 def test_qwen_web_tool_bridge_recovers_when_permission_denial_repair_repeats(tmp_path: Path) -> None:

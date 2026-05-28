@@ -206,6 +206,7 @@ _LOCAL_EXECUTION_TOOL_NAMES = {
     "pwsh",
     "run",
     "shell",
+    "showwidget",
     "terminal",
 }
 _REQUEST_TRACE_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
