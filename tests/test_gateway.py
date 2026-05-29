@@ -18774,6 +18774,23 @@ def test_qwen_web_parser_prefers_answer_phase_over_think_phase() -> None:
     assert parse_qwen_stream_text(text) == "OK"
 
 
+def test_qwen_web_parser_uses_think_tool_call_when_answer_is_metadata_only() -> None:
+    tool_text = (
+        '<|DSML|tool_calls><|DSML|invoke name="Read">'
+        '<|DSML|parameter name="file_path"><![CDATA[README.md]]></|DSML|parameter>'
+        '</|DSML|invoke></|DSML|tool_calls>'
+    )
+    text = "\n\n".join(
+        [
+            'data: {"choices":[{"delta":{"content":"{\\"title\\":\\"Reading README\\"}","phase":"answer"}}]}',
+            "data: " + json.dumps({"choices": [{"delta": {"content": tool_text, "phase": "think"}}]}),
+            "data: [DONE]",
+        ]
+    )
+
+    assert parse_qwen_stream_text(text) == tool_text
+
+
 def test_qwen_web_stream_returns_complete_tool_json_before_done() -> None:
     consumed = 0
     tool_text = '```tool_json\n{"calls":[{"id":"call_1","name":"Read","input":{}}]}\n```'

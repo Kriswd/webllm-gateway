@@ -559,7 +559,7 @@ def _collect_qwen_stream_lines(
         if message:
             raise RuntimeError(f"Qwen API error: {message}")
         _collect_qwen_text(data, output, think_output)
-        current = "".join(output or think_output)
+        current = _select_qwen_output(output, think_output)
         if _has_complete_tool_json(current):
             return current
         if max_output_chars_without_tool_json and len(current) >= max_output_chars_without_tool_json:
@@ -574,7 +574,19 @@ def _collect_qwen_stream_lines(
                 "think_chars": len("".join(think_output)),
             }
             raise exc
-    return "".join(output or think_output)
+    return _select_qwen_output(output, think_output)
+
+
+def _select_qwen_output(output: list[str], think_output: list[str]) -> str:
+    text = "".join(output)
+    thinking = "".join(think_output)
+    if text:
+        if not _is_qwen_web_non_answer_text(text):
+            return text
+        return thinking if _has_complete_tool_json(thinking) else ""
+    if thinking and not _is_qwen_web_non_answer_text(thinking):
+        return thinking
+    return ""
 
 
 def _has_complete_tool_json(text: str) -> bool:
