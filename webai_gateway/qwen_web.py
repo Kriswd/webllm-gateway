@@ -57,6 +57,9 @@ _TOOL_CALLS_MARKUP_RE = re.compile(
     r"<\s*(?!/)[^<>]{0,80}tool_calls(?=\s|[|｜>])[^<>]*>.*?</\s*[^<>]{0,80}tool_calls(?=\s|[|｜>])[^<>]*>",
     re.IGNORECASE | re.DOTALL,
 )
+_LEGACY_FUNCTION_CALLS_BLOCK_RE = re.compile(r"<function_calls\b[^>]*>.*?</function_calls>", re.IGNORECASE | re.DOTALL)
+_TOOL_CODE_BLOCK_RE = re.compile(r"<tool_code\b[^>]*>.*?</tool_code>", re.IGNORECASE | re.DOTALL)
+_XML_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call\b[^>]*>.*?</tool_call>", re.IGNORECASE | re.DOTALL)
 
 
 def is_qwen_web_model(model: Any) -> bool:
@@ -576,6 +579,12 @@ def _collect_qwen_stream_lines(
 
 def _has_complete_tool_json(text: str) -> bool:
     if _TOOL_CALLS_MARKUP_RE.search(text or ""):
+        return True
+    if _LEGACY_FUNCTION_CALLS_BLOCK_RE.search(text or ""):
+        return True
+    if _TOOL_CODE_BLOCK_RE.search(text or ""):
+        return True
+    if _XML_TOOL_CALL_BLOCK_RE.search(text or ""):
         return True
     for match in _TOOL_JSON_BLOCK_RE.finditer(text or ""):
         try:

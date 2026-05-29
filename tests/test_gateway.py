@@ -18812,6 +18812,30 @@ def test_qwen_web_stream_returns_complete_dsml_tool_block_before_done() -> None:
     assert "<|DSML|tool_calls>" in content
 
 
+@pytest.mark.parametrize(
+    "tool_text",
+    [
+        '<function_calls><invoke name="skills_list"></invoke></function_calls>',
+        "<tool_code>\nskills_list()\n</tool_code>",
+        "<tool_call>\n<function=skills_list>\n</function>\n</tool_call>",
+    ],
+)
+def test_qwen_web_stream_returns_complete_legacy_tool_markup_before_done(tool_text: str) -> None:
+    consumed = 0
+
+    def lines():
+        nonlocal consumed
+        consumed += 1
+        yield "data: " + json.dumps({"choices": [{"delta": {"content": tool_text}}]})
+        consumed += 1
+        raise AssertionError("stream should stop once complete legacy tool markup is available")
+
+    content = _collect_qwen_stream_lines(lines(), deadline_seconds=30)
+
+    assert consumed == 1
+    assert "skills_list" in content
+
+
 def test_qwen_web_stream_returns_runaway_tool_bridge_text_before_timeout() -> None:
     consumed = 0
 
@@ -23102,6 +23126,30 @@ def test_qwen_coder_stream_returns_complete_dsml_tool_block_before_done() -> Non
 
     assert consumed == 1
     assert "<|DSML|tool_calls>" in content
+
+
+@pytest.mark.parametrize(
+    "tool_text",
+    [
+        '<function_calls><invoke name="skills_list"></invoke></function_calls>',
+        "<tool_code>\nskills_list()\n</tool_code>",
+        "<tool_call>\n<function=skills_list>\n</function>\n</tool_call>",
+    ],
+)
+def test_qwen_coder_stream_returns_complete_legacy_tool_markup_before_done(tool_text: str) -> None:
+    consumed = 0
+
+    def lines():
+        nonlocal consumed
+        consumed += 1
+        yield "data: " + json.dumps({"choices": [{"delta": {"content": tool_text, "phase": "answer"}}]})
+        consumed += 1
+        raise AssertionError("stream should stop once complete legacy tool markup is available")
+
+    content = _collect_qwen_coder_stream_lines(lines(), deadline_seconds=30)
+
+    assert consumed == 1
+    assert "skills_list" in content
 
 
 def test_qwen_coder_stream_returns_runaway_tool_bridge_text_before_timeout() -> None:
