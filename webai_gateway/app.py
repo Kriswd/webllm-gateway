@@ -1432,7 +1432,10 @@ def create_app(
         provider = get_provider(provider_id)
         if provider.route == "direct":
             cdp_url = str(body.get("cdpUrl") or body.get("cdp_url") or default_cdp_url())
-            result = app.state.browser_launcher.start(provider_id, cdp_url)
+            # BrowserLauncher waits for local CDP readiness.  Keep that
+            # blocking probe off the ASGI event loop so the frontend's health
+            # heartbeat and authorization-job polling stay responsive.
+            result = await run_in_threadpool(app.state.browser_launcher.start, provider_id, cdp_url)
             return {
                 **result,
                 "success": True,
@@ -1894,7 +1897,7 @@ def create_app(
         provider_id = str(body.get("provider") or "deepseek-web")
         cdp_url = str(body.get("cdpUrl") or default_cdp_url())
         get_provider(provider_id)
-        return app.state.browser_launcher.start(provider_id, cdp_url)
+        return await run_in_threadpool(app.state.browser_launcher.start, provider_id, cdp_url)
 
     def _save_web_auth_callback_url(provider_id: str, body: dict[str, Any]) -> dict[str, Any]:
         provider = get_provider(provider_id)

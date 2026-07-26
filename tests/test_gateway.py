@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import webai_gateway.app as gateway_app
 import webai_gateway.web_auth as web_auth
 from webai_gateway.app import _DirectProviderPoolGate, create_app
 from webai_gateway.anthropic_api import anthropic_body_to_openai
@@ -17035,6 +17036,29 @@ def test_web_auth_browser_start_returns_beginner_friendly_action() -> None:
     assert body["started"] is True
     assert body["loginUrl"] == "https://chat.deepseek.com"
     assert "授权浏览器已启动" in body["message"]
+
+
+def test_direct_browser_start_routes_use_threadpool_to_keep_gateway_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Any, tuple[Any, ...]]] = []
+
+    async def fake_run_in_threadpool(function: Any, *args: Any, **_kwargs: Any) -> Any:
+        calls.append((function, args))
+        return function(*args)
+
+    monkeypatch.setattr(gateway_app, "run_in_threadpool", fake_run_in_threadpool)
+    client = TestClient(
+        create_app(config=_config(), browser_launcher=_FakeBrowserLauncher(), http_client=_not_found_client())
+    )
+
+    onboarding = client.post("/api/admin/onboarding/providers/qwen/login", json={"cdpUrl": "http://127.0.0.1:9222"})
+    legacy = client.post("/api/admin/web-auth/browser/start", json={"provider": "qwen"})
+
+    assert onboarding.status_code == 200
+    assert legacy.status_code == 200
+    assert len(calls) == 2
+    assert all(args[0] == "qwen" for _function, args in calls)
 
 
 class _FakeDeepSeekClient:
