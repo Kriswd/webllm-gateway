@@ -438,15 +438,12 @@ PROVIDERS: dict[str, WebAuthProvider] = {
         name="Qwen / 通义千问国际版",
         login_url="https://chat.qwen.ai/",
         status="available",
-        description="Qwen Web 直连链路已调通 Qwen 3.7 系列；可在本机授权浏览器登录 Qwen，并直接使用 qwen-web/ 前缀模型。",
+        description="Qwen Web 直连使用当前网页模型目录；可在本机授权浏览器登录 Qwen，并直接使用 qwen-web/ 前缀模型。",
         models=(
-            "qwen-web/qwen3.7-max-preview",
+            "qwen-web/qwen3.8-max-preview",
             "qwen-web/qwen3.7-max",
-            "qwen-web/qwen3.7-plus-preview",
-            "qwen-web/qwen3.6-max-preview",
+            "qwen-web/qwen3.7-plus",
             "qwen-web/qwen3.6-plus",
-            "qwen-web/qwen3.5-plus",
-            "qwen-web/qwen3-max",
         ),
         capabilities={"text": True, "image": False, "video": False},
         adapters=("qwen_web", "qwen-web"),
@@ -775,7 +772,12 @@ def is_credential_authorized(provider_id: str, credential: dict[str, Any] | None
     if not credential:
         return False
     bearer = _normalized_bearer(credential.get("bearer"))
-    if provider_id in QWEN_DIRECT_PROVIDER_IDS:
+    if provider_id == "qwen":
+        # Qwen Web's v2 chat endpoints require the web API bearer token. A
+        # browser session cookie may prove that the user is signed in to the
+        # page, but cannot by itself invoke the API.
+        return bool(bearer)
+    if provider_id == "qwen-coder":
         metadata = _normalized_credential_metadata(credential.get("metadata"))
         session_token = _normalized_session_token(metadata.get("sessionToken"))
         cookie_session = _qwen_session_from_cookie_header(_normalized_cookie_header(credential.get("cookie")))
@@ -795,12 +797,22 @@ def credential_from_remote_auth_url(provider_id: str, auth_url: str, user_agent:
     params = _remote_auth_url_params(parsed)
     bearer = _strip_bearer_prefix(_first_remote_auth_param(params, REMOTE_AUTH_TOKEN_KEYS))
     cookie = _normalized_cookie_header(_first_remote_auth_param(params, REMOTE_AUTH_COOKIE_KEYS))
-    session_token = _normalized_session_token(_first_remote_auth_param(params, REMOTE_AUTH_SESSION_KEYS))
+    raw_session_token = _first_remote_auth_param(params, REMOTE_AUTH_SESSION_KEYS)
+    session_token = _normalized_session_token(raw_session_token)
     code = _first_remote_auth_param(params, REMOTE_AUTH_CODE_KEYS)
     parsed_user_agent = _first_remote_auth_param(params, REMOTE_AUTH_USER_AGENT_KEYS)
 
     if not cookie and provider.id in QWEN_DIRECT_PROVIDER_IDS and session_token:
         cookie = f"qwen_session={session_token}"
+    # A remote callback can explicitly carry a Bearer value in its Qwen
+    # session field. Preserve that explicit API credential instead of treating
+    # every session-shaped value as a cookie-only browser login.
+    if (
+        provider.id == "qwen"
+        and not bearer
+        and str(raw_session_token or "").strip().lower().startswith("bearer ")
+    ):
+        bearer = _normalized_bearer(raw_session_token)
     if not session_token and provider.id in QWEN_DIRECT_PROVIDER_IDS and cookie:
         session_token = _qwen_session_from_cookie_header(cookie)
 
@@ -1117,6 +1129,7 @@ class DeepSeekWebAuthService:
 
         bearer_seen = ""
         cookie_only_notice_sent = False
+        qwen_token_notice_sent = False
         started_at = time.monotonic()
         notify("正在连接授权浏览器")
         async with async_playwright() as playwright:
@@ -1172,6 +1185,18 @@ class DeepSeekWebAuthService:
                 ):
                     notify("已看到 DeepSeek 登录 cookie，正在继续等待 bearer token；请保持聊天页打开，必要时刷新 chat.deepseek.com。")
                     cookie_only_notice_sent = True
+                if (
+                    provider.id == "qwen"
+                    and credential
+                    and credential.get("cookie")
+                    and not credential.get("bearer")
+                    and not qwen_token_notice_sent
+                ):
+                    notify(
+                        "已检测到 Qwen 网页登录，但还没有捕获可调用的 API token。"
+                        "请在授权浏览器中打开任一对话并发送一条消息，保持窗口打开；Gateway 将自动继续检测。"
+                    )
+                    qwen_token_notice_sent = True
                 await asyncio.sleep(2)
         if provider.id in QWEN_DIRECT_PROVIDER_IDS:
             raise TimeoutError(f"等待 {provider.name} 登录态超时，请确认已经在 {provider.login_url} 登录成功后重试")
@@ -1266,7 +1291,7 @@ def _qwen_session_token_from_cookies(cookies: list[dict[str, Any]]) -> str:
 
 def _qwen_bearer_token_from_cookies(cookies: list[dict[str, Any]]) -> str:
     for item in cookies:
-        if str(item.get("name") or "").lower() == "token":
+        if str(item.get("name") or "").lower() in {"token", "tongyi_sso_ticket"}:
             return _normalized_bearer(item.get("value"))
     return ""
 

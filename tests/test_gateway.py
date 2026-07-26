@@ -1487,16 +1487,15 @@ def test_models_returns_configured_model_when_upstream_models_unavailable() -> N
     assert "deepseek-v4-pro[1m]" not in model_ids
     assert "deepseek-web/deepseek-chat" not in model_ids
     assert "deepseek" not in model_ids
-    assert "qwen-web/qwen3.7-max-preview" in model_ids
+    assert "qwen-web/qwen3.8-max-preview" in model_ids
     assert "qwen-web/qwen3.7-max" in model_ids
-    assert "qwen-web/qwen3.7-plus-preview" in model_ids
-    assert "qwen-web/qwen3.6-max-preview" in model_ids
+    assert "qwen-web/qwen3.7-plus" in model_ids
     assert "qwen-web/qwen3.6-plus" in model_ids
-    assert "qwen-web/qwen3-max" in model_ids
-    assert "qwen-web/qwen3.6-max" not in model_ids
-    qwen_preview = next(item for item in body["data"] if item["id"] == "qwen-web/qwen3.7-max-preview")
-    assert qwen_preview["capabilities"]["tool_bridge"] is True
-    assert qwen_preview["capabilities"]["supports_native_tools"] is False
+    assert "qwen-web/qwen3.7-max-preview" not in model_ids
+    assert "qwen-web/qwen3.6-max-preview" not in model_ids
+    qwen_current = next(item for item in body["data"] if item["id"] == "qwen-web/qwen3.8-max-preview")
+    assert qwen_current["capabilities"]["tool_bridge"] is True
+    assert qwen_current["capabilities"]["supports_native_tools"] is False
     assert "gpt-instant" not in model_ids
     assert "sora-2" not in model_ids
 
@@ -14413,8 +14412,8 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "模型不可用原因" in bridge_source
     assert "accountValidationFailures" in bridge_source
     assert "模型验证失败" in bridge_source
-    assert "Qwen 3.7 系列已调通" in bridge_source
-    assert "Qwen 3.7 Max / Plus Preview 已纳入直连链路" in bridge_source
+    assert "Qwen 网页模型目录实时同步" in bridge_source
+    assert "Qwen 直连会使用当前网页接口和实时模型目录" in bridge_source
     assert "把网页账号变成可工具调用的 API，实现养虾养马自由！" in bridge_source
     assert "支持在小龙虾、Hermes 或其它兼容 OpenAI 和 Anthropic API 的客户端做轻中度工具调用。" in bridge_source
     assert "Gateway 地址" not in bridge_source
@@ -14473,8 +14472,8 @@ def test_public_intro_and_visible_static_ui_do_not_reference_internal_krisai() -
 
     assert "KrisAI" not in readme_source
     assert "KrisAI" not in static_source
-    assert "Qwen 3.7 系列已经调通" in readme_source
-    assert "Qwen 3.7 系列已调通" in static_source
+    assert "Qwen Web 直连会读取当前网页模型目录" in readme_source
+    assert "Qwen 直连会同步当前网页模型目录" in static_source
     assert "![WebLLM Gateway 核心界面](docs/assets/webllm-gateway-home.png)" in readme_source
     assert screenshot.exists()
     screenshot_bytes = screenshot.read_bytes()
@@ -14523,7 +14522,7 @@ def test_open_source_release_materials_are_present() -> None:
     assert "docs/demos/agent-tool-calling.md" in readme
     assert "docs/promotion/launch-kit.md" in readme
     assert "OpenClaw" in readme and "Hermes" in readme and "轻中度工具调用" in readme
-    assert "qwen-web/qwen3.7-max-preview" in readme
+    assert "qwen-web/qwen3.8-max-preview" in readme
     assert "Qwen 3.7 接入轻量工具调用链路" in agent_demo
     assert "tool_calls" in agent_demo and "tool_use" in agent_demo
     assert "微信群 / 社群文案" in launch_kit
@@ -15381,7 +15380,7 @@ def test_admin_provider_smoke_reports_qwen_tool_loop_without_secrets(tmp_path: P
         "qwen",
         {
             "cookie": "qwen_session=session-secret",
-            "bearer": "",
+            "bearer": "qwen-api-token",
             "userAgent": "Chrome Test",
             "metadata": {"sessionToken": "session-secret"},
         },
@@ -15498,7 +15497,7 @@ def test_admin_provider_smoke_returns_step_failures_without_secrets(tmp_path: Pa
         "qwen",
         {
             "cookie": "qwen_session=session-secret",
-            "bearer": "",
+            "bearer": "qwen-api-token",
             "userAgent": "Chrome Test",
             "metadata": {"sessionToken": "session-secret"},
         },
@@ -15867,14 +15866,13 @@ def test_web_auth_providers_cover_webai2api_supported_sites(tmp_path: Path) -> N
     assert providers["qwen"]["capabilities"] == {"text": True, "image": False, "video": False}
     assert "qwen_web" in providers["qwen"]["adapters"]
     assert "qwen_cn_web" in providers["qwen-cn"]["adapters"]
-    assert "Qwen 3.7 系列" in providers["qwen"]["description"]
-    assert "qwen-web/qwen3.7-max-preview" in providers["qwen"]["models"]
+    assert "当前网页模型目录" in providers["qwen"]["description"]
+    assert "qwen-web/qwen3.8-max-preview" in providers["qwen"]["models"]
     assert "qwen-web/qwen3.7-max" in providers["qwen"]["models"]
-    assert "qwen-web/qwen3.7-plus-preview" in providers["qwen"]["models"]
-    assert "qwen-web/qwen3.6-max-preview" in providers["qwen"]["models"]
+    assert "qwen-web/qwen3.7-plus" in providers["qwen"]["models"]
     assert "qwen-web/qwen3.6-plus" in providers["qwen"]["models"]
-    assert "qwen-web/qwen3-max" in providers["qwen"]["models"]
-    assert "qwen-web/qwen3.6-max" not in providers["qwen"]["models"]
+    assert "qwen-web/qwen3.7-max-preview" not in providers["qwen"]["models"]
+    assert "qwen-web/qwen3.6-max-preview" not in providers["qwen"]["models"]
     assert "Qwen3.5-Plus" in providers["qwen-cn"]["models"]
 
 
@@ -15895,7 +15893,7 @@ def test_qwen_cookie_only_credential_is_not_authorized() -> None:
     assert summary["fields"] == {"cookie": True, "bearer": False, "userAgent": True}
 
 
-def test_qwen_session_token_credential_is_authorized() -> None:
+def test_qwen_session_cookie_only_credential_is_not_authorized() -> None:
     summary = credential_summary(
         "qwen",
         {
@@ -15908,7 +15906,7 @@ def test_qwen_session_token_credential_is_authorized() -> None:
         },
     )
 
-    assert summary["authorized"] is True
+    assert summary["authorized"] is False
 
 
 def test_deepseek_cookie_only_credential_is_not_authorized() -> None:
@@ -16174,12 +16172,13 @@ def test_remote_auth_callback_url_imports_qwen_credentials_without_leaking_url(t
     assert response.status_code == 200
     body = response.json()
     assert body["credential"]["authorized"] is True
-    assert body["credential"]["fields"] == {"cookie": True, "bearer": False, "userAgent": True}
+    assert body["credential"]["fields"] == {"cookie": True, "bearer": True, "userAgent": True}
     assert "qwen-secret" not in response.text
     assert "callback.local" not in response.text
     saved = store.get("qwen")
     assert saved is not None
     assert saved["cookie"] == "qwen_session=qwen-secret"
+    assert saved["bearer"] == "qwen-secret"
     assert saved["metadata"]["sessionToken"] == "qwen-secret"
     assert saved["userAgent"] == "Remote Chrome"
 
@@ -18844,10 +18843,13 @@ def test_qwen_web_client_uses_qwen_chat_api_and_parses_stream() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/chats/new":
+            seen["new_chat_body"] = json.loads(request.content.decode("utf-8"))
+            seen["new_chat_headers"] = dict(request.headers)
             return httpx.Response(200, json={"data": {"id": "chat-1"}}, request=request)
         if request.url.path == "/api/v2/chat/completions":
             seen["body"] = json.loads(request.content.decode("utf-8"))
             seen["query"] = dict(request.url.params)
+            seen["completion_headers"] = dict(request.headers)
             return httpx.Response(
                 200,
                 text='data: {"choices":[{"delta":{"content":"你好"}}]}\n\ndata: {"output":{"text":"，Qwen"}}\n\ndata: [DONE]\n',
@@ -18865,9 +18867,50 @@ def test_qwen_web_client_uses_qwen_chat_api_and_parses_stream() -> None:
     )
 
     assert seen["query"]["chat_id"] == "chat-1"
+    assert seen["new_chat_body"]["title"] == "New Chat"
+    assert seen["new_chat_body"]["models"] == ["qwen3.6-plus"]
+    assert seen["new_chat_body"]["chat_mode"] == "normal"
+    assert seen["new_chat_body"]["chat_type"] == "t2t"
+    assert seen["new_chat_headers"]["source"] == "web"
+    assert seen["new_chat_headers"]["version"] == "0.2.66"
+    assert seen["new_chat_headers"]["bx-v"] == "2.5.36"
+    assert seen["new_chat_headers"]["bx-umidtoken"]
+    assert seen["new_chat_headers"]["x-request-id"]
     assert seen["body"]["model"] == "qwen3.6-plus"
     assert seen["body"]["messages"][0]["feature_config"]["thinking_enabled"] is False
+    assert seen["body"]["messages"][0]["feature_config"]["auto_thinking"] is False
+    assert seen["completion_headers"]["referer"].endswith("/c/chat-1")
     assert response["choices"][0]["message"]["content"] == "你好，Qwen"
+
+
+def test_qwen_web_client_reports_sanitized_metadata_for_non_json_create_chat_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/models":
+            return httpx.Response(200, json=[], request=request)
+        if request.url.path == "/api/v2/chats/new":
+            return httpx.Response(
+                200,
+                text="<html><title>challenge</title></html>",
+                headers={"content-type": "text/html; charset=utf-8"},
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    client = QwenWebClient(
+        {"cookie": "qwen_session=session-secret", "bearer": "bearer-secret", "userAgent": "Chrome Test"},
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(RuntimeError, match="create_chat.*不是 JSON.*text/html.*响应长度") as raised:
+        client.chat_completions(
+            {"model": "qwen-web/qwen3.6-plus", "messages": [{"role": "user", "content": "你好"}]}
+        )
+
+    assert "<html>" not in str(raised.value)
+    assert client.last_diagnostic["qwen_http_stage"] == "create_chat"
+    assert client.last_diagnostic["qwen_http_status"] == 200
+    assert client.last_diagnostic["qwen_http_content_type"] == "text/html"
+    assert client.last_diagnostic["qwen_http_body_chars"] > 0
 
 
 def test_qwen_web_client_records_task_state_snapshot_diagnostics() -> None:
@@ -24910,7 +24953,7 @@ def test_qwen_web_client_resolves_live_display_name_alias_to_upstream_model() ->
     attempts: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/api/v2/models/"):
+        if request.url.path.endswith("/api/models"):
             return httpx.Response(
                 200,
                 json={
@@ -30105,7 +30148,7 @@ def test_qwen_web_allows_safe_generic_tool_use_under_local_agent_policy(tmp_path
         "qwen",
         {
             "cookie": "qwen_session=session-secret",
-            "bearer": "",
+            "bearer": "qwen-api-token",
             "userAgent": "Chrome Test",
             "metadata": {"sessionToken": "session-secret"},
         },

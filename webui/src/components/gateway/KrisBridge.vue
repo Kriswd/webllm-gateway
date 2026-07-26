@@ -996,10 +996,10 @@ onMounted(loadOnboarding);
       <div class="hero-copy">
         <div class="hero-tags">
           <a-tag color="blue">Local WebAI Access</a-tag>
-          <a-tag color="green">Qwen 3.7 系列已调通</a-tag>
+          <a-tag color="green">Qwen 网页模型目录实时同步</a-tag>
         </div>
         <h1>把网页账号变成可工具调用的 API，实现养虾养马自由！</h1>
-        <p>登录网页账号，自动检测可用模型；Qwen 3.7 Max / Plus Preview 已纳入直连链路，支持在小龙虾、Hermes 或其它兼容 OpenAI 和 Anthropic API 的客户端做轻中度工具调用。</p>
+        <p>登录网页账号后自动检测可用模型；Qwen 直连会使用当前网页接口和实时模型目录，支持在小龙虾、Hermes 或其它兼容 OpenAI 和 Anthropic API 的客户端做轻中度工具调用。</p>
         <div class="hero-actions">
           <a-button type="primary" size="large" :loading="actionLoading" @click="handleStartLogin">
             <template #icon><LoginOutlined /></template>

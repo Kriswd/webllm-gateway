@@ -4213,6 +4213,10 @@ def _provider_diagnostic_fields(diagnostic: Any) -> dict[str, Any]:
         "metadata_retry_succeeded": "providerMetadataRetrySucceeded",
         "model": "providerModel",
         "ds2api_base_url": "providerBaseUrl",
+        "qwen_http_stage": "providerQwenHttpStage",
+        "qwen_http_status": "providerQwenHttpStatus",
+        "qwen_http_content_type": "providerQwenHttpContentType",
+        "qwen_http_body_chars": "providerQwenHttpBodyChars",
     }
     fields: dict[str, Any] = {}
     for source_key, target_key in mapping.items():
@@ -7104,10 +7108,10 @@ def _qwen_web_chat(app: FastAPI, client: httpx.Client, body: dict[str, Any], con
     payload, bridge, allowed_tools, bridge_context = _build_direct_payload(
         body,
         config,
-        default_model="qwen-web/qwen3.5-plus",
+        default_model="qwen-web/qwen3.6-plus",
         provider_native_web_search=True,
     )
-    model = str(payload.get("model") or "qwen-web/qwen3.5-plus")
+    model = str(payload.get("model") or "qwen-web/qwen3.6-plus")
     skill_preflight = _skill_loader_preflight_response(app, model, bridge_context, require_namespaced_slash=True)
     if skill_preflight is not None:
         return skill_preflight

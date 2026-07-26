@@ -2,7 +2,7 @@
 
 **给小龙虾（OpenClaw）、Hermes 等兼容客户端使用的网页登录模型 API 网关。**
 
-WebLLM Gateway 把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让小龙虾、Hermes 等客户端像调用原生模型 API 一样使用网页账号。Qwen 3.7 系列已经调通，Qwen 3.7 Max / Plus Preview 可通过 qwen-web 直连链路接入，适合养虾养马、资料整理、简单工具调用和低成本试错。
+WebLLM Gateway 把 Qwen Web、DeepSeek Web 和已验证的网页登录模型包装成 OpenAI / Anthropic 兼容、可工具调用的标准 API，让小龙虾、Hermes 等客户端像调用原生模型 API 一样使用网页账号。Qwen Web 直连会读取当前网页模型目录，并将旧模型 ID 映射到仍可用的网页模型，适合资料整理、简单工具调用和低成本试错。
 
 > Turn web AI accounts into OpenAI/Anthropic-compatible, tool-callable APIs.
 
@@ -164,7 +164,7 @@ OpenAI 兼容客户端：
 ```text
 base_url = http://127.0.0.1:8610/v1
 api_key = local-dev-key
-model = qwen-web/qwen3.7-max-preview
+model = qwen-web/qwen3.7-max
 ```
 
 Anthropic 兼容客户端可使用：
@@ -172,7 +172,7 @@ Anthropic 兼容客户端可使用：
 ```text
 base_url = http://127.0.0.1:8610/v1
 api_key = local-dev-key
-model = qwen-web/qwen3.7-max-preview
+model = qwen-web/qwen3.7-max
 endpoint = /v1/messages
 ```
 
@@ -202,16 +202,13 @@ POST /v1/images/generations
 
 ## 模型目录
 
-Qwen / 通义千问国际版本地直连模型，首推已经调通的 Qwen 3.7 系列：
+Qwen / 通义千问国际版本地直连模型会在登录后读取网页的实时目录；当前默认目录为：
 
 ```text
-qwen-web/qwen3.7-max-preview
+qwen-web/qwen3.8-max-preview
 qwen-web/qwen3.7-max
-qwen-web/qwen3.7-plus-preview
-qwen-web/qwen3.6-max-preview
+qwen-web/qwen3.7-plus
 qwen-web/qwen3.6-plus
-qwen-web/qwen3.5-plus
-qwen-web/qwen3-max
 ```
 
 DeepSeek Web 已改为通过本地 `ds2api` sidecar 接入。完成浏览器网页登录授权后，需要点击“检测模型”做一次真实请求验证；检测通过后，前端和 `/v1/models` 才应作为可用模型使用：

@@ -22,10 +22,20 @@ from .prompt_compaction import (
 
 QWEN_MODEL_PREFIX = "qwen-web/"
 QWEN_BASE_URL = "https://chat.qwen.ai"
-QWEN_MODELS_PATH = "/api/v2/models/"
+QWEN_MODELS_PATH = "/api/models"
+QWEN_SPA_VERSION = "0.2.66"
+QWEN_BX_VERSION = "2.5.36"
+QWEN_BX_UMIDTOKEN_FALLBACK = "T2gA0000000000000000000000000000000000000000"
 DEFAULT_QWEN_REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_QWEN_PROMPT_MAX_CHARS = 32000
 QWEN_TOOL_BRIDGE_RUNAWAY_OUTPUT_CHARS = 12000
+QWEN_LEGACY_MODEL_ALIASES = {
+    "qwen3.7-max-preview": "qwen3.7-max",
+    "qwen3.7-plus-preview": "qwen3.7-plus",
+    "qwen3.6-max-preview": "qwen3.6-plus",
+    "qwen3.5-plus": "qwen3.6-plus",
+    "qwen3-max": "qwen3.7-max",
+}
 _QWEN_WEB_METADATA_KEYS = {
     "action",
     "chat_id",
@@ -68,7 +78,7 @@ def is_qwen_web_model(model: Any) -> bool:
 
 def normalize_qwen_model(model: str) -> str:
     model = normalize_model_id(model)
-    return model.removeprefix(QWEN_MODEL_PREFIX) or "qwen3.5-plus"
+    return model.removeprefix(QWEN_MODEL_PREFIX) or "qwen3.6-plus"
 
 
 class QwenWebClient:
@@ -104,12 +114,12 @@ class QwenWebClient:
             raise ValueError("没有可发送给 Qwen 网页模型的消息")
         if files:
             raise RuntimeError("Qwen Web 直连暂不支持 multimodal 附件上传；请改用 WebAI2API Qwen 适配器或支持多模态的上游。")
-        model = str(payload.get("model") or f"{QWEN_MODEL_PREFIX}qwen3.5-plus")
+        model = str(payload.get("model") or f"{QWEN_MODEL_PREFIX}qwen3.6-plus")
         upstream_model = self.resolve_model_alias(model)
         if upstream_model != normalize_qwen_model(model):
             self.last_diagnostic["model_alias_resolved"] = True
             self.last_diagnostic["upstream_model"] = upstream_model
-        chat = self.create_chat_session()
+        chat = self.create_chat_session(upstream_model)
         try:
             content = self.send_chat(
                 chat_id=str(chat.get("chatId") or chat.get("chat_id") or chat.get("id") or ""),
@@ -159,17 +169,18 @@ class QwenWebClient:
     def list_models(self) -> list[dict[str, Any]]:
         response = self.http_client.get(
             f"{QWEN_BASE_URL}{QWEN_MODELS_PATH}",
-            headers=self.headers(accept="application/json"),
+            headers=self.headers(accept="*/*"),
             follow_redirects=True,
         )
+        self._record_http_response("model_catalog", response)
         response.raise_for_status()
         _raise_for_qwen_response_error(response)
-        return parse_qwen_model_catalog(response.json())
+        return parse_qwen_model_catalog(self._json_response(response, "model_catalog"))
 
     def resolve_model_alias(self, model: str) -> str:
         requested = normalize_qwen_model(model)
         alias_map = self._live_model_alias_map()
-        return alias_map.get(requested, requested)
+        return alias_map.get(requested, QWEN_LEGACY_MODEL_ALIASES.get(requested, requested))
 
     def _live_model_alias_map(self) -> dict[str, str]:
         if self._model_alias_cache is not None:
@@ -191,19 +202,54 @@ class QwenWebClient:
         self._model_alias_cache = aliases
         return aliases
 
-    def create_chat_session(self) -> dict[str, Any]:
+    def create_chat_session(self, model: str) -> dict[str, Any]:
         response = self.http_client.post(
             f"{QWEN_BASE_URL}/api/v2/chats/new",
-            json={},
-            headers=self.headers(accept="application/json"),
+            json={
+                "title": "New Chat",
+                "models": [model],
+                "chat_mode": "normal",
+                "chat_type": "t2t",
+                "timestamp": int(time.time() * 1000),
+            },
+            headers=self.headers(accept="*/*"),
         )
+        self._record_http_response("create_chat", response)
         response.raise_for_status()
         _raise_for_qwen_response_error(response)
-        data = response.json()
+        data = self._json_response(response, "create_chat")
+        if not isinstance(data, dict):
+            raise RuntimeError("Qwen 创建会话接口返回了非对象 JSON，无法取得会话 ID。")
         chat_id = _deep_get(data, ("data", "id")) or data.get("chat_id") or data.get("id") or data.get("chatId")
         if not chat_id:
             raise RuntimeError("Qwen 没有返回可用的会话信息")
         return {"chatId": chat_id, "raw": data}
+
+    def _record_http_response(self, stage: str, response: httpx.Response) -> None:
+        content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        try:
+            body_chars = len(response.content)
+        except httpx.ResponseNotRead:
+            body_chars = 0
+        self.last_diagnostic.update(
+            {
+                "qwen_http_stage": stage,
+                "qwen_http_status": int(response.status_code),
+                "qwen_http_content_type": content_type or "missing",
+                "qwen_http_body_chars": body_chars,
+            }
+        )
+
+    def _json_response(self, response: httpx.Response, stage: str) -> Any:
+        try:
+            return response.json()
+        except ValueError as exc:
+            content_type = str(self.last_diagnostic.get("qwen_http_content_type") or "missing")
+            body_chars = int(self.last_diagnostic.get("qwen_http_body_chars") or 0)
+            raise RuntimeError(
+                f"Qwen 网页接口 {stage} 返回的不是 JSON（HTTP {response.status_code}，"
+                f"content-type {content_type}，响应长度 {body_chars}）。"
+            ) from exc
 
     def send_chat(
         self,
@@ -218,12 +264,17 @@ class QwenWebClient:
         qwen_files = files or []
         if qwen_files:
             raise RuntimeError("Qwen Web 直连暂不支持 multimodal 附件上传；请改用 WebAI2API Qwen 适配器或支持多模态的上游。")
-        feature_config = {"thinking_enabled": False, "output_schema": "phase"}
+        feature_config = {
+            "thinking_enabled": False,
+            "output_schema": "phase",
+            "auto_thinking": False,
+            "research_mode": "normal",
+            "auto_search": False,
+        }
         if enable_web_search:
             feature_config["auto_search"] = True
         request_body = {
             "stream": True,
-            "version": "2.1",
             "incremental_output": True,
             "chat_id": chat_id,
             "chat_mode": "normal",
@@ -242,6 +293,8 @@ class QwenWebClient:
                     "models": [model],
                     "chat_type": "t2t",
                     "feature_config": feature_config,
+                    "sub_chat_type": "t2t",
+                    "parent_id": None,
                 }
             ],
         }
@@ -252,7 +305,7 @@ class QwenWebClient:
             f"{QWEN_BASE_URL}/api/v2/chat/completions",
             params={"chat_id": chat_id},
             json=request_body,
-            headers=self.headers(accept="text/event-stream"),
+            headers=self.headers(accept="*/*", chat_id=chat_id),
         ) as response:
             response.raise_for_status()
             if "json" in response.headers.get("content-type", "").lower():
@@ -267,7 +320,7 @@ class QwenWebClient:
                 ),
             )
 
-    def headers(self, *, accept: str) -> dict[str, str]:
+    def headers(self, *, accept: str, chat_id: str = "") -> dict[str, str]:
         headers = {
             "Cookie": str(self.credential.get("cookie") or ""),
             "User-Agent": str(
@@ -277,7 +330,12 @@ class QwenWebClient:
             "Content-Type": "application/json",
             "Accept": accept,
             "Origin": QWEN_BASE_URL,
-            "Referer": f"{QWEN_BASE_URL}/",
+            "Referer": f"{QWEN_BASE_URL}/c/{chat_id}" if chat_id else f"{QWEN_BASE_URL}/",
+            "source": "web",
+            "version": QWEN_SPA_VERSION,
+            "x-request-id": str(uuid.uuid4()),
+            "bx-v": QWEN_BX_VERSION,
+            "bx-umidtoken": QWEN_BX_UMIDTOKEN_FALLBACK,
         }
         bearer = str(self.credential.get("bearer") or "")
         if bearer:
