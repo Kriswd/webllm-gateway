@@ -16796,23 +16796,21 @@ def test_browser_launcher_uses_a_dedicated_ready_cdp_port_when_default_is_occupi
     assert result["cdpReady"] is True
     assert result["cdpUrl"] == "http://127.0.0.1:19322"
     assert ready_urls == ["http://127.0.0.1:19322"]
-    assert launched == [
-        [
-            "C:/Browser/chrome.exe",
-            "--remote-debugging-address=127.0.0.1",
-            "--remote-debugging-port=19322",
-            f"--user-data-dir={str((tmp_path / 'auth-profiles' / 'qwen').resolve())}",
-            "--no-first-run",
-            "--disable-default-apps",
-            "--new-window",
-            "https://chat.qwen.ai/",
-        ]
+    assert len(launched) == 1
+    assert launched[0][:3] == [
+        "C:/Browser/chrome.exe",
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=19322",
     ]
+    assert launched[0][3].startswith(f"--user-data-dir={str((tmp_path / 'auth-profiles' / 'qwen').resolve())}\\session-")
+    assert launched[0][4:] == ["--no-first-run", "--disable-default-apps", "--new-window", "https://chat.qwen.ai/"]
 
 
 def test_browser_launcher_does_not_start_capture_until_cdp_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    launched: list[list[str]] = []
+
     class FakeProcess:
         pid = 4243
 
@@ -16822,20 +16820,25 @@ def test_browser_launcher_does_not_start_capture_until_cdp_is_ready(
     monkeypatch.setattr(web_auth, "find_browser_executables", lambda: [("Chrome", "C:/Browser/chrome.exe")])
     monkeypatch.setattr(web_auth, "_loopback_port_in_use", lambda _port: False)
     monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda _url: False)
-    monkeypatch.setattr(web_auth.subprocess, "Popen", lambda _command, **_kwargs: FakeProcess())
+    monkeypatch.setattr(
+        web_auth.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launched.append(command) or FakeProcess(),
+    )
 
     result = BrowserLauncher(tmp_path / "auth-profiles").start("qwen", "http://127.0.0.1:9222")
 
     assert result["started"] is False
     assert result["cdpReady"] is False
     assert result["pid"] == 4243
+    assert len(launched) == 1
+    assert "不会自动再打开浏览器" in result["message"]
 
 
-def test_browser_launcher_recovers_with_another_browser_when_primary_exits(
+def test_browser_launcher_starts_only_one_window_when_cdp_is_not_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launched: list[list[str]] = []
-    ready_urls: list[str] = []
 
     class ExitedProcess:
         pid = 5101
@@ -16843,15 +16846,9 @@ def test_browser_launcher_recovers_with_another_browser_when_primary_exits(
         def poll(self) -> int:
             return 1
 
-    class ReadyProcess:
-        pid = 5102
-
-        def poll(self) -> None:
-            return None
-
     def fake_popen(command: list[str], **_kwargs: Any) -> Any:
         launched.append(command)
-        return ExitedProcess() if len(launched) == 1 else ReadyProcess()
+        return ExitedProcess()
 
     monkeypatch.setattr(
         web_auth,
@@ -16859,61 +16856,51 @@ def test_browser_launcher_recovers_with_another_browser_when_primary_exits(
         lambda: [("Chrome", "C:/Browser/chrome.exe"), ("Edge", "C:/Browser/msedge.exe")],
     )
     monkeypatch.setattr(web_auth, "_loopback_port_in_use", lambda _port: False)
-    monkeypatch.setattr(web_auth, "_find_available_loopback_port", lambda: 19322)
-    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda url: ready_urls.append(url) or url.endswith(":19322"))
+    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda _url: False)
     monkeypatch.setattr(web_auth.subprocess, "Popen", fake_popen)
 
     result = BrowserLauncher(tmp_path / "auth-profiles").start("qwen", "http://127.0.0.1:9222")
 
-    assert result["started"] is True
-    assert result["cdpReady"] is True
-    assert result["pid"] == 5102
-    assert result["cdpUrl"] == "http://127.0.0.1:19322"
-    assert "自动切换" in result["message"]
+    assert result["started"] is False
+    assert result["cdpReady"] is False
+    assert result["pid"] == 5101
     assert result["attempts"] == [
         {"browser": "Chrome", "started": True, "cdpReady": False, "launcherExited": True},
-        {"browser": "Edge", "started": True, "cdpReady": True, "launcherExited": False},
     ]
-    assert ready_urls == ["http://127.0.0.1:9222", "http://127.0.0.1:19322"]
+    assert len(launched) == 1
     assert launched[0][0] == "C:/Browser/chrome.exe"
-    assert launched[1][0] == "C:/Browser/msedge.exe"
-    assert launched[1][3].endswith("auth-profiles\\qwen-edge")
 
 
-def test_browser_launcher_recovers_with_fresh_profile_when_only_browser_exits(
+def test_browser_launcher_reuses_ready_authorization_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launched: list[list[str]] = []
 
-    class ExitedProcess:
-        pid = 5201
-
-        def poll(self) -> int:
-            return 1
-
     class ReadyProcess:
-        pid = 5202
+        pid = 5201
 
         def poll(self) -> None:
             return None
 
     def fake_popen(command: list[str], **_kwargs: Any) -> Any:
         launched.append(command)
-        return ExitedProcess() if len(launched) == 1 else ReadyProcess()
+        return ReadyProcess()
 
     monkeypatch.setattr(web_auth, "find_browser_executables", lambda: [("Chrome", "C:/Browser/chrome.exe")])
     monkeypatch.setattr(web_auth, "_loopback_port_in_use", lambda _port: False)
-    monkeypatch.setattr(web_auth, "_find_available_loopback_port", lambda: 19322)
-    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda url: url.endswith(":19322"))
+    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda _url: True)
+    monkeypatch.setattr(web_auth, "_cdp_endpoint_ready", lambda _url: True)
     monkeypatch.setattr(web_auth.subprocess, "Popen", fake_popen)
 
-    result = BrowserLauncher(tmp_path / "auth-profiles").start("qwen", "http://127.0.0.1:9222")
+    launcher = BrowserLauncher(tmp_path / "auth-profiles")
+    first = launcher.start("qwen", "http://127.0.0.1:9222")
+    result = launcher.start("qwen", "http://127.0.0.1:9222")
 
-    assert result["started"] is True
-    assert result["pid"] == 5202
-    assert len(launched) == 2
-    assert "qwen-recovery-" in launched[1][3]
-    assert result["attempts"][1]["browser"] == "Chrome 恢复实例"
+    assert first["started"] is True
+    assert result["started"] is False
+    assert result["cdpReady"] is True
+    assert len(launched) == 1
+    assert "不会重复打开浏览器" in result["message"]
 
 
 def test_browser_launcher_only_connects_to_existing_remote_cdp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
