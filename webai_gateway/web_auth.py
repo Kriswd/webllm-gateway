@@ -21,7 +21,11 @@ from webai_gateway.deepseek_web import DEEPSEEK_WEB_CATALOG_MODELS
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 _LOOPBACK_CDP_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-_CDP_READY_TIMEOUT_SECONDS = 6.0
+# A first browser launch on Windows can take noticeably longer than a warm
+# launch, especially while the browser hands off an existing instance.  Keep
+# the UI synchronous long enough to distinguish that normal handoff from a
+# genuine CDP failure.
+_CDP_READY_TIMEOUT_SECONDS = 15.0
 _CDP_READY_POLL_SECONDS = 0.15
 DEEPSEEK_WEB_AVAILABLE_REASON = (
     "DeepSeek Web 现通过本地 ds2api sidecar 接入。完成网页登录授权并检测通过后，可使用 `deepseek-v4-pro`；"
@@ -949,8 +953,8 @@ class BrowserLauncher:
                 }
         effective_cdp_url = _loopback_cdp_url(port)
 
-        browser = find_browser_executable()
-        if not browser:
+        browsers = find_browser_executables()
+        if not browsers:
             cdp_ready = _wait_for_cdp_ready(effective_cdp_url)
             return {
                 "provider": provider.id,
@@ -966,81 +970,122 @@ class BrowserLauncher:
                 ),
             }
 
-        # Each provider gets a stable isolated profile.  This keeps a Qwen
-        # authorization attempt from attaching to an unrelated provider's
-        # browser process, while leaving the legacy shared profile untouched.
-        profile_dir = self.profile_dir / provider.id
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        command = [
-            browser,
-            "--remote-debugging-address=127.0.0.1",
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={str(profile_dir.resolve())}",
-            "--no-first-run",
-            "--disable-default-apps",
-            "--new-window",
-            provider.login_url,
+        # Start with the provider's stable isolated profile so an existing
+        # authorization can be reused.  When Windows hands the request to a
+        # stale or incompatible browser instance, retry with another installed
+        # browser and finally a fresh recovery profile.  This is intentionally
+        # limited to browser instances launched by this method; it never
+        # closes, reuses, or inspects a user's normal browser session.
+        primary_name, primary_browser = browsers[0]
+        launch_specs: list[tuple[str, str, Path]] = [
+            (primary_name, primary_browser, self.profile_dir / provider.id)
         ]
-        try:
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            return {
-                "provider": provider.id,
-                "cdpUrl": effective_cdp_url,
-                "loginUrl": provider.login_url,
-                "started": False,
-                "cdpReady": False,
-                "message": "授权浏览器未能启动。请检查 Chrome/Edge 是否可正常打开，然后重试。",
-            }
+        launch_specs.extend(
+            (name, browser, self.profile_dir / f"{provider.id}-{name.lower()}")
+            for name, browser in browsers[1:]
+        )
+        launch_specs.append(
+            (
+                f"{primary_name} 恢复实例",
+                primary_browser,
+                self.profile_dir / f"{provider.id}-recovery-{uuid.uuid4().hex[:10]}",
+            )
+        )
 
-        cdp_ready = _wait_for_cdp_ready(effective_cdp_url)
-        if not cdp_ready:
+        attempts: list[dict[str, Any]] = []
+        last_process: Any | None = None
+        for index, (browser_name, browser, profile_dir) in enumerate(launch_specs):
+            try:
+                attempt_port = port if index == 0 else _find_available_loopback_port()
+            except RuntimeError:
+                attempts.append({"browser": browser_name, "started": False, "cdpReady": False})
+                continue
+            attempt_cdp_url = _loopback_cdp_url(attempt_port)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            command = [
+                browser,
+                "--remote-debugging-address=127.0.0.1",
+                f"--remote-debugging-port={attempt_port}",
+                f"--user-data-dir={str(profile_dir.resolve())}",
+                "--no-first-run",
+                "--disable-default-apps",
+                "--new-window",
+                provider.login_url,
+            ]
+            try:
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                attempts.append({"browser": browser_name, "started": False, "cdpReady": False})
+                continue
+
+            last_process = process
+            cdp_ready = _wait_for_cdp_ready(attempt_cdp_url)
             process_exited = bool(getattr(process, "poll", lambda: None)() is not None)
+            attempts.append({"browser": browser_name, "started": True, "cdpReady": cdp_ready, "launcherExited": process_exited})
+            if not cdp_ready:
+                continue
+
+            fallback_used = index > 0
             return {
                 "provider": provider.id,
-                "cdpUrl": effective_cdp_url,
+                "cdpUrl": attempt_cdp_url,
                 "loginUrl": provider.login_url,
-                "started": False,
-                "cdpReady": False,
+                "started": True,
+                "cdpReady": True,
                 "pid": process.pid,
+                "attempts": attempts,
                 "message": (
-                    "授权浏览器启动后意外退出，未能建立本机调试连接。请关闭异常浏览器窗口后重试。"
-                    if process_exited
-                    else "授权浏览器已打开，但本机调试连接尚未就绪。请确认浏览器窗口已出现后重试。"
+                    "首选授权浏览器未能建立调试连接，已自动切换到可用的隔离授权窗口。请在弹出的窗口里完成登录。"
+                    if fallback_used
+                    else (
+                        "默认调试端口已被其他浏览器占用，已为本次授权打开独立浏览器窗口。"
+                        if port_reassigned
+                        else "授权浏览器已启动，请在弹出的窗口里完成登录。"
+                    )
                 ),
             }
+
         return {
             "provider": provider.id,
             "cdpUrl": effective_cdp_url,
             "loginUrl": provider.login_url,
-            "started": True,
-            "cdpReady": True,
-            "pid": process.pid,
+            "started": False,
+            "cdpReady": False,
+            "pid": getattr(last_process, "pid", None),
+            "attempts": attempts,
             "message": (
-                "默认调试端口已被其他浏览器占用，已为本次授权打开独立浏览器窗口。"
-                if port_reassigned
-                else "授权浏览器已启动，请在弹出的窗口里完成登录。"
+                "Chrome/Edge 的授权窗口都未能建立本机调试连接。"
+                "请改用“远程/NAS 授权”填写一台已启动远程调试的 Chrome/Edge 地址，或检查浏览器安全策略是否禁止远程调试。"
             ),
         }
 
 
-def find_browser_executable() -> str | None:
+def find_browser_executables() -> list[tuple[str, str]]:
     candidates = [
-        os.environ.get("CHROME_PATH"),
-        os.environ.get("EDGE_PATH"),
-        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft/Edge/Application/msedge.exe",
+        ("Chrome", os.environ.get("CHROME_PATH")),
+        ("Edge", os.environ.get("EDGE_PATH")),
+        ("Chrome", Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe"),
+        ("Chrome", Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe"),
+        ("Chrome", Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe"),
+        ("Edge", Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft/Edge/Application/msedge.exe"),
+        ("Edge", Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft/Edge/Application/msedge.exe"),
     ]
-    for candidate in candidates:
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, candidate in candidates:
         if not candidate:
             continue
         path = Path(candidate)
-        if path.exists():
-            return str(path)
-    return None
+        key = str(path).casefold()
+        if path.exists() and key not in seen:
+            seen.add(key)
+            found.append((name, str(path)))
+    return found
+
+
+def find_browser_executable() -> str | None:
+    browsers = find_browser_executables()
+    return browsers[0][1] if browsers else None
 
 
 def _port_from_cdp_url(cdp_url: str) -> int:
