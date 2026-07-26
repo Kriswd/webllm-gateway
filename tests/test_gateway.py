@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import webai_gateway.web_auth as web_auth
 from webai_gateway.app import _DirectProviderPoolGate, create_app
 from webai_gateway.anthropic_api import anthropic_body_to_openai
 from webai_gateway.accounts import AccountRegistry, webai2api_account_id
@@ -81,6 +82,7 @@ from webai_gateway.tool_bridge import (
     sanitize_leaked_tool_protocol_output,
 )
 from webai_gateway.web_auth import (
+    BrowserLauncher,
     CredentialStore,
     DeepSeekWebAuthService,
     PROVIDERS,
@@ -14438,6 +14440,20 @@ def test_vendored_webai2api_frontend_has_gateway_bridge_page() -> None:
     assert "/v1/images/generations" in bridge_source
     assert "gpt-image-2" in bridge_source
     assert "response_format" in bridge_source
+    assert "const directCdpUrlByProvider = ref({});" in bridge_source
+    direct_auth_source = bridge_source.split("async function startDirectAuth", 1)[1].split(
+        "async function retryDirectAuthCapture", 1
+    )[0]
+    assert "const effectiveCdpUrl = String(browserData.cdpUrl || '').trim() || cdpUrl.value;" in direct_auth_source
+    assert "browserData.cdpReady !== true" in direct_auth_source
+    assert "await captureDirectAuth(provider, effectiveCdpUrl);" in direct_auth_source
+    assert "captureCdpUrl = directCdpUrlByProvider.value[provider.id] || cdpUrl.value" in direct_auth_source
+    assert "cdpUrl: captureCdpUrl" in direct_auth_source
+    legacy_auth_source = (root / "webai_gateway" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "authCdpUrls: {}" in legacy_auth_source
+    assert "await startAuthCapture(data.cdpUrl);" in legacy_auth_source
+    assert "async function startAuthCapture(cdpUrl = \"\")" in legacy_auth_source
+    assert "cdpUrl = captureCdpUrl" in legacy_auth_source
     assert "Claude Code" not in bridge_source
     assert "const configProfile = ref('cc-switch');" in bridge_source
     assert "cc-switch 专用配置" in bridge_source
@@ -16555,6 +16571,12 @@ def test_qwen_coder_auth_service_captures_browser_login(monkeypatch: pytest.Monk
             self.pages = [FakePage()]
             self.request = _FakeQwenAuthRequest(True)
 
+        async def new_page(self) -> FakePage:
+            seen["new_page"] = True
+            page = FakePage()
+            self.pages.append(page)
+            return page
+
         async def cookies(self, urls: Any) -> list[dict[str, str]]:
             seen["cookie_urls"] = urls
             return [{"name": "qwen_session", "value": "coder-session"}]
@@ -16598,7 +16620,8 @@ def test_qwen_coder_auth_service_captures_browser_login(monkeypatch: pytest.Monk
     assert "https://coder.qwen.ai" in seen["cookie_urls"]
     assert credential["metadata"]["sessionToken"] == "coder-session"
     assert credential["userAgent"] == "Chrome Test"
-    assert seen["closed"] is True
+    assert seen["new_page"] is True
+    assert "closed" not in seen
     assert any("Qwen Coder" in item for item in progress)
 
 
@@ -16639,6 +16662,12 @@ def test_deepseek_auth_service_waits_for_bearer_after_cookie_only_login(monkeypa
         def __init__(self) -> None:
             self.pages = [FakePage()]
             self.request = FakeRequest()
+
+        async def new_page(self) -> FakePage:
+            seen["new_page"] = True
+            page = FakePage()
+            self.pages.append(page)
+            return page
 
         async def cookies(self, url: str) -> list[dict[str, str]]:
             assert url == "https://chat.deepseek.com"
@@ -16682,7 +16711,8 @@ def test_deepseek_auth_service_waits_for_bearer_after_cookie_only_login(monkeypa
     assert seen["goto"] == "https://chat.deepseek.com/"
     assert seen["user_calls"] == 2
     assert credential["bearer"] == "deepseek-bearer-secret"
-    assert seen["closed"] is True
+    assert seen["new_page"] is True
+    assert "closed" not in seen
 
 
 class _FakeAuthService:
@@ -16736,6 +16766,83 @@ class _FakeBrowserLauncher:
             "started": True,
             "message": "授权浏览器已启动",
         }
+
+
+def test_browser_launcher_uses_a_dedicated_ready_cdp_port_when_default_is_occupied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launched: list[list[str]] = []
+    ready_urls: list[str] = []
+
+    class FakeProcess:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(command: list[str], **_kwargs: Any) -> FakeProcess:
+        launched.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(web_auth, "find_browser_executable", lambda: "C:/Browser/chrome.exe")
+    monkeypatch.setattr(web_auth, "_loopback_port_in_use", lambda port: port == 9222)
+    monkeypatch.setattr(web_auth, "_find_available_loopback_port", lambda: 19322)
+    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda url: ready_urls.append(url) or True)
+    monkeypatch.setattr(web_auth.subprocess, "Popen", fake_popen)
+
+    result = BrowserLauncher(tmp_path / "auth-profiles").start("qwen", "http://localhost:9222")
+
+    assert result["started"] is True
+    assert result["cdpReady"] is True
+    assert result["cdpUrl"] == "http://127.0.0.1:19322"
+    assert ready_urls == ["http://127.0.0.1:19322"]
+    assert launched == [
+        [
+            "C:/Browser/chrome.exe",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=19322",
+            f"--user-data-dir={str((tmp_path / 'auth-profiles' / 'qwen').resolve())}",
+            "--no-first-run",
+            "--disable-default-apps",
+            "--new-window",
+            "https://chat.qwen.ai/",
+        ]
+    ]
+
+
+def test_browser_launcher_does_not_start_capture_until_cdp_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeProcess:
+        pid = 4243
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(web_auth, "find_browser_executable", lambda: "C:/Browser/chrome.exe")
+    monkeypatch.setattr(web_auth, "_loopback_port_in_use", lambda _port: False)
+    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda _url: False)
+    monkeypatch.setattr(web_auth.subprocess, "Popen", lambda _command, **_kwargs: FakeProcess())
+
+    result = BrowserLauncher(tmp_path / "auth-profiles").start("qwen", "http://127.0.0.1:9222")
+
+    assert result["started"] is False
+    assert result["cdpReady"] is False
+    assert result["pid"] == 4243
+
+
+def test_browser_launcher_only_connects_to_existing_remote_cdp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_browser_lookup() -> str:
+        raise AssertionError("remote CDP must not launch a local browser")
+
+    monkeypatch.setattr(web_auth, "find_browser_executable", unexpected_browser_lookup)
+    monkeypatch.setattr(web_auth, "_wait_for_cdp_ready", lambda url: url == "http://remote.example:9222")
+
+    result = BrowserLauncher(tmp_path / "auth-profiles").start("qwen", "http://remote.example:9222")
+
+    assert result["started"] is False
+    assert result["cdpReady"] is True
+    assert result["cdpUrl"] == "http://remote.example:9222"
 
 
 def test_web_auth_job_captures_and_persists_credentials(tmp_path: Path) -> None:

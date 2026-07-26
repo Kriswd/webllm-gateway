@@ -40,6 +40,7 @@ const imageGenerating = ref(false);
 const imageError = ref('');
 const imageResultUrl = ref('');
 const cdpUrl = ref('http://127.0.0.1:9222');
+const directCdpUrlByProvider = ref({});
 const configProfile = ref('cc-switch');
 const accountEditOpen = ref(false);
 const accountEditSaving = ref(false);
@@ -506,11 +507,19 @@ async function startDirectAuth(provider) {
     const browserData = await browserRes.json();
     if (!browserRes.ok) throw new Error(browserData.detail || `HTTP ${browserRes.status}`);
     appendLog(browserData.message || '授权浏览器已启动');
-    if (!browserData.started && browserData.loginUrl) {
-      window.open(browserData.loginUrl, '_blank', 'noopener,noreferrer');
+    const effectiveCdpUrl = String(browserData.cdpUrl || '').trim() || cdpUrl.value;
+    if (browserData.cdpReady !== true) {
+      if (!browserData.started && browserData.loginUrl) {
+        window.open(browserData.loginUrl, '_blank', 'noopener,noreferrer');
+      }
+      throw new Error(browserData.message || '授权浏览器尚未就绪，请检查浏览器窗口后重试');
     }
+    directCdpUrlByProvider.value = {
+      ...directCdpUrlByProvider.value,
+      [provider.id]: effectiveCdpUrl,
+    };
 
-    await captureDirectAuth(provider);
+    await captureDirectAuth(provider, effectiveCdpUrl);
     message.success(`${provider.name} 授权完成`);
     await loadOnboarding();
   } catch (error) {
@@ -522,12 +531,15 @@ async function startDirectAuth(provider) {
   }
 }
 
-async function captureDirectAuth(provider) {
+async function captureDirectAuth(
+  provider,
+  captureCdpUrl = directCdpUrlByProvider.value[provider.id] || cdpUrl.value,
+) {
   appendLog('正在检测网页登录状态');
   const jobRes = await fetch('/api/admin/web-auth/jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider: provider.id, cdpUrl: cdpUrl.value }),
+    body: JSON.stringify({ provider: provider.id, cdpUrl: captureCdpUrl }),
   });
   const job = await jobRes.json();
   if (!jobRes.ok) throw new Error(job.detail || `HTTP ${jobRes.status}`);

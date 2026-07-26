@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -11,12 +12,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, unquote, urlparse
+from urllib.request import urlopen
 
 from webai_gateway.deepseek_web import DEEPSEEK_WEB_CATALOG_MODELS
 
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+_LOOPBACK_CDP_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_CDP_READY_TIMEOUT_SECONDS = 6.0
+_CDP_READY_POLL_SECONDS = 0.15
 DEEPSEEK_WEB_AVAILABLE_REASON = (
     "DeepSeek Web 现通过本地 ds2api sidecar 接入。完成网页登录授权并检测通过后，可使用 `deepseek-v4-pro`；"
     "如果检测失败，请按页面提示检查本地 ds2api、网页账号状态或重新授权。"
@@ -887,34 +893,122 @@ class BrowserLauncher:
 
     def start(self, provider_id: str, cdp_url: str | None = None) -> dict[str, Any]:
         provider = get_provider(provider_id)
-        cdp_url = cdp_url or default_cdp_url()
-        browser = find_browser_executable()
-        if not browser:
+        requested_cdp_url = str(cdp_url or default_cdp_url()).strip()
+        if not _is_loopback_cdp_url(requested_cdp_url):
+            cdp_ready = _wait_for_cdp_ready(requested_cdp_url)
             return {
                 "provider": provider.id,
-                "cdpUrl": cdp_url,
+                "cdpUrl": requested_cdp_url,
                 "loginUrl": provider.login_url,
                 "started": False,
-                "message": "没有找到 Chrome 或 Edge，请先安装浏览器，或手动用调试端口启动后再点“开始捕获登录态”。",
+                "cdpReady": cdp_ready,
+                "message": (
+                    "已检测到远程 CDP 授权浏览器，可以开始检测登录态。"
+                    if cdp_ready
+                    else "当前 CDP 地址不是本机浏览器，Gateway 不会在本机另开浏览器。"
+                    "请先在该设备启动 Chrome/Edge 远程调试并确认地址可访问，然后重新检测登录态。"
+                ),
             }
-        port = _port_from_cdp_url(cdp_url)
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            requested_port = _port_from_cdp_url(requested_cdp_url)
+        except ValueError:
+            return {
+                "provider": provider.id,
+                "cdpUrl": requested_cdp_url,
+                "loginUrl": provider.login_url,
+                "started": False,
+                "cdpReady": False,
+                "message": "CDP 地址中的端口格式无效，请检查后重试。",
+            }
+        port = requested_port
+        port_reassigned = _loopback_port_in_use(port)
+        if port_reassigned:
+            try:
+                port = _find_available_loopback_port()
+            except RuntimeError:
+                return {
+                    "provider": provider.id,
+                    "cdpUrl": requested_cdp_url,
+                    "loginUrl": provider.login_url,
+                    "started": False,
+                    "cdpReady": False,
+                    "message": "未能为授权浏览器分配本机调试端口，请稍后重试。",
+                }
+        effective_cdp_url = _loopback_cdp_url(port)
+
+        browser = find_browser_executable()
+        if not browser:
+            cdp_ready = _wait_for_cdp_ready(effective_cdp_url)
+            return {
+                "provider": provider.id,
+                "cdpUrl": effective_cdp_url,
+                "loginUrl": provider.login_url,
+                "started": False,
+                "cdpReady": cdp_ready,
+                "message": (
+                    "已检测到现有授权浏览器，可以开始检测登录态。"
+                    if cdp_ready
+                    else "没有找到 Chrome 或 Edge，也没有检测到可用的授权浏览器。"
+                    "请先安装浏览器，或手动用调试端口启动后再点“重新检测登录态”。"
+                ),
+            }
+
+        # Each provider gets a stable isolated profile.  This keeps a Qwen
+        # authorization attempt from attaching to an unrelated provider's
+        # browser process, while leaving the legacy shared profile untouched.
+        profile_dir = self.profile_dir / provider.id
+        profile_dir.mkdir(parents=True, exist_ok=True)
         command = [
             browser,
+            "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={port}",
-            f"--user-data-dir={str(self.profile_dir.resolve())}",
+            f"--user-data-dir={str(profile_dir.resolve())}",
             "--no-first-run",
             "--disable-default-apps",
+            "--new-window",
             provider.login_url,
         ]
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return {
+                "provider": provider.id,
+                "cdpUrl": effective_cdp_url,
+                "loginUrl": provider.login_url,
+                "started": False,
+                "cdpReady": False,
+                "message": "授权浏览器未能启动。请检查 Chrome/Edge 是否可正常打开，然后重试。",
+            }
+
+        cdp_ready = _wait_for_cdp_ready(effective_cdp_url)
+        if not cdp_ready:
+            process_exited = bool(getattr(process, "poll", lambda: None)() is not None)
+            return {
+                "provider": provider.id,
+                "cdpUrl": effective_cdp_url,
+                "loginUrl": provider.login_url,
+                "started": False,
+                "cdpReady": False,
+                "pid": process.pid,
+                "message": (
+                    "授权浏览器启动后意外退出，未能建立本机调试连接。请关闭异常浏览器窗口后重试。"
+                    if process_exited
+                    else "授权浏览器已打开，但本机调试连接尚未就绪。请确认浏览器窗口已出现后重试。"
+                ),
+            }
         return {
             "provider": provider.id,
-            "cdpUrl": cdp_url,
+            "cdpUrl": effective_cdp_url,
             "loginUrl": provider.login_url,
             "started": True,
+            "cdpReady": True,
             "pid": process.pid,
-            "message": "授权浏览器已启动，请在弹出的窗口里完成登录。",
+            "message": (
+                "默认调试端口已被其他浏览器占用，已为本次授权打开独立浏览器窗口。"
+                if port_reassigned
+                else "授权浏览器已启动，请在弹出的窗口里完成登录。"
+            ),
         }
 
 
@@ -942,6 +1036,62 @@ def _port_from_cdp_url(cdp_url: str) -> int:
     if parsed.port:
         return parsed.port
     return 9222
+
+
+def _is_loopback_cdp_url(cdp_url: str) -> bool:
+    try:
+        parsed = urlparse(cdp_url)
+        return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in _LOOPBACK_CDP_HOSTS
+    except ValueError:
+        return False
+
+
+def _loopback_cdp_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def _loopback_port_in_use(port: int) -> bool:
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.15)
+                probe.connect((address, port))
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _find_available_loopback_port() -> int:
+    for _ in range(32):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = int(reservation.getsockname()[1])
+        if not _loopback_port_in_use(port):
+            return port
+    raise RuntimeError("无法分配本机授权浏览器调试端口")
+
+
+def _cdp_endpoint_ready(cdp_url: str) -> bool:
+    endpoint = f"{cdp_url.rstrip('/')}/json/version"
+    try:
+        with urlopen(endpoint, timeout=0.5) as response:  # nosec B310 - user-authorized local/remote CDP endpoint
+            if int(getattr(response, "status", 200) or 200) != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, OSError, URLError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and bool(payload.get("webSocketDebuggerUrl"))
+
+
+def _wait_for_cdp_ready(cdp_url: str, timeout_seconds: float = _CDP_READY_TIMEOUT_SECONDS) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        if _cdp_endpoint_ready(cdp_url):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_CDP_READY_POLL_SECONDS)
 
 
 class DeepSeekWebAuthService:
@@ -972,7 +1122,11 @@ class DeepSeekWebAuthService:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.connect_over_cdp(cdp_url)
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page = context.pages[0] if context.pages else await context.new_page()
+            # This browser may be a user-managed remote CDP instance.  Create
+            # an authorization page instead of navigating one of the user's
+            # existing tabs, then let Playwright disconnect with the manager.
+            # Calling browser.close() here would close the user's browser.
+            page = await context.new_page()
 
             def on_request(request: Any) -> None:
                 nonlocal bearer_seen
@@ -1008,7 +1162,6 @@ class DeepSeekWebAuthService:
                         notify(f"已检测到 {provider.name} 登录态")
                     else:
                         notify(f"已捕获 {provider.name} 登录态")
-                    await browser.close()
                     return credential
                 if (
                     provider.id == "deepseek-web"
@@ -1020,8 +1173,6 @@ class DeepSeekWebAuthService:
                     notify("已看到 DeepSeek 登录 cookie，正在继续等待 bearer token；请保持聊天页打开，必要时刷新 chat.deepseek.com。")
                     cookie_only_notice_sent = True
                 await asyncio.sleep(2)
-
-            await browser.close()
         if provider.id in QWEN_DIRECT_PROVIDER_IDS:
             raise TimeoutError(f"等待 {provider.name} 登录态超时，请确认已经在 {provider.login_url} 登录成功后重试")
         if provider.id == "deepseek-web":

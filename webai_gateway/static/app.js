@@ -3,6 +3,7 @@ const state = {
   tokenVisible: false,
   providers: [],
   authJobTimer: null,
+  authCdpUrls: {},
   requestDiagnostics: [],
   autoResearch: null,
   autoResearchCandidates: [],
@@ -469,15 +470,16 @@ async function startAuthFlow() {
     throw new Error(data.detail || `启动失败：HTTP ${res.status}`);
   }
   appendAuthLog(data.message || "授权浏览器已启动");
-  if (!data.started) {
+  if (data.cdpReady !== true) {
     showToast(data.message || "需要手动启动浏览器");
     return;
   }
+  state.authCdpUrls[provider] = String(data.cdpUrl || "").trim();
   showToast(`请在弹出的浏览器里完成 ${providerInfo?.name || provider} 登录`);
-  await startAuthCapture();
+  await startAuthCapture(data.cdpUrl);
 }
 
-async function startAuthCapture() {
+async function startAuthCapture(cdpUrl = "") {
   const provider = $("authProvider").value || "deepseek-web";
   const providerInfo = selectedProvider();
   if (providerInfo?.route !== "direct") {
@@ -485,10 +487,15 @@ async function startAuthCapture() {
     return;
   }
   appendAuthLog("正在捕获网页登录态...");
+  const captureCdpUrl = String(cdpUrl || state.authCdpUrls[provider] || "").trim();
+  const body = { provider };
+  if (captureCdpUrl) {
+    body.cdpUrl = captureCdpUrl;
+  }
   const res = await fetch("/api/admin/web-auth/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
   if (!res.ok) {
